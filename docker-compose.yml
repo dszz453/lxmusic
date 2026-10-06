@@ -1,0 +1,61 @@
+services:
+  lxmusic:
+    # 用官方镜像就留这行；想自己构建就注释掉它、打开下面那行 build
+    image: ghcr.io/dszz453/lxmusic:latest
+    # build: .
+
+    container_name: lxmusic
+    restart: unless-stopped
+
+    # 以容器内的 node 用户（uid 1000）运行，而不是 root。
+    #
+    # **这一行和下面 volumes 的配合很重要**：
+    # 如果宿主机上 ./data 还不存在，Docker 会以 root 身份把它建出来（755），
+    # 那么容器里 uid 1000 的进程就写不进去，服务无限重启，
+    # 日志只有一句 `unable to open database file`（见 server/d1-sqlite.mjs 里那段体检）。
+    # 显式声明 user 之后属主就对得上了。宿主机上仍是 1000 属主，用普通用户即可读。
+    #
+    # 若你的宿主机账号 uid 不是 1000，把下面两个数字都改成 `id -u` 的结果，
+    # 或者干脆执行：sudo chown -R 1000:1000 ./data
+    user: "1000:1000"
+
+    ports:
+      # 宿主机端口:容器端口。容器内部固定 8787，改外面这个就行。
+      # 前面挂 Lucky / Nginx 做域名与 HTTPS 时，可以改成 "127.0.0.1:8787:8787"，
+      # 这样只有本机的反代能访问，外网打不到这个端口。
+      - "8787:8787"
+
+    environment:
+      # 会话签名密钥。留空则首次启动随机生成并存进数据库 ——
+      # 重启不会把所有人踢下线，也不用你去编一个。想手动固定再填。
+      LX_SESSION_SECRET: ""
+      # 综合搜索 / 首页推荐默认用哪些平台（also 可在管理后台改，改在库里优先级更高）
+      DEFAULT_SOURCES: "kg,wy,kw,tx,xm"
+      # AI 歌单（可选）。也可以什么都不填，登录后在管理后台「AI 歌单接口」里配。
+      AI_PROVIDER: "qwen"
+      AI_API_KEY: ""
+      # 插件评分：**默认每天自动跑一轮**，结果落库并立刻改变取流时的插件尝试顺序。
+      # 写在这里是为了让它「看得见」—— 代码里的默认值同样是 1d，两处一致。
+      # 取值：off（只手动）/ 30m / 12h / 1d / 2w …… 最小 5 分钟。
+      # 每轮都要真打各音乐平台（几十次请求），别设得太密。
+      # 不管设成什么，管理后台「立即重评」都随时能手动触发一轮。
+      LX_SCORE_INTERVAL: "1d"
+      # 备用：某个插件在你的网络下会把进程搞崩时，写进来跳过（英文逗号分隔）
+      # LX_PLUGIN_SKIP: "pdone-lx"
+
+    volumes:
+      # 数据库、WAL 全在这儿。**别省这一行**，否则删容器 = 清库。
+      #
+      # 首次部署前建议先建好目录并交给 1000（见上面 user 的说明）：
+      #     mkdir -p data && sudo chown -R 1000:1000 data
+      # 不建也能跑（Docker 会自己建），前提是上面写了 user: "1000:1000"。
+      - ./data:/data
+
+    healthcheck:
+      test: ["CMD", "node", "-e", "fetch('http://127.0.0.1:8787/healthz').then(r=>process.exit(r.ok?0:1)).catch(()=>process.exit(1))"]
+      interval: 30s
+      timeout: 5s
+      retries: 3
+      # 启动宽限 20s：实测就绪 ~1.1s，这里纯粹给慢盘/小主机留余量。
+      # 设大了的唯一代价是容器真挂时晚一点被发现。
+      start_period: 20s

@@ -1,0 +1,11 @@
+<?xml version="1.0" encoding="utf-8"?>
+<resources>
+    <!-- 用无 ActionBar 的 Material Light，和网页版浅色主题对齐 -->
+    <style name="AppTheme" parent="@android:style/Theme.Material.Light.NoActionBar">
+        <item name="android:windowBackground">#FFFFFFFF</item>
+        <item name="android:statusBarColor">#FFFFFFFF</item>
+        <item name="android:navigationBarColor">#FFFFFFFF</item>
+        <item name="android:colorPrimary">#FFEC4141</item>
+        <item name="android:colorAccent">#FFEC4141</item>
+    </style>
+</resources>

@@ -1,0 +1,89 @@
+# ── 什么进仓库、什么不进 ─────────────────────────────────────────
+# 原则：**仓库里只放「构建所需的最小源码」**。
+# 凡是「能重新生成」或「体积大/含隐私」的，一律不进 —— 前者靠构建脚本现造，
+# 后者（密钥、数据库、日志）进了仓库就是事故。
+
+# ── 依赖与缓存 ──────────────────────────────────────────────────
+node_modules/
+.wrangler/
+.wrangler-dry-run/
+npm-debug.log*
+.pnpm-store/
+
+# ── 安卓构建工具链 —— 1.1GB！JDK + Android SDK，脚本会按需下载 ────
+# build-apk.sh 会检查这两个目录，缺了会明确提示「各下一份」，
+# 所以排除掉不会让构建静默出错。
+android-build/
+android/build/
+android/gen/
+android/assets/www/
+*.apk
+*.aab
+
+# android/assets/www 是 build-apk.sh 第 1.5 步从 public/ **整包拷过去**的产物。
+# 它和 public/ 逐字节同源，提交进来只会造成「改了一处、另一处是旧的」的经典事故。
+# 想构建 APK 就先跑 build-apk.sh（它自己会拷）。
+
+# ⚠ android/keystore/ **绝不能排除**，也绝不能进仓库 —— 两难。
+# 密钥泄露 = 别人能给你用户推假更新；密钥丢失 = 只能让用户卸载重装（数据全丢）。
+# 折中：目录留在工作区、被 ignore 挡在仓库外，由部署者自己备份（见 docs/self-host.md）。
+android/keystore/
+
+# ── 探测/构建产物 ───────────────────────────────────────────────
+probe/
+dist/
+shots/
+_release/
+_pluginscan/
+_d1test/
+_research/
+build/
+
+# ── 运行时数据 —— 用户的库，绝不能进仓库 ─────────────────────────
+data/
+_dockerdata/
+*dockerdata*
+*.db
+*.db-wal
+*.db-shm
+
+# ── 密钥与凭证 ──────────────────────────────────────────────────
+.cf-token
+.dev.vars
+.env
+.env.*
+!.env.example
+
+# ── 日志与临时文件 ──────────────────────────────────────────────
+*.log
+_dev*.log
+_ui*.log
+_score-run*.log
+# 评分脚本的中间产物（每轮都是全新的探针结果，没有留存价值）
+tools/.score-tmp/
+tools/.plugin-score-probes.json
+tools/.plugin-score.json
+_*.mjs
+_*.png
+_*.json
+!package.json
+!package-lock.json
+!wrangler.toml
+
+# ── 打包文件（几十 MB 的源码快照，没必要进仓库）────────────────
+*.zip
+*.tar.gz
+
+# ── 编辑器 / 系统 ───────────────────────────────────────────────
+.DS_Store
+Thumbs.db
+.vscode/
+.idea/
+*.swp
+
+# ── 本地插件缓存（构建时按需重新抓取，1.3MB）────────────────────
+# 注意 build.mjs 会**优先用这里的缓存**（本机连不上 raw.githubusercontent.com）。
+# 但不进仓库是对的：用户在你机器上没有这份缓存时，构建脚本走代理抓取即可，
+# 且插件是第三方代码，不该由本仓库分发。
+plugins/
+.ghcache.json

@@ -1,0 +1,60 @@
+<?xml version="1.0" encoding="utf-8"?>
+<!--
+  music-edge Android 壳
+  设计取舍：
+    · 不用 Capacitor / TWA —— TWA 依赖 Chrome Custom Tabs，国内多数安卓机没装 Chrome 会白屏；
+      Capacitor 要拉一堆 Maven 依赖，构建链路长、易断。这里是纯 WebView，零第三方依赖。
+    · 允许明文流量 + 混合内容：音乐 CDN 有一部分只给 http 直链。
+      网页版是 https，会被浏览器按混合内容拦掉；壳里放开这一层，直连命中率更高。
+-->
+<manifest xmlns:android="http://schemas.android.com/apk/res/android"
+    package="com.zyplnn.musicedge"
+    android:versionCode="100"
+    android:versionName="1.0">
+    <!--
+      versionCode / versionName 是 aapt2 link 时用 --version-code / --version-name **覆盖**的
+      （见 build-apk.sh，值来自 src/version.js）。这里写的是兜底值：
+      直接用 Android Studio 打开这个工程、或有人手敲 aapt2 时，不至于没有版本号。
+      改版本请改 src/version.js，不要改这里。
+    -->
+
+    <uses-sdk android:minSdkVersion="21" android:targetSdkVersion="34" />
+
+    <uses-permission android:name="android.permission.INTERNET" />
+    <uses-permission android:name="android.permission.ACCESS_NETWORK_STATE" />
+    <uses-permission android:name="android.permission.WAKE_LOCK" />
+    <uses-permission android:name="android.permission.FOREGROUND_SERVICE" />
+    <uses-permission android:name="android.permission.FOREGROUND_SERVICE_MEDIA_PLAYBACK" />
+    <uses-permission android:name="android.permission.POST_NOTIFICATIONS" />
+
+    <application
+        android:allowBackup="false"
+        android:hardwareAccelerated="true"
+        android:icon="@mipmap/ic_launcher"
+        android:label="@string/app_name"
+        android:supportsRtl="true"
+        android:theme="@style/AppTheme"
+        android:usesCleartextTraffic="true">
+
+        <activity
+            android:name=".MainActivity"
+            android:configChanges="orientation|screenSize|smallestScreenSize|keyboardHidden|uiMode|screenLayout"
+            android:exported="true"
+            android:launchMode="singleTask"
+            android:windowSoftInputMode="adjustResize">
+            <intent-filter>
+                <action android:name="android.intent.action.MAIN" />
+                <category android:name="android.intent.category.LAUNCHER" />
+            </intent-filter>
+        </activity>
+
+        <!-- 播放期前台服务 = 媒体会话宿主。
+             mediaPlayback 这个类型有两个作用：Android 14 起前台服务必须声明类型；
+             声明之后系统也不会因为「用户从最近任务划掉了 App」而顺手把它收掉。 -->
+        <service
+            android:name=".PlaybackService"
+            android:exported="false"
+            android:foregroundServiceType="mediaPlayback"
+            android:stopWithTask="false" />
+    </application>
+</manifest>

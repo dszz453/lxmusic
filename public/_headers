@@ -1,0 +1,29 @@
+# 静态资源的响应头（Cloudflare Workers Static Assets 在 Worker 之前生效）
+#
+# 这里能配的必须是「资源层」的头 —— 写在 src/index.js 里没用：
+# 带 [assets] 的 Worker 默认是「先匹配资源、再进 Worker」，
+# 命中文件的请求压根不会执行 Worker 代码（/admin 就是这种）。
+
+# 管理后台：不希望被搜索引擎收录。
+# admin.html 的 <meta name="robots"> 已经声明过一次，这里补一道响应头 ——
+# 有些爬虫只看头不看 html。
+#
+# no-cache 是「每次都要回来校验」，配合 Static Assets 自带的 ETag 就是 304 或新版，
+# 不会白白浪费流量，但保证不会停在旧页面上。详见 public/sw.js 里 ADMIN_PATHS 那段。
+#
+# 注意：这里必须写成两条「路径 + 它的头」的形式。Cloudflare 的 _headers 不允许在
+# 路径末尾跟通配符匹配多个文件（/admin* 这种写法不生效），所以一个路径一段。
+/admin
+  X-Robots-Tag: noindex, nofollow
+  Cache-Control: no-cache
+
+/admin.html
+  X-Robots-Tag: noindex, nofollow
+  Cache-Control: no-cache
+
+/js/admin.js
+  Cache-Control: no-cache
+
+# Service Worker 必须每次校验，否则用户手机上会长期吃旧版本
+/sw.js
+  Cache-Control: no-cache

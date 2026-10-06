@@ -1,0 +1,47 @@
+# 构建镜像时不要发给 docker daemon 的东西。
+#
+# 运行时真正需要的只有：package.json、src/、public/、server/、tools/（见 Dockerfile 的 COPY）。
+# 其余一律排除 —— 尤其是 *_tmp / 日志 / 本地数据库，它们动辄几十 MB，
+# 还会让「同一份代码两次构建出不同镜像」。
+
+# —— 依赖与缓存 ——
+node_modules
+.wrangler
+.wrangler-dry-run
+npm-debug.log*
+
+# —— 数据（绝不能进镜像：那是用户的库）——
+data
+_dockerdata
+*dockerdata*
+*.db
+*.db-wal
+*.db-shm
+
+# —— 构建产物 / 平台工程 ——
+android
+android-build
+build
+dist
+shots
+_release
+_pluginscan
+_d1test
+_research
+
+# —— 只在本机有用的东西 ——
+probe
+test
+plugins
+*.log
+*.zip
+.cf-token
+_dev*.log
+_ui*.log
+_score-run*.log
+_probe*
+
+# —— 版本控制与 CI 自身 ——
+.git
+.gitignore
+.github

@@ -1,0 +1,201 @@
+// 每日推荐单元测试：不真出网 —— AI 与搜索都通过参数注入 fake。
+// 覆盖：北京时间跨日、prompt 组装、信号表缺席容错、生成编排（AI 成功 / AI 失败兜底 /
+// 解析不足兜底）、当天已有记录不重生成、手动刷新 force 覆盖、落库后 getDaily 读回。
+import { todayBJ, buildPrompt, collectSignals, generateDaily, getDaily, resolveAiSongs } from '../src/server/daily.js'
+
+let pass = 0, fail = 0
+const results = []
+function ok(name, cond, extra = '') {
+  if (cond) { pass++; results.push('  ✓ ' + name) }
+  else { fail++; results.push('  ✗ ' + name + (extra ? ' —— ' + extra : '')) }
+}
+
+/* ---------- fake 基建 ---------- */
+
+// 内存 D1 替身：只实现 daily.js 用到的 prepare().bind().first()/run()/all()
+function fakeDb() {
+  const daily = new Map()   // date -> row
+  const tables = { playlists: [], play_progress: [], search_history: [] }
+  return {
+    _tables: tables, _daily: daily,
+    prepare(sql) {
+      const s = sql.toUpperCase()
+      const chain = {
+        _args: [],
+        bind(...a) { this._args = a; return this },
+        async first() {
+          if (s.includes('FROM DAILY_RECOMMEND')) return daily.get(this._args[0]) || null
+          if (s.includes('FROM PLAY_PROGRESS') && s.includes('GROUP BY')) {
+            const rows = tables.play_progress
+            if (!rows.length) return null
+            const cnt = {}
+            for (const r of rows) cnt[r.user_id] = (cnt[r.user_id] || 0) + 1
+            const [user_id, n] = Object.entries(cnt).sort((a, b) => b[1] - a[1])[0]
+            return { user_id, n }
+          }
+          return null
+        },
+        async all() {
+          if (s.includes('FROM PLAYLISTS')) return { results: tables.playlists.map(r => ({ name: r.name })) }
+          return { results: [] }
+        },
+        async run() {
+          if (s.includes('INSERT INTO DAILY_RECOMMEND')) {
+            const [date, title, songs, generatedAt, generator] = this._args
+            daily.set(date, { date, title, songs, generated_at: generatedAt, generator })
+          }
+          return { success: true }
+        },
+      }
+      return chain
+    },
+    // collectSignals 走 db.js 的 listPlayHistory / listSearchHistory，它们用 prepare().bind().all()
+  }
+}
+
+// listPlayHistory/listSearchHistory 用固定 SQL 查 play_progress / search_history，
+// fakeDb 的 all() 不区分它们 —— 直接给 db 对象挂上这两个函数的替身。
+function withHistory(db, history, searches) {
+  db.listPlayHistory = async (_userId, limit) => history.slice(0, limit || 200)
+  db.listSearchHistory = async (_userId, limit) => searches.slice(0, limit || 20)
+  return db
+}
+
+const fakeEnv = (over = {}) => ({ PLUGIN_POOL: null, DB: null, ...over })
+
+// AI fake：返回指定歌单
+const aiOk = (songs, title = '测试歌单') => async () => ({ title, songs })
+// AI fake：直接抛（未配置 / 超时 / 上游 500）
+const aiBoom = async () => { throw new Error('AI 未配置') }
+// 搜索 fake：每个关键词都命中 1 首（name 里带回关键词便于断言）
+const searchOk = async (q) => ({ list: [{ source: 'kg', id: 'x_' + q, name: q, singer: '某人', img: '', types: [{ type: '128k' }] }] })
+// 搜索 fake：永远空
+const searchEmpty = async () => ({ list: [] })
+
+/* ---------- 1. 北京时间 ---------- */
+{
+  // UTC 2026-10-01T17:00:00Z = 北京 10-02 01:00 → 日期应算成 10-02
+  ok('todayBJ 跨日：UTC 17:00 已是北京次日',
+    todayBJ(Date.UTC(2026, 9, 1, 17, 0, 0)) === '2026-10-02')
+  // UTC 2026-10-01T15:59:00Z = 北京 10-01 23:59 → 还是当天
+  ok('todayBJ 不跨日：UTC 15:59 还是北京当天',
+    todayBJ(Date.UTC(2026, 9, 1, 15, 59, 0)) === '2026-10-01')
+}
+
+/* ---------- 2. buildPrompt ---------- */
+{
+  const p1 = buildPrompt({
+    playlistNames: ['深夜驾车', '粤语回忆'],
+    history: [
+      { song: { name: '海阔天空', singer: 'Beyond' }, playCount: 12 },
+      { song: { name: '富士山下', singer: '陈奕迅' }, playCount: 8 },
+      { song: { name: '海阔天空', singer: 'Beyond' }, playCount: 3 },
+    ],
+    searches: [{ keyword: '老歌' }],
+  })
+  ok('prompt 含歌单名', p1.includes('深夜驾车') && p1.includes('粤语回忆'))
+  ok('prompt 含高频歌手（Beyond 听了 15 次）', p1.includes('Beyond'))
+  ok('prompt 含搜索词', p1.includes('老歌'))
+
+  const p2 = buildPrompt({ playlistNames: [], history: [], searches: [] })
+  ok('信号全空时退化为大众口味 prompt', p2.includes('推荐'))
+
+  // play_count 汇总：海阔天空 12+3=15 > 富士山下 8 → Beyond 排前面
+  const p3 = buildPrompt({
+    playlistNames: [],
+    history: [
+      { song: { name: '富士山下', singer: '陈奕迅' }, playCount: 8 },
+      { song: { name: '海阔天空', singer: 'Beyond' }, playCount: 12 },
+      { song: { name: '海阔天空', singer: 'Beyond' }, playCount: 3 },
+    ],
+    searches: [],
+  })
+  ok('歌手按播放次数排序（Beyond 在前）', p3.indexOf('Beyond') < p3.indexOf('陈奕迅'))
+}
+
+/* ---------- 3. collectSignals 容错 ---------- */
+{
+  const badDb = {
+    prepare() { throw new Error('表不存在') },
+    listPlayHistory: async () => { throw new Error('boom') },
+    listSearchHistory: async () => { throw new Error('boom') },
+  }
+  const sig = await collectSignals(badDb, 'u1')
+  ok('三张表全炸时返回空信号而不抛',
+    Array.isArray(sig.playlistNames) && Array.isArray(sig.history) && Array.isArray(sig.searches)
+    && !sig.playlistNames.length && !sig.history.length && !sig.searches.length)
+}
+
+/* ---------- 4. generateDaily 编排 ---------- */
+{
+  // 4a. AI 成功 + 搜索能解析 → generator=ai，走 toWeb 转换
+  const db1 = withHistory(fakeDb(), [], [])
+  const aiSongs = Array.from({ length: 12 }, (_, i) => ({ name: '歌' + i, singer: '歌手' + i }))
+  const rec1 = await generateDaily(fakeEnv(), db1, {
+    force: true, toWeb: (s) => ({ ...s, web: true }),
+    aiFn: aiOk(aiSongs, '按口味挑的'), searchFn: searchOk,
+  })
+  ok('AI 链路成功 → generator=ai', rec1.generator === 'ai')
+  ok('标题用 AI 起的名', rec1.title === '按口味挑的')
+  ok('歌曲经过 toWeb 转换后落库', rec1.songs.length === 12 && rec1.songs[0].web === true)
+
+  // 落库后 getDaily 能读回（同一天）
+  const back = await getDaily(db1)
+  ok('落库后当天 getDaily 读回同一份', !!back && back.songs.length === 12 && back.generator === 'ai')
+
+  // 4b. force=false 且当天已有 → 直接返回，不再生成（AI 不会被调用）
+  let called = 0
+  const rec2 = await generateDaily(fakeEnv(), db1, {
+    force: false, aiFn: async () => { called++; return { title: 'x', songs: [] } }, searchFn: searchOk,
+  })
+  ok('当天已有记录时不重生成', called === 0 && rec2.generator === 'ai' && rec2.title === '按口味挑的')
+
+  // 4c. force=true（手动刷新）→ 覆盖当天
+  const rec3 = await generateDaily(fakeEnv(), db1, {
+    force: true, toWeb: (s) => s,
+    aiFn: aiOk(aiSongs, '换一批后的'), searchFn: searchOk,
+  })
+  ok('手动刷新覆盖当天记录', rec3.title === '换一批后的' && (await getDaily(db1)).title === '换一批后的')
+
+  // 4d. AI 抛错 → 兜底搜索
+  const db4 = withHistory(fakeDb(), [], [])
+  const rec4 = await generateDaily(fakeEnv(), db4, {
+    force: true, aiFn: aiBoom, searchFn: searchOk,
+  })
+  ok('AI 失败 → 兜底关键词搜索', rec4.generator === 'fallback' && rec4.songs.length > 0)
+  ok('兜底标题带关键词', /^今日精选 · /.test(rec4.title))
+
+  // 4e. AI 成功但解析出的歌太少 → 兜底
+  // （搜索 fake：AI 歌名「歌N」搜不到，兜底关键词「热歌」这类能搜到 —— 生产上两者走同一个真搜索）
+  const db5 = withHistory(fakeDb(), [], [])
+  const rec5 = await generateDaily(fakeEnv(), db5, {
+    force: true, toWeb: (s) => s, aiFn: aiOk(aiSongs),
+    searchFn: async (q) => (/^歌/.test(q) ? { list: [] } : searchOk(q)),
+  })
+  ok('解析不足 8 首 → 退兜底', rec5.generator === 'fallback' && rec5.songs.length > 0)
+
+  // 4f. AI 与搜索全炸 → 向上抛错
+  let threw = false
+  try {
+    await generateDaily(fakeEnv(), withHistory(fakeDb(), [], []), {
+      force: true, aiFn: aiBoom, searchFn: searchEmpty,
+    })
+  } catch { threw = true }
+  ok('兜底也搜不到时向上抛错', threw)
+}
+
+/* ---------- 5. resolveAiSongs ---------- */
+{
+  const got = await resolveAiSongs(fakeEnv(), fakeDb(), [
+    { name: '晴天', singer: '周杰伦' },
+    { name: '', singer: '' },         // 全空跳过
+    { name: '冷门歌', singer: '' },   // 搜索失败跳过
+  ], async (q) => { if (q.includes('冷门')) throw new Error('无结果'); return searchOk(q) })
+  ok('resolveAiSongs：跳过空名与搜索失败的', got.length === 1 && got[0].name.includes('晴天'))
+}
+
+/* ---------- 汇总 ---------- */
+console.log('===== daily.test =====')
+console.log(results.join('\n'))
+console.log(`===== 共 ${pass + fail} 项：${pass} 通过 / ${fail} 失败 =====`)
+process.exit(fail ? 1 : 0)

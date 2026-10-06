@@ -1,0 +1,22 @@
+{
+  "name": "lxmusic-cf",
+  "version": "1.0.0",
+  "private": true,
+  "description": "Cloudflare Workers 上的 LX 插件兼容音乐服务器（Subsonic 协议 + PWA）",
+  "scripts": {
+    "probe": "wrangler deploy -c probe/wrangler.toml",
+    "dev": "wrangler dev",
+    "build": "node build.mjs",
+    "deploy": "node build.mjs && wrangler deploy",
+    "serve": "node server/index.mjs",
+    "docker:build": "docker build -t lxmusic .",
+    "prescreen": "node tools/plugin-prescreen.mjs",
+    "test:server": "node test/server-node.mjs",
+    "build:app": "node tools/build-app.mjs"
+  },
+  "devDependencies": {
+    "@cloudflare/workerd-windows-64": "^1.20260926.1",
+    "@esbuild/win32-x64": "^0.28.1",
+    "wrangler": "^4.142.0"
+  }
+}

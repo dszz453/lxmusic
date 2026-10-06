@@ -1,0 +1,12 @@
+<?xml version="1.0" encoding="utf-8"?>
+<!-- Android 6+ 深色状态栏图标（浅色背景上要深色字），单独放 v23 避免低版本解析报错 -->
+<resources>
+    <style name="AppTheme" parent="@android:style/Theme.Material.Light.NoActionBar">
+        <item name="android:windowBackground">#FFFFFFFF</item>
+        <item name="android:statusBarColor">#FFFFFFFF</item>
+        <item name="android:navigationBarColor">#FFFFFFFF</item>
+        <item name="android:windowLightStatusBar">true</item>
+        <item name="android:colorPrimary">#FFEC4141</item>
+        <item name="android:colorAccent">#FFEC4141</item>
+    </style>
+</resources>

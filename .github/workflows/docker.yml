@@ -1,0 +1,124 @@
+name: docker
+
+# 构建并推送自托管镜像到 GHCR，附带一次「真起容器跑一遍」的验收。
+#
+# 为什么每次都要真起容器：这个镜像的价值就在于「一个 docker run 就能用」，
+# 而 Dockerfile 与 server/index.mjs 里最容易出错的恰恰是运行期才暴露的东西
+# （node:sqlite 能不能用、插件求值会不会把进程搞死、静态资源发不发得出来）。
+# 只 build 不 run，这些问题要到用户手里才发现。
+
+on:
+  push:
+    branches: [main, master]
+    tags: ['v*']
+  # 允许在 Actions 页面手动点一次
+  workflow_dispatch:
+
+env:
+  IMAGE: ghcr.io/${{ github.repository }}
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      packages: write
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: docker/setup-qemu-action@v3
+      - uses: docker/setup-buildx-action@v3
+
+      - name: 登录 GHCR
+        uses: docker/login-action@v3
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - id: meta
+        uses: docker/metadata-action@v5
+        with:
+          images: ${{ env.IMAGE }}
+          tags: |
+            type=raw,value=latest,enable={{is_default_branch}}
+            type=ref,event=tag
+            type=sha,format=short
+
+      - uses: docker/build-push-action@v6
+        with:
+          context: .
+          # iStoreOS / 群晖 / N100 小主机基本是 amd64；arm64 覆盖树莓派与部分软路由
+          platforms: linux/amd64,linux/arm64
+          push: true
+          tags: ${{ steps.meta.outputs.tags }}
+          labels: ${{ steps.meta.outputs.labels }}
+          cache-from: type=gha
+          cache-to: type=gha,mode=max
+
+  verify:
+    # 单独一个 job：只在这一台架构上构建本地镜像，然后真跑起来验收
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: docker/setup-buildx-action@v3
+
+      - name: 构建（本地，不推送）
+        uses: docker/build-push-action@v6
+        with:
+          context: .
+          load: true
+          tags: lxmusic:ci
+          cache-from: type=gha
+
+      - name: 起容器
+        # 刻意**照真实部署的样子来**：预建目录并交给 1000，再 --user 1000:1000。
+        #
+        # 以前这里写的是 `mkdir -p && chmod 777`，图省事 —— 但那样一来
+        # 「宿主机目录属主不对导致容器写不进去」这个**真机上第一个会踩的坑**
+        # 在 CI 里永远暴露不出来（chmod 777 把权限问题整个抹平了）。
+        # 这个坑我在 Debian 上真踩过：容器无限重启，日志只有一句
+        # `unable to open database file`。CI 要能挡住它，就不能靠 777 绕过。
+        run: |
+          mkdir -p "$RUNNER_TEMP/lxdata"
+          chown -R 1000:1000 "$RUNNER_TEMP/lxdata"
+          docker run -d --name lxmusic-ci \
+            -p 8787:8787 \
+            -v "$RUNNER_TEMP/lxdata:/data" \
+            --user 1000:1000 \
+            -e LX_SESSION_SECRET=ci-secret \
+            -e LX_SCORE_INTERVAL=off \
+            lxmusic:ci
+        # LX_SCORE_INTERVAL=off：CI 里没必要真跑一轮评分（要几分钟，
+        # 而且会去打第三方音源站）。评分的真机验收在 test/rescore-docker.mjs，
+        # 按需手动跑。
+
+      - name: 等健康检查通过
+        run: |
+          # 实测正常 1~2 秒就绪；这里给 60 次 × 2 秒 = 2 分钟，纯粹是给 CI runner
+          # 偶发 IO 抖动留余量。一直不通过就把容器日志打出来便于排错。
+          for i in $(seq 1 60); do
+            code=$(curl -s -o /dev/null -w '%{http_code}' http://127.0.0.1:8787/healthz || true)
+            if [ "$code" = "200" ]; then echo "健康检查通过（第 ${i} 次，约 $((i*2)) 秒）"; exit 0; fi
+            sleep 2
+          done
+          echo "健康检查一直没通过，容器日志："
+          docker logs lxmusic-ci
+          exit 1
+
+      - name: 容器日志（插件加载结果）
+        run: docker logs lxmusic-ci
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: '22'
+
+      - name: 端到端验收（真 HTTP，覆盖 sqlite 适配层与静态资源）
+        env:
+          LX_BASE: http://127.0.0.1:8787
+        run: node test/server-node.mjs
+
+      - name: 失败时导日志
+        if: failure()
+        run: docker logs lxmusic-ci || true

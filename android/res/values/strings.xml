@@ -1,0 +1,17 @@
+<?xml version="1.0" encoding="utf-8"?>
+<resources>
+    <string name="app_name">music-edge</string>
+    <string name="notif_channel">播放</string>
+    <!-- 占位通知：为了守住 startForeground 的 5 秒期限而先露个面，几毫秒后就被真实曲目顶掉 -->
+    <string name="notif_preparing">正在准备播放…</string>
+
+    <!-- 媒体通知上的三个按键。Android 13 会把它们渲染进系统媒体卡片，
+         所以这几个名字会直接出现在锁屏 / 控制中心里 -->
+    <string name="act_prev">上一首</string>
+    <string name="act_play">播放</string>
+    <string name="act_pause">暂停</string>
+    <string name="act_next">下一首</string>
+
+    <string name="notif_denied">没有通知权限，锁屏与通知栏看不到播放控制。可在系统设置里为 music-edge 打开通知。</string>
+    <string name="notif_ok">通知权限已开启</string>
+</resources>

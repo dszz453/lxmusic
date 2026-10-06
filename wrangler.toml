@@ -1,0 +1,46 @@
+name = "lxmusic"
+main = "src/index.js"
+compatibility_date = "2025-09-01"
+compatibility_flags = ["nodejs_compat"]
+workers_dev = true
+
+# 每日推荐定时生成：UTC 22:00 = 北京时间 06:00（CF cron 只认 UTC）。
+# 生成逻辑见 src/index.js 的 scheduled；手动刷新走 POST /api/daily/refresh。
+[triggers]
+crons = ["0 22 * * *"]
+
+# 自定义域名（workers.dev 在国内 DNS 被污染，必须绑自有域名）
+routes = [
+  { pattern = "music.zyplnn.dpdns.org", custom_domain = true }
+]
+
+[[d1_databases]]
+binding = "DB"
+database_name = "lxmusic-db"
+database_id = "cf13afc2-2c37-4a5c-a2fb-647ae70ebfe3"
+
+[assets]
+directory = "./public"
+binding = "ASSETS"
+not_found_handling = "none"
+
+[vars]
+# 综合搜索 / 首页推荐 / AI 匹配默认用哪些源。
+# 加 xm（喜马拉雅）的原因：它是唯一的有声书/播客平台，实测 CF 出口 200 / ~1.1s，
+# 不带上它「综合搜索」就等于搜不到有声内容，用户只能手动切平台。
+# 实测各平台单独搜索的耗时都远低于 7s 硬超时，多带一个不拖慢整体（并发跑的）。
+# 管理员也可以在「音源与插件 -> 默认搜索源」里改（写 D1，优先级高于这里）。
+DEFAULT_SOURCES = "kg,wy,kw,tx,xm"
+
+# 会话签名密钥（用于 PWA 登录态、Subsonic 代理）
+SESSION_SECRET = "e43ca2621ae9502323f09cb7f504aa9c3e6405d5fb76dc5c"
+
+# —— AI 歌单（可选，也可在管理后台「设置」里填，走 D1 settings，优先级更高）——
+# provider: qwen（阿里云百炼，默认）| openai | cloudflare（CF Workers AI）| 自定义
+# baseURL / model 严格跟随 provider 内置默认（qwen→dashscope，openai→api.openai.com，
+# cloudflare→api.cloudflare.com），如需自定义请在后台「设置」里填（写 D1 settings）。
+AI_PROVIDER = "qwen"
+# 填你自己的 API Key（阿里云百炼 / OpenAI / Cloudflare cfut_）；留空则走 D1 settings
+AI_API_KEY = ""
+# Cloudflare Workers AI 专用：账户 ID（provider=cloudflare 时必填，否则走 D1 settings）
+AI_ACCOUNT_ID = ""

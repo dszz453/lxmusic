@@ -1,0 +1,29 @@
+{
+  "name": "云音乐 · 在线音乐聚合",
+  "short_name": "云音乐",
+  "description": "聚合酷狗、网易云、酷我、QQ音乐的多平台在线音乐应用，兼容落雪插件，支持歌单导入与 Subsonic 客户端接入。",
+  "id": "/",
+  "start_url": "/#/",
+  "scope": "/",
+  "display": "standalone",
+  "display_override": ["standalone", "minimal-ui"],
+  "orientation": "portrait",
+  "background_color": "#ffffff",
+  "theme_color": "#ec4141",
+  "lang": "zh-CN",
+  "dir": "ltr",
+  "categories": ["music", "entertainment"],
+  "prefer_related_applications": false,
+  "icons": [
+    { "src": "/icons/favicon-32.png", "sizes": "32x32", "type": "image/png" },
+    { "src": "/icons/icon-192.png", "sizes": "192x192", "type": "image/png", "purpose": "any" },
+    { "src": "/icons/icon-512.png", "sizes": "512x512", "type": "image/png", "purpose": "any" },
+    { "src": "/icons/icon-maskable-512.png", "sizes": "512x512", "type": "image/png", "purpose": "maskable" }
+  ],
+  "shortcuts": [
+    { "name": "搜索歌曲", "short_name": "搜索", "url": "/#/search" },
+    { "name": "我的歌单", "short_name": "歌单", "url": "/#/library" },
+    { "name": "我喜欢的音乐", "short_name": "收藏", "url": "/#/favorite" },
+    { "name": "排行榜", "short_name": "榜单", "url": "/#/charts" }
+  ]
+}

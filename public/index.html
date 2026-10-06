@@ -1,0 +1,255 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width,initial-scale=1,viewport-fit=cover,maximum-scale=1,user-scalable=no">
+<meta name="theme-color" content="#ffffff">
+<meta name="apple-mobile-web-app-capable" content="yes">
+<meta name="apple-mobile-web-app-status-bar-style" content="default">
+<meta name="apple-mobile-web-app-title" content="云音乐">
+<meta name="format-detection" content="telephone=no">
+<title>云音乐 · 在线音乐聚合</title>
+<link rel="manifest" href="/manifest.json">
+<link rel="icon" type="image/png" sizes="32x32" href="/icons/favicon-32.png">
+<link rel="apple-touch-icon" sizes="180x180" href="/icons/apple-touch-icon.png">
+<meta name="mobile-web-app-capable" content="yes">
+<link rel="stylesheet" href="/css/app.css">
+</head>
+<body>
+
+<div id="app">
+
+  <!-- ===== 顶部栏 ===== -->
+  <header class="topbar" id="topbar">
+    <div class="topbar__left">
+      <button class="icon-btn" id="btnMenu" aria-label="菜单">
+        <svg viewBox="0 0 24 24"><path d="M3 6h18M3 12h18M3 18h18"/></svg>
+      </button>
+    </div>
+    <a class="topbar__search" id="topSearch" href="#/search">
+      <svg viewBox="0 0 24 24" class="ico-search"><circle cx="11" cy="11" r="7"/><path d="M20 20l-3.5-3.5"/></svg>
+      <span id="searchHint">搜索歌曲、专辑、有声书</span>
+    </a>
+    <div class="topbar__right">
+      <button class="icon-btn" id="btnAccount" aria-label="我的">
+        <svg viewBox="0 0 24 24"><circle cx="12" cy="8" r="4"/><path d="M4 21c0-4.4 3.6-8 8-8s8 3.6 8 8"/></svg>
+      </button>
+    </div>
+  </header>
+
+  <!-- ===== 主视图 ===== -->
+  <main id="view" class="view"></main>
+
+  <!-- ===== 迷你播放条 ===== -->
+  <div class="miniplayer" id="miniplayer" hidden>
+    <div class="miniplayer__progress" id="miniProgress"><i></i></div>
+    <div class="miniplayer__inner">
+      <div class="miniplayer__cover" id="miniCover"></div>
+      <div class="miniplayer__meta">
+        <div class="miniplayer__title" id="miniTitle">未在播放</div>
+        <div class="miniplayer__artist" id="miniArtist"></div>
+      </div>
+      <button class="icon-btn icon-btn--play" id="miniPlay" aria-label="播放/暂停">
+        <svg viewBox="0 0 24 24" id="miniPlayIcon"><path d="M8 5v14l11-7z" fill="currentColor" stroke="none"/></svg>
+      </button>
+      <button class="icon-btn" id="miniNext" aria-label="下一首">
+        <svg viewBox="0 0 24 24"><path d="M6 5l9 7-9 7z" fill="currentColor" stroke="none"/><rect x="16" y="5" width="2.2" height="14" rx="1" fill="currentColor" stroke="none"/></svg>
+      </button>
+    </div>
+  </div>
+
+  <!-- ===== 底部标签栏 ===== -->
+  <nav class="tabbar" id="tabbar">
+    <a class="tabbar__item is-active" data-tab="home" href="#/">
+      <svg viewBox="0 0 24 24"><path d="M3 10.5L12 3l9 7.5"/><path d="M5.5 9.5V20h13V9.5"/></svg>
+      <span>发现</span>
+    </a>
+    <a class="tabbar__item" data-tab="library" href="#/library">
+      <svg viewBox="0 0 24 24"><rect x="4" y="4" width="16" height="16" rx="3"/><path d="M9 4v16M4 10h16"/></svg>
+      <span>我的歌单</span>
+    </a>
+    <a class="tabbar__item" data-tab="favorite" href="#/favorite">
+      <svg viewBox="0 0 24 24"><path d="M12 20s-7-4.6-7-9.6A4.4 4.4 0 0 1 12 8a4.4 4.4 0 0 1 7 2.4c0 5-7 9.6-7 9.6z"/></svg>
+      <span>收藏</span>
+    </a>
+    <a class="tabbar__item" data-tab="mine" href="#/mine">
+      <svg viewBox="0 0 24 24"><circle cx="12" cy="8" r="4"/><path d="M4 21c0-4.4 3.6-8 8-8s8 3.6 8 8"/></svg>
+      <span>我的</span>
+    </a>
+  </nav>
+
+  <!-- ===== 全屏播放器 ===== -->
+  <section class="player" id="player" hidden>
+    <div class="player__bg" id="playerBg"></div>
+    <div class="player__nav">
+      <button class="icon-btn icon-btn--light" id="playerCollapse" aria-label="收起">
+        <svg viewBox="0 0 24 24"><path d="M6 9l6 6 6-6"/></svg>
+      </button>
+      <div class="player__nav-info">
+        <div class="player__nav-title" id="playerNavTitle"></div>
+        <div class="player__nav-artist" id="playerNavArtist"></div>
+      </div>
+      <button class="icon-btn icon-btn--light" id="btnQuality" aria-label="音质"><span id="qualityLabel">320k</span></button>
+    </div>
+
+    <div class="player__stage" id="playerStage">
+      <div class="player__disc" id="playerDisc">
+        <div class="player__cover" id="playerCover"></div>
+      </div>
+      <div class="player__lyric" id="playerLyric">
+        <div class="lyric-scroll" id="lyricScroll"></div>
+      </div>
+    </div>
+
+    <div class="player__meta">
+      <div class="player__title" id="playerTitle">未在播放</div>
+      <div class="player__artist" id="playerArtist"></div>
+    </div>
+
+    <!-- 歌词偏移校准：声音比高亮慢（蓝牙耳机常见）就按 +，把歌词往后挪。
+         刻意放在歌词区**外面**、歌名下面：早先它是 .player__lyric 里的 absolute
+         元素，等于浮在歌词列表上，上下滑歌词或点某行跳转时手指很容易顺手点到 −/+，
+         偏移被改掉了用户还不知道。移出后不再跟歌词抢点击。 -->
+    <div class="lyric-cal" id="lyricCal">
+      <span class="lyric-cal__label">歌词偏移</span>
+      <button class="lyric-cal__btn" id="lyricCalMinus" aria-label="歌词提前一档">−</button>
+      <button class="lyric-cal__val" id="lyricCalVal" title="点一下复位为同步">同步</button>
+      <button class="lyric-cal__btn" id="lyricCalPlus" aria-label="歌词延后一档">+</button>
+    </div>
+
+    <div class="player__actions">
+      <button class="icon-btn icon-btn--light" id="btnFav" aria-label="收藏">
+        <svg viewBox="0 0 24 24" id="favIcon"><path d="M12 20s-7-4.6-7-9.6A4.4 4.4 0 0 1 12 8a4.4 4.4 0 0 1 7 2.4c0 5-7 9.6-7 9.6z"/></svg>
+      </button>
+      <!-- 音色：Web Audio 均衡器预设。开启后取流会自动避开没有 CORS 头的音源 -->
+      <button class="icon-btn icon-btn--light" id="btnTone" aria-label="音色">
+        <svg viewBox="0 0 24 24" id="toneIcon">
+          <path d="M4 9h2.2M8.6 9H20M4 15h11.4M18 15h2"/>
+          <circle cx="7.4" cy="9" r="2.1" fill="currentColor" stroke="none"/>
+          <circle cx="16.8" cy="15" r="2.1" fill="currentColor" stroke="none"/>
+        </svg>
+      </button>
+    </div>
+
+    <div class="player__progress">
+      <span id="curTime">00:00</span>
+      <div class="range" id="progressRange"><div class="range__track"><i id="progressFill"></i></div><div class="range__thumb" id="progressThumb"></div></div>
+      <span id="totalTime">00:00</span>
+    </div>
+
+    <div class="player__controls">
+      <button class="icon-btn icon-btn--light" id="btnMode" aria-label="播放模式">
+        <svg viewBox="0 0 24 24"><path d="M4 7h13l-3-3M20 17H7l3 3"/></svg>
+      </button>
+      <button class="icon-btn icon-btn--light icon-btn--lg" id="btnPrev" aria-label="上一首">
+        <svg viewBox="0 0 24 24"><path d="M18 5l-9 7 9 7z" fill="currentColor" stroke="none"/><rect x="5.8" y="5" width="2.2" height="14" rx="1" fill="currentColor" stroke="none"/></svg>
+      </button>
+      <button class="play-btn" id="btnPlay" aria-label="播放/暂停">
+        <svg viewBox="0 0 24 24" id="playIcon"><path d="M8 5v14l11-7z" fill="currentColor" stroke="none"/></svg>
+      </button>
+      <button class="icon-btn icon-btn--light icon-btn--lg" id="btnNext" aria-label="下一首">
+        <svg viewBox="0 0 24 24"><path d="M6 5l9 7-9 7z" fill="currentColor" stroke="none"/><rect x="16" y="5" width="2.2" height="14" rx="1" fill="currentColor" stroke="none"/></svg>
+      </button>
+      <button class="icon-btn icon-btn--light" id="btnQueue" aria-label="播放队列">
+        <svg viewBox="0 0 24 24"><path d="M4 6h16M4 12h16M4 18h10"/></svg>
+      </button>
+    </div>
+
+    <div class="player__footer" id="playerResolvedBy"></div>
+  </section>
+
+  <!-- ===== 队列抽屉 ===== -->
+  <section class="sheet" id="queueSheet" hidden>
+    <div class="sheet__mask" data-close></div>
+    <div class="sheet__panel">
+      <div class="sheet__head">
+        <span>播放队列 <em id="queueCount">0</em></span>
+        <button class="icon-btn" data-close aria-label="关闭"><svg viewBox="0 0 24 24"><path d="M6 6l12 12M18 6L6 18"/></svg></button>
+      </div>
+      <div class="sheet__body" id="queueList"></div>
+    </div>
+  </section>
+
+  <!-- ===== 通用抽屉（菜单/音源等）===== -->
+  <section class="sheet" id="drawer" hidden>
+    <div class="sheet__mask" data-close></div>
+    <div class="sheet__panel">
+      <div class="sheet__head">
+        <span id="drawerTitle">菜单</span>
+        <button class="icon-btn" data-close aria-label="关闭"><svg viewBox="0 0 24 24"><path d="M6 6l12 12M18 6L6 18"/></svg></button>
+      </div>
+      <div class="sheet__body" id="drawerBody"></div>
+    </div>
+  </section>
+
+  <div class="toast" id="toast" hidden></div>
+  <!-- 不加 crossorigin：第三方 CDN 多数不带 CORS 头，加了反而放不了 -->
+  <audio id="audio" preload="metadata"></audio>
+</div>
+
+<!--
+  版本自愈：Service Worker 换了新版本就自己刷一次页面。
+
+  为什么必须写在 index.html 里、而不能放进 app.js：
+    app.js 自己就是「可能被旧缓存喂回来的那个文件」。发版后第一次打开，
+    导航是网络优先（拿到新 HTML），但紧接着的 /js/app.js 是
+    stale-while-revalidate —— 旧 SW 会**先把旧 app.js 吐回来**再去后台更新。
+    结果就是：代码已经发了新版本，用户看到的还是旧界面，必须手动强刷两次。
+    （「搜索页没有喜马拉雅/专辑入口、上拉加载更多不动」就是这么来的。）
+
+  只在「本来就有旧 SW 在管 -> 换成新 SW」时刷一次
+  （首次安装也会触发 controllerchange，那一次不能刷，否则白闪一下）。
+-->
+<script>
+(function () {
+  if (!('serviceWorker' in navigator)) return
+  var hadController = !!navigator.serviceWorker.controller
+  var done = false
+  navigator.serviceWorker.addEventListener('controllerchange', function () {
+    if (!hadController || done) return
+    done = true
+    // 换的是新版本 -> 重新加载一次，让页面拿到与 SW 同版本的静态资源
+    location.reload()
+  })
+})()
+</script>
+
+<!--
+  版本号注入。
+  为什么放在这里、而不是写在某个 js 里：它要在**任何脚本之前**就位，
+  因为设置页可能在 app.js 一加载完就被渲染出来（深链接进 #/settings）。
+  壳里（WebView）由 Java 侧在页面加载前把 window.LX_VERSION 塞进来；
+  这里做两件事：
+    1. 兜底：没有任何宿主注入时，至少给个占位，不要显示 undefined；
+    2. 组合出 LX_VERSION_LINE —— APP 版本 + 构建标识，供设置页/关于页直接用。
+  ⚠ 服务端版本**不在这里取**：那要走网络，放这儿会拖慢首屏。设置页渲染完再异步补（见 app.js）。
+-->
+<script>
+(function () {
+  var native = window.LX_VERSION || ''          // 安卓壳注入（Java: evaluateJavascript）
+  window.LX_VERSION = native || 'web'
+  window.LX_BUILD = window.LX_BUILD || 'dev'
+  window.LX_VERSION_LINE = '客户端 ' + window.LX_VERSION + ' (' + window.LX_BUILD + ')'
+})()
+</script>
+
+<!--
+  加载顺序有讲究，安卓壳（离线包）依赖它：
+    1. util.js / plugins.data.js —— 纯数据与工具，无依赖
+    2. backend.bundle.js         —— 由 tools/build-app.mjs 生成的展平版后端（挂 window.LXBackend）
+    3. native.js                 —— 桥接层：换掉 fetch / DB，并把 /api/* 接到本地后端。
+                                    必须在 api.js、app.js 之前，才能赶在它们发第一个请求前生效。
+                                    桥不存在时（普通浏览器）本文件直接返回，行为与线上完全一致。
+    4. api.js / lxplugin.js / player.js / app.js —— 前端主体，全部零改动
+-->
+<script src="/js/util.js"></script>
+<script src="/js/plugins.data.js"></script>
+<script src="/js/backend.bundle.js"></script>
+<script src="/js/native.js"></script>
+<script src="/js/api.js"></script>
+<script src="/js/lxplugin.js"></script>
+<script src="/js/tone.js"></script>
+<script src="/js/player.js"></script>
+<script src="/js/app.js"></script>
+</body>
+</html>
