@@ -32,10 +32,16 @@
 # 官方镜像（GitHub Actions 自动构建）：ghcr.io/dszz453/lxmusic:latest
 FROM node:22-bookworm-slim
 
+# 构建标识：CI 传 commit sha 进来，`/api/version` 的 build 字段就会显示它。
+# 用途很具体 —— 部署完想知道「这台机器上跑的是不是我刚推的那一版」，
+# 否则只能去容器里翻文件比对（实测翻过好几次）。不传就是 'dev'。
+ARG LX_BUILD_ID=docker
+
 ENV NODE_ENV=production \
     LX_PORT=8787 \
     LX_HOST=0.0.0.0 \
-    LX_DATA_DIR=/data
+    LX_DATA_DIR=/data \
+    LX_BUILD_ID=$LX_BUILD_ID
 
 WORKDIR /app
 

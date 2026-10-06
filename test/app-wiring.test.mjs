@@ -44,6 +44,20 @@ function ok(name, cond, detail) {
 
 const manifest = read('android/AndroidManifest.xml')
 const buildSh = read('android/build-apk.sh')
+/**
+ * 版本号的**单一事实来源**。
+ *
+ * 1.10 起 build-apk.sh 不再写死 VERSION_CODE / VERSION_NAME ——
+ * 它是 `VERSION_CODE="$(node -e "import('./src/version.js')…")"` 这样读出来的。
+ * 于是早先那版「拿正则去 build.sh 里抠数字」的断言必然抠不到（实测报 `脚本 null`），
+ * 但**产品其实是对的**：两处都对，只是比对的中介物选错了。
+ *
+ * 正确口径是「清单(兜底值) ↔ src/version.js(事实来源)」，
+ * 顺带保证 build-apk.sh 确实是从那边取的（否则改了 version.js 而包里没变）。
+ */
+const versionJs = read('src/version.js')
+const srcCode = /APP_VERSION_CODE\s*=\s*(\d+)/.exec(versionJs)
+const srcName = /APP_VERSION\s*=\s*['"]([^'"]+)['"]/.exec(versionJs)
 const mediaBridge = readJava('MediaBridge.java')
 const playback = readJava('PlaybackService.java')
 const mainActivity = readJava('MainActivity.java')
@@ -178,15 +192,48 @@ ok('通知权限状态、通知总开关、通道状态都能查',
 console.log('\n== 7. 版本号一致性与发布约束 ==')
 const mc = /android:versionCode="(\d+)"/.exec(manifest)
 const mn = /android:versionName="([\d.]+)"/.exec(manifest)
-const sc = /VERSION_CODE=(\d+)/.exec(buildSh)
-const sn = /VERSION_NAME="([\d.]+)"/.exec(buildSh)
-ok('清单与构建脚本的 versionCode 一致',
-  mc && sc && mc[1] === sc[1], `清单 ${mc && mc[1]} / 脚本 ${sc && sc[1]}`)
-ok('清单与构建脚本的 versionName 一致',
-  mn && sn && mn[1] === sn[1], `清单 ${mn && mn[1]} / 脚本 ${sn && sn[1]}`)
+
+// 事实来源必须有值，否则后面全是「null === null」的假通过
+ok('src/version.js 声明了 APP_VERSION 与 APP_VERSION_CODE',
+  !!(srcCode && srcCode[1]) && !!(srcName && srcName[1]),
+  `APP_VERSION=${srcName && srcName[1]} / CODE=${srcCode && srcCode[1]}`)
+
+const wantName = (srcName && srcName[1] || '').replace(/^v/i, '')
+const wantCode = srcCode && srcCode[1]
+ok('清单里的 versionCode 与 src/version.js 一致',
+  !!mc && !!wantCode && mc[1] === wantCode, `清单 ${mc && mc[1]} / version.js ${wantCode}`)
+ok('清单里的 versionName 与 src/version.js 一致',
+  !!mn && !!wantName && mn[1] === wantName, `清单 ${mn && mn[1]} / version.js ${wantName}`)
+
+// 构建脚本必须是**从 version.js 取**，不能自己写死一套 —— 否则改了 version.js 包里没变
+ok('build-apk.sh 从 src/version.js 读版本（不是自己写死一套）',
+  /VERSION_CODE="\$\(node[^)]*src\/version\.js/.test(buildSh) &&
+  /VERSION_NAME="\$\(node[^)]*src\/version\.js/.test(buildSh),
+  '没看到从 src/version.js 取值的写法')
+ok('aapt2 link 用的就是这两个变量（取到了却没传进去 = 白取）',
+  /--version-code\s+\$VERSION_CODE/.test(buildSh) && /--version-name\s+"\$VERSION_NAME"/.test(buildSh))
+
+// 本版说明段：约定形如 `# 1.0：……`
 ok('构建脚本里有本版说明（每次改包都该写清楚改了什么）',
-  buildSh.includes('1.' + mn[1].split('.')[1] + '：') || buildSh.includes('#' + ' ' + mn[1]),
-  '没找到 1.' + (mn && mn[1].split('.')[1]) + ' 的说明段')
+  buildSh.includes('# ' + wantName + '：'), '没找到 `# ' + wantName + '：` 的说明段')
+
+/* 发版规矩（老板 2026-10-06 定）：每发一版 APP_VERSION 升 0.1、APP_VERSION_CODE +1。
+ * 这条规矩没法靠测试「强制」—— 测试不知道什么时候算发了一版。
+ * 能强制的是**同一次发版里几处别漏改**：版本改了、code 没改，手机上装不上新版；
+ * package.json 跟不上，npm 侧看到的又是另一个数字。所以这里把「一致性」钉住。 */
+console.log('\n== 7b. 发版规矩：几处版本号必须同步 ==')
+const pkg = JSON.parse(read('package.json'))
+// V1.1 ↔ 1.1.0 （产品版本两位 → semver 补一个 .0）
+const wantPkg = wantName + '.0'
+ok('package.json 的 version 与 src/version.js 对得上',
+  pkg.version === wantPkg, `package.json ${pkg.version} / 期望 ${wantPkg}`)
+ok('versionCode 是个只增不减的整数（Android 靠它判断能否覆盖安装）',
+  /^\d+$/.test(String(wantCode)), 'code=' + wantCode)
+ok('README 头部的「当前版本」跟得上 src/version.js',
+  read('README.md').includes('当前版本：V' + wantName),
+  'README 里没找到 `当前版本：V' + wantName + '`')
+ok('sw.js 的 VERSION 没被当成产品版本用（两条线要分开）',
+  !new RegExp("APP_VERSION\\s*=\\s*'v").test(versionJs))
 
 const swVer = /const VERSION = 'v(\d+)'/.exec(read('public/sw.js'))
 ok('sw.js 的 VERSION 存在（改静态资源必须抬它，否则手机吃旧缓存）', !!swVer,

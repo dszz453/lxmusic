@@ -1,5 +1,5 @@
 /* 由 tools/build-app.mjs 自动生成，请勿手动修改。
- * 源摘要: 9ffee91cb10364bd
+ * 源摘要: b9b2bebaf9521fe9
  * 模块数: 22
  *
  * 这是给安卓壳用的后端展平版：把 src/ 的 ESM 后端打成单个 IIFE，
@@ -7158,32 +7158,52 @@ __modules["src/version.js"] = function (__exports, __require) {
  * 所以统一读这里，谁也别再各写各的。
  *
  * ── 两条版本线，别混 ──────────────────────────────────────────
- *   APP_VERSION      产品版本，人看的。改功能才动它。当前 V1.0
+ *   APP_VERSION      产品版本，人看的。改功能才动它。当前 V1.1
  *   APP_VERSION_CODE 整数构建号，Android 靠它判断「能不能覆盖安装」。
  *                    每次要发新版就 +1，**不能倒退、不能重复**，
  *                    否则手机上会报「应用未安装」（签名相同也装不上）。
  *
- * sw.js 里那个 `VERSION='v20'` 是另一回事：它只管浏览器静态缓存该不该失效，
- * 每次改前端资源都要 +1，跟产品版本解耦。别把两者合并 —— 合并的后果是
- * 「只想刷新一下缓存，却被迫宣布发了个新版本」。
+ * ── 发版规矩（老板 2026-10-06 定的）────────────────────────────
+ *   **每发一个版本，APP_VERSION 升 0.1**（V1.0 → V1.1 → V1.2 …），
+ *   同时 APP_VERSION_CODE +1。两件事一次做完，别只改一个 ——
+ *   只改名字不改 code，手机上装不上新版；只改 code 不改名字，用户看不出换了。
+ *   一次发版=一次对外可见的变化，别把好几个改动攒着当一版发。
+ *
+ * sw.js 里那个 `VERSION='vNN'` 是另一回事：它只管浏览器静态缓存该不该失效，
+ * 每次改前端资源都要 +1，跟产品版本解耦。**这里不写它的当前值** ——
+ * 写了就会过期（早先这里写着 v20，而实际已经 v22 了，纯属误导），
+ * 要看得去 public/sw.js 里读。
+ * 别把两者合并 —— 合并的后果是「只想刷新一下缓存，却被迫宣布发了个新版本」。
  */
 
-/** 产品版本（对外展示用）。V1.0 起。 */
-const APP_VERSION = 'V1.0'
+/** 产品版本（对外展示用）。每发一版升 0.1。 */
+const APP_VERSION = 'V1.1'
 
-/** Android versionCode：整数、单调递增、跨次发布不可重复。 */
-const APP_VERSION_CODE = 100
+/** Android versionCode：整数、单调递增、跨次发布不可重复。每发一版 +1。 */
+const APP_VERSION_CODE = 101
 
 /** 人类可读的完整标识，日志/关于页用。 */
 const APP_ID = 'lxmusic'
 
 /**
- * 构建标识。Docker 里由构建参数注入（镜像 tag / git sha），
- * 本地跑就是 'dev'。用来回答「这台机器上跑的是哪一次构建」。
+ * 构建标识。用来回答「这台机器上跑的是哪一次构建」。
+ *
+ * 由构建参数注入：Dockerfile 收 `--build-arg LX_BUILD_ID=…`（CI 传 commit sha），
+ * 本地直接跑源码就是 'dev'。
+ *
+ * 为什么非要它不可：**光看产品版本号分辨不出代码新旧** —— V1.0 会挂很久，
+ * 部署完到底有没有生效，之前只能靠「去抓某个文件里有没有某段字符串」这种土办法。
+ * 有了它，`curl /api/version` 一眼就能对上：接口里那个 sha 是不是你刚推的那一次。
  */
-const BUILD_ID = (typeof process !== 'undefined' && process.env && process.env.LX_BUILD_ID) || 'dev'
+const BUILD_ID = String(
+  (typeof process !== 'undefined' && process.env && process.env.LX_BUILD_ID) || 'dev',
+)
+  .trim()
+  // 完整的 40 位 sha 太长，日志和页面里都挤。取前 12 位已经足够区分，
+  // 又能在 git 里直接搜到那一次提交。
+  .slice(0, 12) || 'dev'
 
-/** 一行式版本串：`lxmusic V1.0 (dev)` */
+/** 一行式版本串，形如 `lxmusic V1.1 (3a41e22a1b2c)` */
 function versionLine() {
   return `${APP_ID} ${APP_VERSION} (${BUILD_ID})`
 }

@@ -98,10 +98,14 @@ docker compose logs -f          # 看启动日志
 
 ```sh
 curl -s http://127.0.0.1:8787/api/version
-# {"ok":true,"app":"lxmusic","version":"V1.0","versionCode":100,"build":"dev","full":"lxmusic V1.0 (dev)"}
+# {"ok":true,"app":"lxmusic","version":"V1.1","versionCode":101,"build":"3a41e22a1b2c","full":"lxmusic V1.1 (3a41e22a1b2c)"}
 curl -s http://127.0.0.1:8787/healthz | grep -o '"version":{[^}]*}'
 docker logs lxmusic | head -3          # 启动第一行就带版本
 ```
+
+`build` 是构建标识（CI 传的 commit sha 前 12 位），**用来确认部署真的生效了**：
+它应该等于你刚推的那次提交的 sha 前缀。若显示 `dev`，说明这个镜像不是 CI 构建的
+（比如本地 `docker build` 没带 `--build-arg LX_BUILD_ID=…`）。
 
 或者直接看应用里：**设置页底部「版本」**会同时显示客户端版本与服务端版本；
 两者不一致时会高亮 —— 这正是「APP 装了新版、连的却是旧服务器」的典型症状。

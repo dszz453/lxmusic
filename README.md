@@ -1,12 +1,16 @@
 # music-edge · 安卓 APP（自包含） + Cloudflare Workers 源码包
 
-> **当前版本：V1.0**
+> **当前版本：V1.1**
 >
 > 同一份 `src/` 同时服务三个宿主，靠**运行时宿主能力判定**分支，不做编译期分叉：
 > Cloudflare Workers（线上）、安卓壳（APK 内自带）、Docker（你自己的服务器）。
 >
 > 版本号在三处一致：`/api/version`、`/healthz` 的 `version` 字段、App 设置页。
 > 单一事实来源是 `src/version.js`。**改了它不必再改别处。**
+> 发版规矩：每发一版 `APP_VERSION` **升 0.1**，同时 `APP_VERSION_CODE` **+1**。
+>
+> `/api/version` 的 `build` 字段是构建标识（CI 传的 commit sha 前 12 位）。
+> 部署完想知道「跑的是不是我刚推的那一版」，看它就行。
 
 ---
 

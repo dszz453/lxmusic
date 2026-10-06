@@ -53,6 +53,11 @@ jobs:
           push: true
           tags: ${{ steps.meta.outputs.tags }}
           labels: ${{ steps.meta.outputs.labels }}
+          # 把 commit sha 打进镜像，`/api/version` 的 build 字段就会显示它。
+          # 部署后 `curl /api/version` 直接对上「跑的是不是刚推的那一版」，
+          # 不用再去容器里翻文件比对。
+          build-args: |
+            LX_BUILD_ID=${{ github.sha }}
           cache-from: type=gha
           cache-to: type=gha,mode=max
 
@@ -70,6 +75,9 @@ jobs:
           context: .
           load: true
           tags: lxmusic:ci
+          # 与推送那份同一口径，顺带让下面那条断言能真的验到「build 字段有值」
+          build-args: |
+            LX_BUILD_ID=${{ github.sha }}
           cache-from: type=gha
 
       - name: 起容器
@@ -122,6 +130,20 @@ jobs:
         env:
           LX_BASE: http://127.0.0.1:8787
         run: node test/server-node.mjs
+
+      - name: 断言构建标识真的注入到镜像里了
+        # 这条**必须在 CI 里**、不能放进 test/server-node.mjs：
+        # 那个脚本平时是对着 `node server/index.mjs` 或 wrangler dev 跑的，
+        # 那种环境下 build 本来就该是 'dev'，放进去只会得到一条假失败。
+        # 而 CI 这里**一定**传了 --build-arg，所以「还是 dev」就等于接线断了。
+        run: |
+          build=$(curl -s http://127.0.0.1:8787/api/version \
+            | node -e "let s='';process.stdin.on('data',d=>s+=d).on('end',()=>console.log(JSON.parse(s).build))")
+          echo "build = $build"
+          if [ -z "$build" ] || [ "$build" = "dev" ] || [ "$build" = "docker" ]; then
+            echo "::error::LX_BUILD_ID 没注入进镜像（build='$build'）—— Dockerfile 的 ARG/ENV 或本工作流的 build-args 被改断了"
+            exit 1
+          fi
 
       - name: 失败时导日志
         if: failure()

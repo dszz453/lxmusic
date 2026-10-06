@@ -7,7 +7,7 @@
  *
  * 每次发版记得把 VERSION 往上抬一格，否则用户手机上会一直吃旧缓存。
  */
-const VERSION = 'v22'
+const VERSION = 'v23'
 const STATIC_CACHE = 'lxmusic-static-' + VERSION
 const SHELL_CACHE = 'lxmusic-shell-' + VERSION
 
