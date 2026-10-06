@@ -111,6 +111,42 @@ docker exec -e PW=你的管理密码 lxmusic node --experimental-sqlite /tmp/res
 
 详细的排障手册在 `docs/self-host.md`。
 
+### 镜像
+
+CI 在每次推 `main` 时构建 `linux/amd64` + `linux/arm64` 双架构并推到 GHCR：
+
+```
+ghcr.io/dszz453/lxmusic:latest
+```
+
+> ⚠️ GHCR 的包**默认是私有的**，这时 `docker pull` 会返回 `denied`（而不是 404，
+> 容易误判成「镜像不存在」）。要让别人免登录拉取，去
+> `https://github.com/users/<你>/packages/container/lxmusic/settings` 把 visibility 改成 Public。
+
+本机想自己构建也行：
+
+```bash
+docker build -t lxmusic:local .
+```
+
+### 本机推不上去 GitHub？
+
+如果 `git push` 反复报下面这个（某些网络对 `git-receive-pack` 的响应流有干扰）：
+
+```
+send-pack: unexpected disconnect while reading sideband packet
+```
+
+改用 REST API 发布，它是一串普通 HTTP 请求，对中间代理友好得多：
+
+```bash
+GH_TOKEN=ghp_xxx node tools/publish-github.mjs          # 发布
+GH_TOKEN=ghp_xxx node tools/publish-github.mjs --dry    # 只看清单
+```
+
+（实测：`git push` 连续失败 4 次；这个脚本 242 个文件一次成功，
+中途 7 次断连全被重试兜住。token 需要 `repo` + `write:packages`。）
+
 ---
 
 ## 〇、本轮（2026-10-01）改了什么

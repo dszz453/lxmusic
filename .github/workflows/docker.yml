@@ -80,9 +80,13 @@ jobs:
         # 在 CI 里永远暴露不出来（chmod 777 把权限问题整个抹平了）。
         # 这个坑我在 Debian 上真踩过：容器无限重启，日志只有一句
         # `unable to open database file`。CI 要能挡住它，就不能靠 777 绕过。
+        #
+        # chown 前面必须加 sudo：GitHub runner 上的用户对 $RUNNER_TEMP
+        # **没有 chown 权限**（实测报 `Operation not permitted`，
+        # 而裸机 Debian 上用 su 是可以的 —— 两边不一样）。runner 有免密 sudo。
         run: |
           mkdir -p "$RUNNER_TEMP/lxdata"
-          chown -R 1000:1000 "$RUNNER_TEMP/lxdata"
+          sudo chown -R 1000:1000 "$RUNNER_TEMP/lxdata"
           docker run -d --name lxmusic-ci \
             -p 8787:8787 \
             -v "$RUNNER_TEMP/lxdata:/data" \
