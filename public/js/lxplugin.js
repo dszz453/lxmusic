@@ -208,15 +208,103 @@
     })
   }
 
-  /** 从 URL 导入插件（走服务端代理抓取，绕过 GitHub 的 CORS 与直连问题） */
-  async function importFromUrl(url) {
+  /**
+   * 下载插件脚本 —— **带 GitHub 镜像自动降级**。
+   *
+   * 为什么需要这个（2026-10-06 实测）：
+   *   内置的 20 多个预设音源**全部指向 `raw.githubusercontent.com`**，而这个域名
+   *   在国内网络下极不稳定 —— 实测会出现「DNS 能解析、TCP 连接被丢」的 12 秒超时，
+   *   也会偶尔在 17 秒后突然通了（时通时不通，最难排查）。
+   *   于是「一键导入插件」在国内容器/手机上一律失败，且报错只有一句 fetch 失败，
+   *   看不出是被墙还是插件本身坏了。
+   *
+   * 做法：把 GitHub 原始地址改写成公开镜像，逐个试，谁先给出**非空的、看起来像
+   * 插件脚本的内容**就用谁。镜像实测（同一份 sixyin/latest.js，332677 字节）：
+   *
+   *     gh-proxy.com     200  1.50s  ✅
+   *     ghfast.top       200  2.38s  ✅ ← 默认首选（老板指定）
+   *     ghproxy.net      200  1.50s  ✅
+   *     raw.githubusercontent  200  14~17s  ❌ 时通时不通，只做最后兜底
+   *     gcore.jsdelivr.net     500  Network connection lost —— 不可靠，已弃用
+   *     cdn.jsdelivr.net       200  12s 只下到 1/4 → 超时，已弃用
+   *     raw.gitmirror.com      502 → 已弃用
+   *
+   * 原地址保留在最后 —— 网络通（比如在境外）时它最可信，且不需要中间人。
+   */
+
+  /** 列出这个 URL 的所有候选下载地址（含它自己）。非 GitHub 地址就只有它自己。 */
+  function candidateUrls(url) {
+    const out = []
+    const rawRe = /^https:\/\/raw\.githubusercontent\.com\//
+    const blobRe = /^https:\/\/github\.com\/([^/]+)\/([^/]+)\/blob\/([^/]+)\/(.+)$/
+    const isRaw = rawRe.test(url)
+    const isBlob = blobRe.test(url)
+
+    if (isRaw) {
+      // ghfast.top 优先（老板指定），再备两家代理，最后原地址
+      out.push('https://ghfast.top/' + url)
+      out.push('https://gh-proxy.com/' + url)
+      out.push('https://ghproxy.net/' + url)
+    } else if (isBlob) {
+      // 有人会直接把 github.com/.../blob/... 的网页地址贴进来，换成 raw 再走镜像
+      const [, o, r, b, p] = blobRe.exec(url)
+      const rawUrl = `https://raw.githubusercontent.com/${o}/${r}/${b}/${p}`
+      out.push('https://ghfast.top/' + rawUrl)
+      out.push('https://gh-proxy.com/' + rawUrl)
+      out.push('https://ghproxy.net/' + rawUrl)
+      out.push(rawUrl)
+    }
+    out.push(url)   // 原地址永远作为最后兜底
+    return Array.from(new Set(out))
+  }
+
+  /** 通过服务端 /api/proxy 取一段文本（带超时，避免一个镜像挂死拖垮整条链）。 */
+  async function proxyGet(url, timeoutMs) {
     const token = API.getToken()
-    const res = await fetch('/api/proxy?url=' + encodeURIComponent(url), {
-      headers: token ? { Authorization: 'Bearer ' + token } : {},
-    })
-    if (!res.ok) throw new Error('下载失败 HTTP ' + res.status)
-    const script = await res.text()
-    return importFromText(script, url)
+    const ctl = new AbortController()
+    const timer = setTimeout(() => ctl.abort(), timeoutMs || 15000)
+    try {
+      const res = await fetch('/api/proxy?url=' + encodeURIComponent(url), {
+        headers: token ? { Authorization: 'Bearer ' + token } : {},
+        signal: ctl.signal,
+      })
+      const text = await res.text()
+      if (!res.ok) throw new Error('HTTP ' + res.status + (text ? ' ' + text.slice(0, 80) : ''))
+      return text
+    } finally {
+      clearTimeout(timer)
+    }
+  }
+
+  /**
+   * 抓插件脚本。逐个候选地址试，判定标准是「拿到非空且长度像插件的文本」——
+   * 不能只看 HTTP 200：镜像挂了常常回一个 200 的 HTML 错误页。
+   */
+  async function fetchPluginScript(url) {
+    const urls = candidateUrls(url)
+    const errors = []
+    for (const u of urls) {
+      const host = (() => { try { return new URL(u).host } catch { return u } })()
+      try {
+        const text = await proxyGet(u, 15000)
+        if (text && text.length >= 50 && !/^\s*<(!doctype|html)/i.test(text)) {
+          return { script: text, from: host }
+        }
+        errors.push(host + ': 内容不像插件脚本')
+      } catch (e) {
+        errors.push(host + ': ' + ((e && e.message) || e).slice(0, 60))
+      }
+    }
+    throw new Error('下载失败（已试 ' + urls.length + ' 个地址）— ' + errors.join('；'))
+  }
+
+  /**
+   * 从 URL 导入插件。GitHub 地址会自动走镜像（见 fetchPluginScript）。
+   */
+  async function importFromUrl(url) {
+    const { script, from } = await fetchPluginScript(url)
+    const res = await importFromText(script, url)
+    return Object.assign(res, { from })
   }
 
   async function importFromText(script, url) {

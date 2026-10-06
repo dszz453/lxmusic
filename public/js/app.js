@@ -1465,13 +1465,16 @@
   }
 
   async function importPluginByUrl(url) {
-    U.toast('正在下载插件…', 60000)
+    U.toast('正在下载插件…（GitHub 源会自动走镜像）', 60000)
     try {
       const res = await LXP.importFromUrl(url)
-      U.toast('已导入：' + ((res.meta && res.meta.name) || '插件'))
+      // 带上来源镜像：国内直连 raw.githubusercontent.com 不通，
+      // 让用户看见「从哪个镜像拿到的」，下次遇到慢就知道该换哪个
+      const via = res.from ? '（经 ' + res.from + '）' : ''
+      U.toast('已导入：' + ((res.meta && res.meta.name) || '插件') + via)
       await reloadLocalPlugins()
     } catch (e) {
-      U.toast((e && e.message) || '导入失败')
+      U.toast((e && e.message) || '导入失败', 8000)
     }
   }
 

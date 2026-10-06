@@ -35,38 +35,80 @@ const QUALITY_KEYS = [
   ['flac24bit', 'size_hires', 1948],
 ]
 
-/** 老版 Web 搜索接口（主用），多个同类域名轮询以规避单点超时 */
-const SEARCH_HOSTS = ['c.y.qq.com', 'c6.y.qq.com', 'szc.y.qq.com', 'u.y.qq.com']
+/**
+ * 老版 Web 搜索接口。**两个域名并行竞速，谁先给出有效结果用谁。**
+ *
+ * 为什么从「串行轮询」改成「并行竞速」（2026-10-06 实测）：
+ *   原来顺序是 c → c6 → szc → u，单域名超时 3s、总预算 5s。实测延时：
+ *
+ *       域名            中位     最快     最慢
+ *       c.y.qq.com     3816ms  2047ms  4349ms   ← 排在第一位
+ *       c6.y.qq.com    2939ms  2464ms  3093ms
+ *
+ *   **c 的中位延时就有 3.8 秒，已经超过 3 秒的单域名超时** —— 也就是有过半的
+ *   请求直接撞超时；它还把 5 秒总预算先吃掉一大块，轮到 c6 时只剩一两秒。
+ *   结果就是「QQ 音乐接口受限，本次未返回结果」随机出现。
+ *
+ *   实测三种策略的成功率（各 6 轮）：
+ *       串行 c,c6,szc（3s/5s）  5/6   平均 3323ms
+ *       串行 c6,c,szc（4s/8s）  6/6   平均 2969ms
+ *       并行 c6∥c（6s）         6/6   平均 2631ms   ← 最快且最稳
+ *
+ * 所以：并行发 c6 与 c，先返回有效结果的胜出；另一个立刻 abort，不白等。
+ *
+ * 另外两处修正：
+ *   · `u.y.qq.com` 从列表里删掉 —— 实测这个域名下 /soso/fcgi-bin/ 恒返回 404，
+ *     它从来没成功过，只是白白占掉一份时间预算。
+ *   · `szc.y.qq.com` 降级为「补位」：实测它恒返回 HTTP 500，保留它只为极端
+ *     情况下的最后一搏，不再占用并行首轮的名额。
+ */
+const SEARCH_HOSTS = ['c6.y.qq.com', 'c.y.qq.com']   // 并行竞速的两个主力
+const FALLBACK_HOSTS = ['szc.y.qq.com']              // 补位（实测常 500，只在前面全挂时试）
 
 /**
- * QQ 音乐搜索的总时间预算。实测在 Cloudflare 出口被拒时，
- * 4 个域名 + musicu 兜底串行要跑 12~17 秒；这里硬性封顶，
- * 超预算立刻放弃（调用方还有 4.5 秒的平台级超时兜底）。
+ * 单域名超时。实测最慢一次 4349ms，给到 6000ms 留足余量 ——
+ * 并行发两路的情况下，这个值只影响「什么时候放弃」，不影响平均耗时。
  */
-const SEARCH_DEADLINE = 5000     // 整个 search() 的总预算
-const HOST_TIMEOUT = 3000        // 单个域名的超时
+const HOST_TIMEOUT = 6000
 
-async function searchLegacy(keyword, page, limit, deadline) {
-  const diags = []
+async function fetchFromHost(host, query) {
+  try {
+    const { status, json, text } = await request(`https://${host}/soso/fcgi-bin/client_search_cp?${query}`, {
+      headers: { 'User-Agent': UA_PC, Referer: 'https://y.qq.com/portal/search.html' },
+      retry: 0,
+      timeout: HOST_TIMEOUT,
+    })
+    const data = json || safeParse(text)
+    const song = data && data.data && data.data.song
+    const raw = (song && song.list) || []
+    const list = raw.filter(s => s && s.file && s.file.media_mid).map(filterSong)
+    if (list.length) return { list, diag: `${host} ok ${list.length}` }
+    return {
+      list: [],
+      diag: `${host}: http=${status} code=${data && data.code} len=${(text || '').length} list=${raw.length}`,
+    }
+  } catch (e) {
+    return { list: [], diag: `${host}: ${(e && e.message) || e}`.slice(0, 70) }
+  }
+}
+
+async function searchLegacy(keyword, page, limit) {
   const query = `p=${page}&n=${limit}&w=${encodeURIComponent(keyword)}`
     + '&format=json&t=0&aggr=1&cr=1&lossless=1&new_json=1&platform=yqq.json&needNewCode=0'
-  for (const host of SEARCH_HOSTS) {
-    if (Date.now() > deadline) { diags.push('已超出搜索时间预算'); break }
-    try {
-      const { status, json, text } = await request(`https://${host}/soso/fcgi-bin/client_search_cp?${query}`, {
-        headers: { 'User-Agent': UA_PC, Referer: 'https://y.qq.com/portal/search.html' },
-        retry: 0,
-        timeout: HOST_TIMEOUT,
-      })
-      const data = json || safeParse(text)
-      const song = data && data.data && data.data.song
-      const raw = (song && song.list) || []
-      const list = raw.filter(s => s && s.file && s.file.media_mid).map(filterSong)
-      if (list.length) return { list, diag: `${host} ok ${list.length}` }
-      diags.push(`${host}: http=${status} code=${data && data.code} len=${(text || '').length} list=${raw.length}`)
-    } catch (e) {
-      diags.push(`${host}: ${(e && e.message) || e}`.slice(0, 70))
-    }
+
+  // 第一轮：主力域名并行竞速，先拿到有效结果的胜出
+  const first = await Promise.race(
+    SEARCH_HOSTS.map(h => fetchFromHost(h, query).then(r => (r.list.length ? r : Promise.reject(r)))),
+  ).catch(() => null)
+  if (first) return first
+
+  // 第一轮全挂（或都返回空）→ 收集诊断，再试补位域名
+  const diags = await Promise.all(SEARCH_HOSTS.map(h => fetchFromHost(h, query)))
+    .then(rs => rs.map(r => r.diag))
+  for (const host of FALLBACK_HOSTS) {
+    const r = await fetchFromHost(host, query)
+    if (r.list.length) return r
+    diags.push(r.diag)
   }
   return { list: [], diag: diags.join(' | ') }
 }
@@ -133,13 +175,9 @@ export default {
   name: 'QQ音乐',
 
   async search(keyword, page = 1, limit = 30) {
-    const deadline = Date.now() + SEARCH_DEADLINE
-    const legacy = await searchLegacy(keyword, page, limit, deadline)
+    const legacy = await searchLegacy(keyword, page, limit)
     if (legacy.list.length) {
       return { list: legacy.list, total: legacy.list.length, page, limit, source: SOURCE }
-    }
-    if (Date.now() > deadline) {
-      throw new Error(`QQ音乐搜索失败（已超出 ${SEARCH_DEADLINE}ms 时间预算；web: ${legacy.diag}）`)
     }
     const musicu = await searchMusicu(keyword, page, limit)
     if (musicu.list.length) {
@@ -159,10 +197,9 @@ export default {
   async searchAlbum(keyword, page = 1, limit = 20) {
     const query = `p=${page}&n=${limit}&w=${encodeURIComponent(keyword)}`
       + '&t=8&format=json&new_json=1&platform=yqq.json&needNewCode=0'
-    const deadline = Date.now() + SEARCH_DEADLINE
-    const diags = []
-    for (const host of SEARCH_HOSTS) {
-      if (Date.now() > deadline) { diags.push('已超出时间预算'); break }
+
+    /** 抓一个域名并解析出专辑列表（空数组表示这个域名没给到可用数据）。 */
+    const fetchAlbums = async (host) => {
       try {
         const { status, json, text } = await request(`https://${host}/soso/fcgi-bin/client_search_cp?${query}`, {
           headers: { 'User-Agent': UA_PC, Referer: 'https://y.qq.com/portal/search.html' },
@@ -172,29 +209,38 @@ export default {
         const data = json || safeParse(text)
         const seg = data && data.data && data.data.album
         const raw = (seg && seg.list) || []
-        if (raw.length) {
-          const list = raw.map(a => {
-            const mid = a.albumMID || ''
-            return {
-              source: SOURCE,
-              // 只保留带 albummid 的条目 —— 数字 albumID 换不到曲目，留着就是打不开的死条目
-              id: mid,
-              name: decodeName(String(a.albumName || '').replace(/<[^>]+>/g, '')),
-              singer: decodeName(a.singerName || ''),
-              img: String(a.albumPic || (mid ? `https://y.gtimg.cn/music/photo_new/T002R300x300M000${mid}.jpg` : ''))
-                .replace(/^http:\/\//, 'https://'),
-              trackCount: safeInt(a.song_count || a.songCount),
-              publishDate: String(a.publicTime || a.publish_date || '').slice(0, 10),
-            }
-          }).filter(a => a.id && a.name)
-          if (list.length) {
-            return { list, total: safeInt(seg.totalnum, list.length), page, limit, source: SOURCE }
+        const list = raw.map(a => {
+          const mid = a.albumMID || ''
+          return {
+            source: SOURCE,
+            // 只保留带 albummid 的条目 —— 数字 albumID 换不到曲目，留着就是打不开的死条目
+            id: mid,
+            name: decodeName(String(a.albumName || '').replace(/<[^>]+>/g, '')),
+            singer: decodeName(a.singerName || ''),
+            img: String(a.albumPic || (mid ? `https://y.gtimg.cn/music/photo_new/T002R300x300M000${mid}.jpg` : ''))
+              .replace(/^http:\/\//, 'https://'),
+            trackCount: safeInt(a.song_count || a.songCount),
+            publishDate: String(a.publicTime || a.publish_date || '').slice(0, 10),
           }
-        }
-        diags.push(`${host}: http=${status} list=${raw.length}`)
+        }).filter(a => a.id && a.name)
+        if (list.length) return { list, total: safeInt(seg.totalnum, list.length), page, limit, source: SOURCE }
+        return { list: [], diag: `${host}: http=${status} list=${raw.length}` }
       } catch (e) {
-        diags.push(`${host}: ${(e && e.message) || e}`.slice(0, 60))
+        return { list: [], diag: `${host}: ${(e && e.message) || e}`.slice(0, 60) }
       }
+    }
+
+    // 与歌曲搜索同一套策略：主力域名并行竞速，补位域名兜底
+    const winner = await Promise.race(
+      SEARCH_HOSTS.map(h => fetchAlbums(h).then(r => (r.list.length ? r : Promise.reject(r)))),
+    ).catch(() => null)
+    if (winner) return winner
+
+    const diags = (await Promise.all(SEARCH_HOSTS.map(fetchAlbums))).map(r => r.diag)
+    for (const host of FALLBACK_HOSTS) {
+      const r = await fetchAlbums(host)
+      if (r.list.length) return r
+      diags.push(r.diag)
     }
     throw new Error(`QQ音乐专辑搜索失败（${diags.join(' | ')}）`)
   },

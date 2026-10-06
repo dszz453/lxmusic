@@ -12,10 +12,13 @@
     android:versionCode="100"
     android:versionName="1.0">
     <!--
-      versionCode / versionName 是 aapt2 link 时用 --version-code / --version-name **覆盖**的
+      versionCode / versionName 是 aapt2 link 时用 version-code / version-name 参数覆盖的
       （见 build-apk.sh，值来自 src/version.js）。这里写的是兜底值：
       直接用 Android Studio 打开这个工程、或有人手敲 aapt2 时，不至于没有版本号。
       改版本请改 src/version.js，不要改这里。
+
+      注意：XML 注释里不能出现连续两个连字符（会报 not well-formed），
+      所以上面写的是不带前导连字符的参数名。
     -->
 
     <uses-sdk android:minSdkVersion="21" android:targetSdkVersion="34" />

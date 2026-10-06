@@ -1,6 +1,6 @@
 /* 由 tools/build-app.mjs 自动生成，请勿手动修改。
- * 源摘要: d39f415ab4c3f6ae
- * 模块数: 21
+ * 源摘要: 9ffee91cb10364bd
+ * 模块数: 22
  *
  * 这是给安卓壳用的后端展平版：把 src/ 的 ESM 后端打成单个 IIFE，
  * 让 WebView 用普通 <script> 就能加载（file:// 下 ESM 会被同源策略拒绝）。
@@ -38,6 +38,7 @@ const { BUNDLED_PLUGINS } = __require("src/generated/plugins.js");
 const db = __require("src/db.js");
 const { generateDaily, getDaily, pickPrimaryUser, todayBJ } = __require("src/server/daily.js");
 const { HOME_KEYWORDS } = __require("src/server/keywords.js");
+const { versionInfo } = __require("src/version.js");
 
 const SESSION_TTL = 30 * 24 * 3600 * 1000
 
@@ -121,6 +122,15 @@ const PREFS_TTL = 60 * 1000
 const DEFAULT_PREFS = { mode: 'auto', order: {}, disabled: [] }
 let prefsCache = { ts: 0, data: null }
 
+/**
+ * 运行时实测评分的两个键 —— 由 server/plugin-rescore.mjs 写入，这里只读。
+ *
+ * 线上（CF Worker）永远是空的（跑不了子进程、没有可写文件系统），
+ * 所以读取失败/读不到都当「没有」处理，退回构建期那份，不当错误。
+ */
+const RUNTIME_SCORES_SETTING = 'plugin.scores'
+const RESCORE_STATUS_SETTING = 'plugin.rescore.status'
+
 /** 归一化一份偏好，挡掉脏数据（手工写库 / 旧版本残留） */
 function normalizePrefs(raw) {
   if (!raw || typeof raw !== 'object') return { ...DEFAULT_PREFS }
@@ -159,6 +169,63 @@ async function applyPluginPrefs(env, store) {
   // 于是所有 /api/* 请求统统 500，整个 App 后端全挂。
   if (typeof pool.setUserPrefs === 'function') pool.setUserPrefs(prefs)
   return prefs
+}
+
+/* ---------------- 运行时评分（自托管优先，线上退回构建期） ---------------- */
+
+/**
+ * 读「运行时实测」的评分明细。
+ *
+ * 只有自托管（Docker）版会有 —— 它按 LX_SCORE_INTERVAL 定期实测并落库。
+ * 线上 Cloudflare 版永远没有（跑不了子进程），返回 null 让调用方退回构建期那份。
+ *
+ * 读失败一律返回 null：这是**锦上添花**的数据，不能因为它把整个接口弄 500。
+ */
+async function readRuntimeScores(env, store) {
+  try {
+    const raw = await store.getSetting(env.DB, RUNTIME_SCORES_SETTING, '')
+    if (!raw) return null
+    const data = JSON.parse(raw)
+    if (!data || typeof data !== 'object') return null
+    return data
+  } catch { return null }
+}
+
+/**
+ * 评分调度器状态。
+ *
+ * 两个来源要合起来看：
+ *   · 进程活着 —— 直接问调度器，拿到的是**实时**状态（正在跑吗、下一轮什么时候）；
+ *   · 进程刚重启 —— 调度器是全新的（rounds=0），但库里存着上次的结果，
+ *     界面要能显示「上次是什么时候测的、成没成」，否则用户重启一次就以为记录丢了。
+ *
+ * ⚠️ 这里**必须每次都真查库**，不要用 `env.RESCORE_LAST` 那种进程内快照：
+ * 调度器跑完一轮只写库，不会回填任何内存变量，于是快照会一直是启动时的值（多半是 null）。
+ * 表现就是「手动重评明明成功了（live.lastOk=true），界面却说从没测过」——
+ * 这个 bug 真出现过（/healthz 那边同款，见 server/index.mjs 里 readSavedStatus 的说明）。
+ *
+ * 代价可以忽略：settings 按主键查一行，且这个接口本来就不是高频路径。
+ */
+async function readRescoreState(env, store) {
+  const live = env.RESCORE && typeof env.RESCORE.snapshot === 'function'
+    ? env.RESCORE.snapshot()
+    : null
+  let saved = null
+  try {
+    const raw = await store.getSetting(env.DB, RESCORE_STATUS_SETTING, '')
+    if (raw) saved = JSON.parse(raw)
+  } catch { saved = null }
+  const supported = !!(env.RESCORE && typeof env.RESCORE.run === 'function')
+  return {
+    supported,
+    live,
+    // 「上次结果」以库里那份为准（跨重启），实时状态补上 running/nextAt 这类瞬时值
+    last: saved || null,
+    note: supported
+      ? null
+      : '当前宿主不支持运行时评分（需要自托管/Docker 版）。'
+        + '线上版请在本地跑 node tools/plugin-score.mjs 后重新部署。',
+  }
 }
 
 /** 首页榜单栅格：取官方榜单里播放量最高的若干个 */
@@ -375,6 +442,15 @@ async function handleApi(request, env, url) {
     /* ---- 公开接口 ---- */
     if (path === '/setup-status') {
       return json({ ok: true, needsSetup: (await db.countUsers(env.DB)) === 0 })
+    }
+
+    /**
+     * 版本号。三个宿主都从这里取，前端「关于」处也用它。
+     * 公开、不需登录 —— 用户报问题时第一件事就是问「你跑的哪版」，
+     * 要登录才能看会白白多一轮来回。
+     */
+    if (path === '/version') {
+      return json({ ok: true, ...versionInfo() })
     }
 
     if (path === '/setup' && method === 'POST') {
@@ -1101,23 +1177,88 @@ async function handleApi(request, env, url) {
       for (const k of ALL_SOURCES) {
         live[k] = env.PLUGIN_POOL.musicUrlPlugins(k, 'musicUrl').map(p => p.id)
       }
+      /**
+       * 评分的来源有二，优先级：**运行时实测 > 构建期实测**。
+       *
+       * 构建期那份是在我的机器上测的，容器/其他出口跑起来未必一致；
+       * 而 Docker 版会自己定期重评并落库（见 server/plugin-rescore.mjs）。
+       * 有运行时那份就用它 —— 否则界面上显示的是「构建机的成绩」，
+       * 却拿它来解释「你服务器上为什么先试这个插件」，两边对不上。
+       */
+      const runtime = await readRuntimeScores(env, db)
+      const useRuntime = !!(runtime && runtime.byPlatform)
+      const srcMeta = useRuntime ? runtime : PLUGIN_SCORES
+      const load = useRuntime ? (runtime.load || {}) : PLUGIN_LOAD
       return json({
         ok: true,
         meta: {
-          generatedAt: PLUGIN_SCORES.generatedAt || null,
-          measuredFrom: PLUGIN_SCORES.measuredFrom || null,
-          keywords: PLUGIN_SCORES.keywords || [],
+          generatedAt: srcMeta.generatedAt || null,
+          measuredFrom: srcMeta.measuredFrom || null,
+          keywords: srcMeta.keywords || [],
+          // 让界面能标出「这份成绩是在哪台机器上测的」—— 构建机 ≠ 你的服务器
+          source: useRuntime ? 'runtime' : 'build',
+          unmeasured: srcMeta.unmeasured || [],
         },
         prefs: await readPluginPrefs(env, db),
-        load: PLUGIN_LOAD,
-        byPlatform: PLUGIN_SCORES.byPlatform || {},
+        load,
+        byPlatform: srcMeta.byPlatform || {},
         live,
+        rescore: await readRescoreState(env, db),
         plugins: env.PLUGIN_POOL.summary().map(p => ({
           id: p.id, name: p.name, ok: !!p.ok, error: p.error || null,
           sources: p.sources || [], version: p.version || null,
         })),
         platforms: ALL_SOURCES.map(k => ({ key: k, name: SOURCE_META[k].name, short: SOURCE_META[k].short })),
       })
+    }
+
+    /**
+     * 插件评分：查状态 / 手动触发一轮。
+     *
+     * 这个接口**只在自托管（Docker）下真正能跑** —— 评分要起子进程、要写数据目录，
+     * Cloudflare Worker 两样都没有（请求时长上限几分钟、文件系统只读且无子进程）。
+     * 所以那边如实返回 `supported: false` + 一句能指导下一步的理由，
+     * 而不是假装支持然后 500。用户看到「换个宿主才行」比看到 500 有用得多。
+     *
+     * ── 为什么默认「受理即返回」而不是等它跑完 ────────────────────────
+     * 一轮评分要真打各音乐平台，**几分钟**。如果 POST 一直挂着等结果：
+     *  · 用户界面上按钮转几分钟，中途刷新/切页签就断了，他会以为失败然后重点；
+     *  · 反代（Lucky / Nginx）默认 60s 就会掐断长请求，用户拿到 504；
+     *  · 而服务端那轮其实**还在跑**，两边状态彻底不一致。
+     * 所以默认行为改成：立刻回 202（已经开始），界面上**轮询** /admin/plugin-rescore
+     * 看 live.running 与上轮结果。想要同步语义（脚本/命令行）加 `?wait=1`。
+     */
+    if (path === '/admin/plugin-rescore') {
+      if (method === 'POST') {
+        const sch = env.RESCORE
+        if (!sch || typeof sch.run !== 'function') {
+          return bad('当前宿主不支持运行时评分（需要自托管/Docker 版）；'
+            + '线上版请用 `node tools/plugin-score.mjs` 在本地实测后重新部署', 501)
+        }
+        // 已经在跑：这不是错误，也不该再起一轮 —— 409 让前端就地去轮询状态
+        if (sch.running) {
+          return json({ ok: false, skipped: true, reason: '已有一轮评分正在进行中', status: await readRescoreState(env, db) }, 409)
+        }
+
+        const wait = url.searchParams.get('wait') === '1'
+        if (wait) {
+          const r = await sch.run('manual')
+          if (r.skipped) return json({ ok: false, skipped: true, reason: r.reason, status: await readRescoreState(env, db) }, 409)
+          return json({
+            ok: !!r.ok, error: r.error || null, elapsedMs: r.elapsedMs || null,
+            status: await readRescoreState(env, db),
+          })
+        }
+
+        /**
+         * 受理即返回。**故意不 await** —— 但也不能把 reject 丢掉：
+         * 调度器内部已经保证 run() 永不 reject，这里再挂个 catch 是双保险
+         * （将来谁改了调度器，也不会变成未处理拒绝把 Node 弄崩）。
+         */
+        sch.run('manual').catch(() => { /* 调度器内部已兜底并记状态 */ })
+        return json({ ok: true, accepted: true, status: await readRescoreState(env, db) }, 202)
+      }
+      return json({ ok: true, status: await readRescoreState(env, db) })
     }
 
     // 读写插件调度偏好（管理端）
@@ -7001,6 +7142,72 @@ const HOME_KEYWORDS = [
   __exports.HOME_KEYWORDS = HOME_KEYWORDS;
 };
 
+__modules["src/version.js"] = function (__exports, __require) {
+/**
+ * 版本号的唯一事实来源（Single Source of Truth）。
+ *
+ * 为什么要有这个文件：这个项目有**三个宿主**（Cloudflare Workers / 安卓壳 /
+ * Docker 自托管），而版本号以前散落在四处、各不相同：
+ *
+ *   package.json                  1.0.0
+ *   android/AndroidManifest.xml   versionName 1.10 / versionCode 11
+ *   public/sw.js                  VERSION = 'v20'（那是**静态缓存版本**，不是产品版本）
+ *   线上 Worker                   没写版本
+ *
+ * 「服务端和 APP 都要有版本号 V1.0」就是要这三处**说同一个数字**。
+ * 所以统一读这里，谁也别再各写各的。
+ *
+ * ── 两条版本线，别混 ──────────────────────────────────────────
+ *   APP_VERSION      产品版本，人看的。改功能才动它。当前 V1.0
+ *   APP_VERSION_CODE 整数构建号，Android 靠它判断「能不能覆盖安装」。
+ *                    每次要发新版就 +1，**不能倒退、不能重复**，
+ *                    否则手机上会报「应用未安装」（签名相同也装不上）。
+ *
+ * sw.js 里那个 `VERSION='v20'` 是另一回事：它只管浏览器静态缓存该不该失效，
+ * 每次改前端资源都要 +1，跟产品版本解耦。别把两者合并 —— 合并的后果是
+ * 「只想刷新一下缓存，却被迫宣布发了个新版本」。
+ */
+
+/** 产品版本（对外展示用）。V1.0 起。 */
+const APP_VERSION = 'V1.0'
+
+/** Android versionCode：整数、单调递增、跨次发布不可重复。 */
+const APP_VERSION_CODE = 100
+
+/** 人类可读的完整标识，日志/关于页用。 */
+const APP_ID = 'lxmusic'
+
+/**
+ * 构建标识。Docker 里由构建参数注入（镜像 tag / git sha），
+ * 本地跑就是 'dev'。用来回答「这台机器上跑的是哪一次构建」。
+ */
+const BUILD_ID = (typeof process !== 'undefined' && process.env && process.env.LX_BUILD_ID) || 'dev'
+
+/** 一行式版本串：`lxmusic V1.0 (dev)` */
+function versionLine() {
+  return `${APP_ID} ${APP_VERSION} (${BUILD_ID})`
+}
+
+/** 给接口/健康检查用的结构化版本信息。 */
+function versionInfo() {
+  return {
+    app: APP_ID,
+    version: APP_VERSION,
+    versionCode: APP_VERSION_CODE,
+    build: BUILD_ID,
+    full: versionLine(),
+  }
+}
+
+  /* 导出挂载 */
+  __exports.APP_VERSION = APP_VERSION;
+  __exports.APP_VERSION_CODE = APP_VERSION_CODE;
+  __exports.APP_ID = APP_ID;
+  __exports.BUILD_ID = BUILD_ID;
+  __exports.versionLine = versionLine;
+  __exports.versionInfo = versionInfo;
+};
+
 __modules["src/providers/kg.js"] = function (__exports, __require) {
 /**
  * 酷狗音乐（kg）
@@ -7935,38 +8142,80 @@ const QUALITY_KEYS = [
   ['flac24bit', 'size_hires', 1948],
 ]
 
-/** 老版 Web 搜索接口（主用），多个同类域名轮询以规避单点超时 */
-const SEARCH_HOSTS = ['c.y.qq.com', 'c6.y.qq.com', 'szc.y.qq.com', 'u.y.qq.com']
+/**
+ * 老版 Web 搜索接口。**两个域名并行竞速，谁先给出有效结果用谁。**
+ *
+ * 为什么从「串行轮询」改成「并行竞速」（2026-10-06 实测）：
+ *   原来顺序是 c → c6 → szc → u，单域名超时 3s、总预算 5s。实测延时：
+ *
+ *       域名            中位     最快     最慢
+ *       c.y.qq.com     3816ms  2047ms  4349ms   ← 排在第一位
+ *       c6.y.qq.com    2939ms  2464ms  3093ms
+ *
+ *   **c 的中位延时就有 3.8 秒，已经超过 3 秒的单域名超时** —— 也就是有过半的
+ *   请求直接撞超时；它还把 5 秒总预算先吃掉一大块，轮到 c6 时只剩一两秒。
+ *   结果就是「QQ 音乐接口受限，本次未返回结果」随机出现。
+ *
+ *   实测三种策略的成功率（各 6 轮）：
+ *       串行 c,c6,szc（3s/5s）  5/6   平均 3323ms
+ *       串行 c6,c,szc（4s/8s）  6/6   平均 2969ms
+ *       并行 c6∥c（6s）         6/6   平均 2631ms   ← 最快且最稳
+ *
+ * 所以：并行发 c6 与 c，先返回有效结果的胜出；另一个立刻 abort，不白等。
+ *
+ * 另外两处修正：
+ *   · `u.y.qq.com` 从列表里删掉 —— 实测这个域名下 /soso/fcgi-bin/ 恒返回 404，
+ *     它从来没成功过，只是白白占掉一份时间预算。
+ *   · `szc.y.qq.com` 降级为「补位」：实测它恒返回 HTTP 500，保留它只为极端
+ *     情况下的最后一搏，不再占用并行首轮的名额。
+ */
+const SEARCH_HOSTS = ['c6.y.qq.com', 'c.y.qq.com']   // 并行竞速的两个主力
+const FALLBACK_HOSTS = ['szc.y.qq.com']              // 补位（实测常 500，只在前面全挂时试）
 
 /**
- * QQ 音乐搜索的总时间预算。实测在 Cloudflare 出口被拒时，
- * 4 个域名 + musicu 兜底串行要跑 12~17 秒；这里硬性封顶，
- * 超预算立刻放弃（调用方还有 4.5 秒的平台级超时兜底）。
+ * 单域名超时。实测最慢一次 4349ms，给到 6000ms 留足余量 ——
+ * 并行发两路的情况下，这个值只影响「什么时候放弃」，不影响平均耗时。
  */
-const SEARCH_DEADLINE = 5000     // 整个 search() 的总预算
-const HOST_TIMEOUT = 3000        // 单个域名的超时
+const HOST_TIMEOUT = 6000
 
-async function searchLegacy(keyword, page, limit, deadline) {
-  const diags = []
+async function fetchFromHost(host, query) {
+  try {
+    const { status, json, text } = await request(`https://${host}/soso/fcgi-bin/client_search_cp?${query}`, {
+      headers: { 'User-Agent': UA_PC, Referer: 'https://y.qq.com/portal/search.html' },
+      retry: 0,
+      timeout: HOST_TIMEOUT,
+    })
+    const data = json || safeParse(text)
+    const song = data && data.data && data.data.song
+    const raw = (song && song.list) || []
+    const list = raw.filter(s => s && s.file && s.file.media_mid).map(filterSong)
+    if (list.length) return { list, diag: `${host} ok ${list.length}` }
+    return {
+      list: [],
+      diag: `${host}: http=${status} code=${data && data.code} len=${(text || '').length} list=${raw.length}`,
+    }
+  } catch (e) {
+    return { list: [], diag: `${host}: ${(e && e.message) || e}`.slice(0, 70) }
+  }
+}
+
+async function searchLegacy(keyword, page, limit) {
   const query = `p=${page}&n=${limit}&w=${encodeURIComponent(keyword)}`
     + '&format=json&t=0&aggr=1&cr=1&lossless=1&new_json=1&platform=yqq.json&needNewCode=0'
-  for (const host of SEARCH_HOSTS) {
-    if (Date.now() > deadline) { diags.push('已超出搜索时间预算'); break }
-    try {
-      const { status, json, text } = await request(`https://${host}/soso/fcgi-bin/client_search_cp?${query}`, {
-        headers: { 'User-Agent': UA_PC, Referer: 'https://y.qq.com/portal/search.html' },
-        retry: 0,
-        timeout: HOST_TIMEOUT,
-      })
-      const data = json || safeParse(text)
-      const song = data && data.data && data.data.song
-      const raw = (song && song.list) || []
-      const list = raw.filter(s => s && s.file && s.file.media_mid).map(filterSong)
-      if (list.length) return { list, diag: `${host} ok ${list.length}` }
-      diags.push(`${host}: http=${status} code=${data && data.code} len=${(text || '').length} list=${raw.length}`)
-    } catch (e) {
-      diags.push(`${host}: ${(e && e.message) || e}`.slice(0, 70))
-    }
+
+  // 第一轮：主力域名并行竞速，先拿到有效结果的胜出
+  const first = await Promise.race(
+    SEARCH_HOSTS.map(h => fetchFromHost(h, query).then(r => (r.list.length ? r : Promise.reject(r)))),
+  ).catch(() => null)
+  if (first) return first
+
+  // 第一轮全挂（或都返回空）→ 收集诊断，再试补位域名
+  const diags = await Promise.all(SEARCH_HOSTS.map(h => fetchFromHost(h, query)))
+    .then(rs => rs.map(r => r.diag))
+  for (const host of FALLBACK_HOSTS) {
+    const r = await fetchFromHost(host, query)
+    if (r.list.length) return r
+    diags.push(r.diag)
   }
   return { list: [], diag: diags.join(' | ') }
 }
@@ -8033,13 +8282,9 @@ __exports.default = {
   name: 'QQ音乐',
 
   async search(keyword, page = 1, limit = 30) {
-    const deadline = Date.now() + SEARCH_DEADLINE
-    const legacy = await searchLegacy(keyword, page, limit, deadline)
+    const legacy = await searchLegacy(keyword, page, limit)
     if (legacy.list.length) {
       return { list: legacy.list, total: legacy.list.length, page, limit, source: SOURCE }
-    }
-    if (Date.now() > deadline) {
-      throw new Error(`QQ音乐搜索失败（已超出 ${SEARCH_DEADLINE}ms 时间预算；web: ${legacy.diag}）`)
     }
     const musicu = await searchMusicu(keyword, page, limit)
     if (musicu.list.length) {
@@ -8059,10 +8304,9 @@ __exports.default = {
   async searchAlbum(keyword, page = 1, limit = 20) {
     const query = `p=${page}&n=${limit}&w=${encodeURIComponent(keyword)}`
       + '&t=8&format=json&new_json=1&platform=yqq.json&needNewCode=0'
-    const deadline = Date.now() + SEARCH_DEADLINE
-    const diags = []
-    for (const host of SEARCH_HOSTS) {
-      if (Date.now() > deadline) { diags.push('已超出时间预算'); break }
+
+    /** 抓一个域名并解析出专辑列表（空数组表示这个域名没给到可用数据）。 */
+    const fetchAlbums = async (host) => {
       try {
         const { status, json, text } = await request(`https://${host}/soso/fcgi-bin/client_search_cp?${query}`, {
           headers: { 'User-Agent': UA_PC, Referer: 'https://y.qq.com/portal/search.html' },
@@ -8072,29 +8316,38 @@ __exports.default = {
         const data = json || safeParse(text)
         const seg = data && data.data && data.data.album
         const raw = (seg && seg.list) || []
-        if (raw.length) {
-          const list = raw.map(a => {
-            const mid = a.albumMID || ''
-            return {
-              source: SOURCE,
-              // 只保留带 albummid 的条目 —— 数字 albumID 换不到曲目，留着就是打不开的死条目
-              id: mid,
-              name: decodeName(String(a.albumName || '').replace(/<[^>]+>/g, '')),
-              singer: decodeName(a.singerName || ''),
-              img: String(a.albumPic || (mid ? `https://y.gtimg.cn/music/photo_new/T002R300x300M000${mid}.jpg` : ''))
-                .replace(/^http:\/\//, 'https://'),
-              trackCount: safeInt(a.song_count || a.songCount),
-              publishDate: String(a.publicTime || a.publish_date || '').slice(0, 10),
-            }
-          }).filter(a => a.id && a.name)
-          if (list.length) {
-            return { list, total: safeInt(seg.totalnum, list.length), page, limit, source: SOURCE }
+        const list = raw.map(a => {
+          const mid = a.albumMID || ''
+          return {
+            source: SOURCE,
+            // 只保留带 albummid 的条目 —— 数字 albumID 换不到曲目，留着就是打不开的死条目
+            id: mid,
+            name: decodeName(String(a.albumName || '').replace(/<[^>]+>/g, '')),
+            singer: decodeName(a.singerName || ''),
+            img: String(a.albumPic || (mid ? `https://y.gtimg.cn/music/photo_new/T002R300x300M000${mid}.jpg` : ''))
+              .replace(/^http:\/\//, 'https://'),
+            trackCount: safeInt(a.song_count || a.songCount),
+            publishDate: String(a.publicTime || a.publish_date || '').slice(0, 10),
           }
-        }
-        diags.push(`${host}: http=${status} list=${raw.length}`)
+        }).filter(a => a.id && a.name)
+        if (list.length) return { list, total: safeInt(seg.totalnum, list.length), page, limit, source: SOURCE }
+        return { list: [], diag: `${host}: http=${status} list=${raw.length}` }
       } catch (e) {
-        diags.push(`${host}: ${(e && e.message) || e}`.slice(0, 60))
+        return { list: [], diag: `${host}: ${(e && e.message) || e}`.slice(0, 60) }
       }
+    }
+
+    // 与歌曲搜索同一套策略：主力域名并行竞速，补位域名兜底
+    const winner = await Promise.race(
+      SEARCH_HOSTS.map(h => fetchAlbums(h).then(r => (r.list.length ? r : Promise.reject(r)))),
+    ).catch(() => null)
+    if (winner) return winner
+
+    const diags = (await Promise.all(SEARCH_HOSTS.map(fetchAlbums))).map(r => r.diag)
+    for (const host of FALLBACK_HOSTS) {
+      const r = await fetchAlbums(host)
+      if (r.list.length) return r
+      diags.push(r.diag)
     }
     throw new Error(`QQ音乐专辑搜索失败（${diags.join(' | ')}）`)
   },
