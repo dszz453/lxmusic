@@ -571,7 +571,14 @@
       view.innerHTML = bar
         + (history.length
           ? '<section class="section">' + sectionHead('搜索历史', '<a class="section__more" href="javascript:void(0)" data-act="clear-history">清空</a>') + '</section>'
-            + '<div class="chips">' + history.slice(0, 20).map(h => '<a class="chip" href="#/search?q=' + encodeURIComponent(h.keyword || h) + (type === 'album' ? '&type=album' : '') + '">' + esc(h.keyword || h) + '</a>').join('') + '</div>'
+            + '<div class="chips">' + history.slice(0, 20).map(h => {
+              const kw = h.keyword || h
+              const href = '#/search?q=' + encodeURIComponent(kw) + (type === 'album' ? '&type=album' : '')
+              return '<span class="chip chip--del">'
+                + '<a href="' + href + '">' + esc(kw) + '</a>'
+                + '<button class="chip__del" data-act="del-history" data-keyword="' + esc(kw) + '" aria-label="删除">&times;</button>'
+                + '</span>'
+            }).join('') + '</div>'
           : '<section class="section">' + sectionHead('热门搜索') + '</section>'
             + '<div class="chips">' + ['周杰伦', '邓紫棋', '林俊杰', '薛之谦', '五月天', '陈奕迅', '毛不易', '刘德华', '纯音乐', '粤语经典']
               .map(k => '<a class="chip" href="#/search?q=' + encodeURIComponent(k) + (type === 'album' ? '&type=album' : '') + '">' + k + '</a>').join('') + '</div>')
@@ -2417,8 +2424,15 @@
         toast((App.platformNames[src] || src) + '暂不支持查看专辑曲目，可切到「综合」或其它平台再试')
         break
       }
+      case 'del-history': {
+        const kw = node.dataset.keyword || ''
+        if (!kw) break
+        try { await API.deleteHistory(kw) } catch { /* ignore */ }
+        pageSearch(parseHash())
+        break
+      }
       case 'clear-history':
-        try { await fetch('/api/history', { method: 'DELETE', headers: authHeader() }) } catch { /* ignore */ }
+        try { await API.deleteHistory() } catch { /* ignore */ }
         pageSearch(parseHash())
         break
       /* --- 播放历史（注意和上面「搜索历史」不是一回事） --- */

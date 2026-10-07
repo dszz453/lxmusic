@@ -813,6 +813,34 @@ em { font-style: normal; }
 }
 .chip.is-active { background: var(--brand); border-color: var(--brand); color: #fff; }
 
+/*
+ * 搜索历史可删 chip：外层 span 当 chip，内部 <a> 承文字链接，<button> 承 ✕ 按钮。
+ * ✕ 按钮紧贴文字右侧，点 ✕ 只删这一条，点文字直接搜索，互不干扰。
+ */
+.chip--del {
+  display: inline-flex;
+  align-items: center;
+  gap: 2px;
+  padding: 0;
+  overflow: hidden;
+}
+.chip--del a {
+  padding: 5px 6px 5px 12px;
+  color: var(--text-2);
+  font-size: 12px;
+  white-space: nowrap;
+}
+.chip__del {
+  padding: 5px 8px 5px 2px;
+  font-size: 14px;
+  line-height: 1;
+  color: var(--text-3);
+  background: none;
+  border: none;
+  cursor: pointer;
+}
+.chip__del:hover { color: var(--danger, #f56c6c); }
+
 /* 搜索页有两排 chips（类型 + 平台），贴一起才像一组，否则中间空出一道 */
 .chips--tight { padding-top: 0; padding-bottom: 4px; }
 .chips--tight .chip { font-weight: 600; }

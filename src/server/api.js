@@ -708,7 +708,14 @@ export async function handleApi(request, env, url) {
 
     if (path === '/history') {
       if (method === 'DELETE') {
-        await db.clearSearchHistory(env.DB, user.id)
+        const keyword = url.searchParams.get('keyword')
+        if (keyword) {
+          // 删单条（按关键词，只删当前用户的）
+          await db.deleteSearchHistoryByKeyword(env.DB, user.id, keyword)
+        } else {
+          // 无 keyword 参数：清空当前用户全部搜索历史
+          await db.clearSearchHistory(env.DB, user.id)
+        }
         return json({ ok: true })
       }
       return json({ ok: true, list: await db.listSearchHistory(env.DB, user.id) })

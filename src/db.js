@@ -306,6 +306,10 @@ export async function clearSearchHistory(db, userId) {
   await db.prepare('DELETE FROM search_history WHERE user_id = ?').bind(userId).run()
 }
 
+export async function deleteSearchHistoryByKeyword(db, userId, keyword) {
+  await db.prepare('DELETE FROM search_history WHERE user_id = ? AND keyword = ?').bind(userId, keyword).run()
+}
+
 /* ---------------- 播放进度 / 播放历史 ---------------- */
 
 /**

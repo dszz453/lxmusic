@@ -84,6 +84,8 @@
     },
     suggest: (q) => get('/suggest?q=' + encodeURIComponent(q)),
     history: () => get('/history'),
+    // keyword 有值：删单条；无值：清空全部
+    deleteHistory: (keyword) => del('/history' + (keyword ? '?keyword=' + encodeURIComponent(keyword) : '')),
 
     // 搜专辑（六平台聚合）
     searchAlbums: (q, opts) => {
