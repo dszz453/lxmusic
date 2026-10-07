@@ -574,7 +574,7 @@
             + '<div class="chips">' + history.slice(0, 20).map(h => {
               const kw = h.keyword || h
               const href = '#/search?q=' + encodeURIComponent(kw) + (type === 'album' ? '&type=album' : '')
-              return '<span class="chip chip--del">'
+              return '<span class="chip--del">'
                 + '<a href="' + href + '">' + esc(kw) + '</a>'
                 + '<button class="chip__del" data-act="del-history" data-keyword="' + esc(kw) + '" aria-label="删除">&times;</button>'
                 + '</span>'

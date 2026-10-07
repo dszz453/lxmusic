@@ -814,30 +814,35 @@ em { font-style: normal; }
 .chip.is-active { background: var(--brand); border-color: var(--brand); color: #fff; }
 
 /*
- * 搜索历史可删 chip：外层 span 当 chip，内部 <a> 承文字链接，<button> 承 ✕ 按钮。
- * ✕ 按钮紧贴文字右侧，点 ✕ 只删这一条，点文字直接搜索，互不干扰。
+ * 搜索历史可删 chip：外层 span 独立样式（不继承 .chip），
+ * 内部 <a> 承文字链接，<button> 承 ✕ 按钮。
+ * 点 ✕ 只删这一条，点文字直接搜索，互不干扰。
  */
 .chip--del {
   display: inline-flex;
   align-items: center;
-  gap: 2px;
-  padding: 0;
-  overflow: hidden;
+  font-size: 12px;
+  border-radius: 999px;
+  background: var(--surface-2);
+  border: 1px solid var(--line-strong);
+  overflow: visible;
 }
 .chip--del a {
-  padding: 5px 6px 5px 12px;
+  padding: 5px 4px 5px 12px;
   color: var(--text-2);
   font-size: 12px;
   white-space: nowrap;
+  line-height: 1.4;
 }
 .chip__del {
-  padding: 5px 8px 5px 2px;
-  font-size: 14px;
+  padding: 4px 8px 4px 2px;
+  font-size: 15px;
   line-height: 1;
   color: var(--text-3);
   background: none;
   border: none;
   cursor: pointer;
+  flex-shrink: 0;
 }
 .chip__del:hover { color: var(--danger, #f56c6c); }
 
