@@ -382,6 +382,59 @@ export async function resolveMusicUrlFast(song, quality, pluginPool, options = {
   let releaseBudget = null
   const budget = new Promise((res) => { releaseBudget = res })
 
+  /**
+   * 探测结果的短收敛窗口（毫秒）。
+   *
+   * ── 为什么需要它（这是「同一首歌选不同音质长度不一样」的真凶）──────
+   * 各音源插件对不同音质返回的是**不同来源**的地址：低音质常落到第三方中转源，
+   * 那些源给的是**试听片段**（三十多秒）；Hi-Res 走正版直链，给的是完整曲目。
+   * 而原来的逻辑是「谁先探通就用谁」—— 试听片段只要先探通就会被选中，
+   * 完整版即使也探通了也不会被看一眼。用户看到的就是「换了音质时长就变了」。
+   *
+   * 修法不是「全部探完再选」——那会把起播拖到 3~5 秒，得不偿失（这条是
+   * 上面那段说明的核心诉求）。而是探通第一条之后**再多等一小会儿**，
+   * 把同期探通的候选收进来一起挑。450ms 的依据：同一批候选的 Range 探测
+   * 耗时集中在 120~240ms，多等这几百毫秒远小于「放半首就没了」的代价。
+   *
+   * 窗口内若收到明显更完整的候选就用它；只有片段可用时仍然用片段
+   * （能出声比不出声强），但在 tried 里标明是「疑似试听片段」。
+   */
+  const SETTLE_MS = 450
+  let settleTimer = null
+  let releaseSettle = null
+  const settle = new Promise((res) => { releaseSettle = res })
+  const armSettle = () => {
+    if (settleTimer) return
+    settleTimer = setTimeout(releaseSettle, SETTLE_MS)
+  }
+  const probed = []          // 探通且 ok 的候选，供 pickBest 挑
+
+  /**
+   * 探通多条时怎么选 —— 与下面的 compareCandidates **必须同档位同顺序**。
+   *
+   * 这里曾经把 official 排在第一档、weak 排到第三档，和 compareCandidates
+   * （weak → official → size）是两套顺序。后果不是「选得不最优」这么轻：
+   * WEAK_HOSTS 是**已知死接口**名单（music.163.com 的 outer/url 实测
+   * 302 → /404），一个死接口只要 HEAD 探测时侥幸回了 content-range，
+   * 就会在 pickBest 这一路被抬到健康的官方 CDN 前面，而它恰恰是放不出声的那条。
+   * 同一份文件里两个sort 顺序不一致 ⇒ 走哪条路径结果不同 ⇒ 极难复现的偶发。
+   *
+   * 档位与 compareCandidates 逐条对齐：
+   *   ① weak 最后   ② official 优先   ③ 体积大优先   ④ native 优先
+   * 两边改一处就要改另一处；test/stream-pick.mjs 有一条一致性断言盯着它们。
+   */
+  const pickBest = (list) => {
+    if (!list.length) return null
+    return list.slice().sort((a, b) => {
+      if (!!a.weak !== !!b.weak) return a.weak ? 1 : -1
+      if (!!a.official !== !!b.official) return a.official ? -1 : 1
+      const as = a.size || 0
+      const bs = b.size || 0
+      if (as !== bs) return bs - as               // 体积大 = 完整版
+      return (b.native ? 1 : 0) - (a.native ? 1 : 0)
+    })[0]
+  }
+
   const flow = Promise.all(thunks.map(async (t) => {
     let r = null
     try { r = await withDeadline(t(), deadline) } catch { return }
@@ -409,24 +462,43 @@ export async function resolveMusicUrlFast(song, quality, pluginPool, options = {
     cands.push(rec)                       // 先入列：哪怕探测没赶上预算也要能返回
     const p = await withDeadline(probeAudioBytes(url), probeDeadline)
     Object.assign(rec, p)
-    if (rec.ok && !earlyPayload) {
-      earlyPayload = rec
-      releaseBudget()                     // 探通了 → 不用再等预算
+    if (rec.ok) {
+      probed.push(rec)
+      // 探通了：不再立刻收工，而是开一个短窗口多收几条再挑（见上面 SETTLE_MS 说明）。
+      // earlyPayload 仍然记第一条 —— 窗口到点时若还没第二条，用的就是它。
+      if (!earlyPayload) earlyPayload = rec
+      armSettle()
     }
   }))
 
   const timer = setTimeout(releaseBudget, totalBudget)
   try {
-    await Promise.race([budget, flow.then(() => null, () => null)])
+    // 等三件事里先到的那个：
+    //   ① 收敛窗口到点（有候选探通了）—— 正常路径，此时手上已有一批可挑的
+    //   ② 全部 flow 跑完 —— 没有候选探通时的自然结束
+    //   ③ 总预算到点 —— 兜底，防止个别源把整条链路拖死
+    await Promise.race([budget, settle, flow.then(() => null, () => null)])
   } finally {
     clearTimeout(timer)
+    if (settleTimer) clearTimeout(settleTimer)
   }
 
   if (earlyPayload) {
+    // 在窗口内收集到的候选里挑「最完整的那条」，而不是「最先探通的那条」
+    const best = pickBest(probed) || earlyPayload
+    if (best !== earlyPayload) {
+      tried.push(`已优先选用更完整的候选（${best.from}，${best.size ? Math.round(best.size / 1024) + 'KB' : '体积未知'}）`
+        + `，放弃先探通的 ${earlyPayload.from}（${earlyPayload.size ? Math.round(earlyPayload.size / 1024) + 'KB' : '体积未知'}，疑似试听片段）`)
+    }
+    // 次要候选一并交出去：客户端那条首条失败就往下试的降级链正好用得上，
+    // 而且它们已经被探过一遍（verified），比让客户端从零开始试要快。
+    const ordered = [best, ...probed.filter(x => x !== best)]
+      .map((x) => ({ url: x.url, from: x.from, size: x.size || 0 }))
     return {
-      urls: [{ url: earlyPayload.url, from: earlyPayload.from, size: earlyPayload.size || 0 }],
-      url: earlyPayload.url,
-      from: earlyPayload.from,
+      urls: ordered,
+      url: best.url,
+      from: best.from,
+      size: best.size || 0,
       tried,
       unverified: false,
     }

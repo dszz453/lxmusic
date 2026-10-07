@@ -123,6 +123,7 @@
     '/playlist-add': (r) => pagePlaylistAdd(r),
     '/favorite': () => pageFavorite(),
     '/history': () => pageHistory(),
+    '/cache': () => pageCache(),
     '/import': () => pageImport(),
     '/ai': () => pageAi(),
     '/settings': (r) => pageSettings(r),
@@ -349,6 +350,12 @@
       const data = await API.home()
       App.home = data
       if (parseHash().path !== '/') return
+      // 骨架 → 内容的交叉过渡：先让骨架淡出，再换上真内容。
+      // 不这么做的话，数据回来那一下是「骨架瞬间消失 + 内容瞬间出现」，
+      // 在慢网（数据要等几秒）时这个硬切特别刺眼。
+      if (!view.querySelector('.skeleton')) { renderHome(data); return }
+      await new Promise((resolve) => fadeOutSkeleton(view, resolve))
+      if (parseHash().path !== '/') return
       renderHome(data)
     } catch (e) {
       if (parseHash().path !== '/') return
@@ -412,8 +419,51 @@
       : (data ? emptyState('暂无推荐', '换个关键词搜索试试') : skeleton(4))
 
     view.innerHTML = quickbar + banner + chartsSection + hotSection
+    playHomeEnter()
     // 不 await：头图是锦上添花，不能拖住首页首屏
     upgradeChartCovers().catch(() => {})
+  }
+
+  /**
+   * 首页入场动画。
+   *
+   * 只在「首次把首页画出来」这一下播（见下面 homeEntered 的判断）——
+   * 从搜索页/设置页返回首页时重播会变成噪音，同一段动画看第三遍就只剩烦。
+   *
+   * 实现上注意两点：
+   *   · 必须等这一帧的布局稳定后再加类。紧挨着 innerHTML 赋值就加，浏览器会把
+   *     「初始态 + 目标态」合并成一次计算，动画根本不跑（表现为内容直接出现）。
+   *   · 动画结束后把类摘掉，避免它长期挂在 DOM 上影响后续的样式匹配。
+   */
+  let homeEntered = false
+
+  function playHomeEnter() {
+    if (homeEntered) return
+    homeEntered = true
+    // 系统开了「减少动态效果」就干脆不加类 —— CSS 那边也有兜底，
+    // 但在 JS 层就拦住更彻底（连动画事件都不会产生）
+    try {
+      if (window.matchMedia && window.matchMedia('(prefers-reduced-motion: reduce)').matches) return
+    } catch { /* 老浏览器没有 matchMedia，继续播 */ }
+    requestAnimationFrame(() => {
+      if (parseHash().path !== '/') return
+      view.classList.add('is-entering')
+      const done = () => view.classList.remove('is-entering')
+      // 兜底定时器：万一 animationend 因为元素被替换而没触发，
+      // 类不能永远挂着（那样后续再进首页会被当成「已播过」而不播）
+      setTimeout(done, 700)
+      const first = view.firstElementChild
+      if (first) first.addEventListener('animationend', done, { once: true })
+    })
+  }
+
+  /** 骨架屏退场：淡出之后再换内容，避免中间闪一下白 */
+  function fadeOutSkeleton(box, done) {
+    if (!box) { if (done) done(); return }
+    const sk = box.querySelector && box.querySelector('.skeleton')
+    if (!sk) { if (done) done(); return }
+    sk.classList.add('is-out')
+    setTimeout(() => { if (done) done() }, 180)
   }
 
   function handleQuick(key) {
@@ -1293,18 +1343,98 @@
   /**
    * 远程模式下的「音源插件」区块。
    *
-   * 插件这时跑在服务器那一侧（由服务端统一管理、统一评分调度），
-   * 本机再摆一份导入 / 启停的入口只会让人以为改这里有用 —— 所以换成一句指向管理端的说明。
+   * ⚠️ 这块以前只写一句「插件由服务器统一管理与调度，需要增删插件请到管理端」，
+   * 而**管理端当时根本没有导入功能**（只有列表 / 评分 / 启停），服务端也没有导入接口
+   * —— 等于把人指到一个不存在的地方。用户反馈的原话就是
+   * 「插件没有办法手动导入新的插件」。
+   *
+   * 现在服务端补齐了导入 / 删除（见 src/server/plugin-import.mjs），这里也直接给
+   * 一个导入入口：手机上调出浏览器去开管理端本来就别扭，能在 App 里点完最好。
+   * 非管理员只看到说明 —— 服务端的插件池是全局的，改它会影响所有人。
    */
   function remotePluginNoteHtml() {
     const base = (window.LXApp && window.LXApp.serverBase) || ''
     const adminUrl = base + '/admin'
-    return '<div class="field__label" style="margin-bottom:8px">音源插件</div>'
-      + '<div class="note">当前是自建服务器模式，插件由服务器统一管理与调度，本机不再单独加载。'
-      + '需要增删插件、调整优先级，请到管理端。</div>'
+    const isAdmin = !!(App.user && App.user.isAdmin)
+    const head = '<div class="field__label" style="margin-bottom:8px">音源插件</div>'
+      + '<div class="note">当前是自建服务器模式，插件在服务器上统一加载与调度，本机不再单独加载。</div>'
+    if (!isAdmin) {
+      return head
+        + '<a class="btn btn--block btn--ghost" style="margin-top:12px" href="' + esc(adminUrl)
+        + '" target="_blank" rel="noopener">打开管理端</a>'
+        + '<div class="note" style="margin-top:8px">' + esc(adminUrl) + '</div>'
+        + '<div class="note" style="margin-top:8px">音源插件由服务器统一管理，只有管理员账号能增删。</div>'
+    }
+    return head
+      + '<div class="field" style="margin-top:12px"><div class="field__label">插件脚本 URL</div>'
+      + '<input class="input" id="srvPluginUrl" placeholder="https://.../latest.js" autocomplete="off"></div>'
+      + '<button class="btn btn--block" data-act="srv-import-url">从 URL 导入到服务器</button>'
+      + '<button class="btn btn--block btn--ghost" style="margin-top:8px" data-act="srv-import-open">粘贴脚本导入</button>'
+      + '<div id="srvImportBox" hidden style="margin-top:10px">'
+      + '<textarea class="textarea" id="srvPluginText" placeholder="/* @name ... */&#10;(function(){ ... })()"></textarea>'
+      + '<button class="btn btn--block" data-act="srv-import-text" style="margin-top:8px">解析并导入</button>'
+      + '</div>'
+      + '<div class="note" id="srvPluginState" style="margin-top:10px"></div>'
+      + '<div class="field__label" style="margin:16px 0 8px">服务器上的插件</div>'
+      + '<div id="srvPluginList"><div class="note">加载中…</div></div>'
       + '<a class="btn btn--block btn--ghost" style="margin-top:12px" href="' + esc(adminUrl)
-      + '" target="_blank" rel="noopener">打开管理端</a>'
-      + '<div class="note" style="margin-top:8px">' + esc(adminUrl) + '</div>'
+      + '" target="_blank" rel="noopener">打开管理端（完整设置）</a>'
+  }
+
+  /** 拉取服务器上的插件清单并画出来（仅远程模式 + 管理员） */
+  async function refreshServerPlugins() {
+    const host = $('#srvPluginList')
+    if (!host) return
+    try {
+      const r = await API.plugins()
+      const list = (r && r.list) || []
+      if (!list.length) { host.innerHTML = '<div class="note">服务器上还没有插件。</div>'; return }
+      host.innerHTML = list.map(p => {
+        const badges = '<span class="pill ' + (p.ok ? 'pill--ok' : 'pill--bad') + '">'
+          + (p.ok ? '运行中' : '加载失败') + '</span>'
+          + (p.bytes ? '<span class="pill">' + Math.round(p.bytes / 1024) + 'KB</span>' : '')
+          + (p.origin === 'user' ? '<span class="pill">手动导入</span>' : '')
+        return '<div class="card-block"><div class="card-block__head">'
+          + '<span class="card-block__name">' + esc(p.name || p.id) + '</span>' + badges
+          + '</div><div class="card-block__desc">'
+          + ((p.sources || []).map(x => '<span class="pill">' + esc(App.platformShort[x] || x) + '</span>').join('') || '—')
+          + '</div>'
+          + (!p.ok && p.error ? '<div class="note" style="color:#d73535;margin-top:4px">' + esc(p.error) + '</div>' : '')
+          + (p.origin === 'user'
+            ? '<div style="margin-top:10px"><button class="btn btn--sm btn--ghost" data-act="srv-del-plugin" data-id="'
+              + esc(p.id) + '">删除</button></div>'
+            : '')
+          + '</div>'
+      }).join('')
+    } catch (e) {
+      host.innerHTML = '<div class="note" style="color:#d73535">读取失败：' + esc((e && e.message) || '') + '</div>'
+    }
+  }
+
+  /**
+   * 把插件导入到**服务器**。
+   *
+   * 失败原因（URL 不通 / 内容不像插件脚本 / 脚本自身加载失败）留在页面上而不只是
+   * 弹 toast —— 两秒后 toast 就没了，而这三类原因的处置办法完全不同。
+   */
+  async function importPluginToServer(payload, node) {
+    const st = $('#srvPluginState')
+    const old = node ? node.textContent : ''
+    if (node) { node.disabled = true; node.textContent = '导入中…' }
+    if (st) { st.style.color = ''; st.textContent = '正在下载并加载插件…（大脚本可能要十几秒）' }
+    try {
+      const r = await API.importPlugin(payload)
+      const name = (r.plugin && r.plugin.name) || '插件'
+      toast((r.replaced ? '已更新：' : '已导入：') + name + (r.from ? '（经 ' + r.from + '）' : ''))
+      if (st) st.textContent = '已导入：' + name
+      await refreshServerPlugins()
+    } catch (e) {
+      const msg = (e && e.message) || '导入失败'
+      if (st) { st.textContent = msg; st.style.color = '#d73535' }
+      toast(msg, 6000)
+    } finally {
+      if (node) { node.disabled = false; node.textContent = old }
+    }
   }
 
   /**
@@ -1633,6 +1763,7 @@
       + '<div class="block"><div class="field__label">默认音质</div><div class="chips" style="padding:0">' + qs + '</div>'
       + '<div class="note" style="margin-top:8px">无损/Hi-Res 需要对应插件支持，取不到时服务端会自动降到可用音质。</div></div>'
       + '<div class="block"><div class="field__label">播放模式</div><div class="chips" style="padding:0">' + ms + '</div></div>'
+      + '<div class="block" id="cacheBlock">' + cacheBlockHtml() + '</div>'
       + '<div class="block"><div class="field__label">播放队列</div>'
       + '<div class="note">当前 ' + Player.queue.length + ' 首</div>'
       + '<div style="display:flex;gap:8px;margin-top:10px">'
@@ -1653,6 +1784,157 @@
 
     // 服务端版本异步补 —— 不在上面的 innerHTML 里等它，否则进设置页会卡一下
     fillVersionBlock()
+    // 缓存占用要遍历 Cache Storage 量字节，同步算会卡住整个设置页
+    fillCacheBlock()
+    // 服务器模式下的插件清单也异步补（同样不占首屏）
+    if (window.LX_REMOTE) refreshServerPlugins().catch(() => {})
+  }
+
+  /* ---------------- 播放缓存 / 下载 ---------------- */
+
+  const MB = 1024 * 1024
+
+  function fmtBytes(n) {
+    const b = Number(n) || 0
+    if (b < 1024) return b + ' B'
+    if (b < MB) return (b / 1024).toFixed(1) + ' KB'
+    if (b < 1024 * MB) return (b / MB).toFixed(1) + ' MB'
+    return (b / 1024 / MB).toFixed(2) + ' GB'
+  }
+
+  /**
+   * 缓存设置卡。
+   *
+   * 三个东西必须一眼可见，否则用户没法判断「缓存到底有没有在起作用」：
+   *   ① 已占用多少 —— 不给数字就会怀疑它偷偷把手机塞满；
+   *   ② 上限是多少，且能改 —— 手机存储是稀缺资源，默认值不该是唯一选择；
+   *   ③ 自动开不开 —— 流量敏感的用户要有办法关掉。
+   */
+  function cacheBlockHtml() {
+    const c = window.LXAudioCache
+    if (!c || !c.supported) {
+      return '<div class="field__label">播放缓存</div>'
+        + '<div class="note">当前环境不支持离线缓存（浏览器隐私模式下 Cache 接口不可用）。</div>'
+    }
+    const auto = c.autoEnabled()
+    const limit = c.limitMb()
+    const opts = [200, 500, 1024, 2048]
+    return '<div class="field__label" style="margin-bottom:8px">播放缓存</div>'
+      + '<div class="note" id="cacheStat">正在统计…</div>'
+      + '<div class="field__label" style="margin:14px 0 6px">缓存上限</div>'
+      + '<div class="chips" style="padding:0">' + opts.map(m =>
+        '<button class="chip' + (m === limit ? ' is-active' : '') + '" data-act="set-cache-limit" data-key="' + m + '">'
+        + (m >= 1024 ? (m / 1024) + 'GB' : m + 'MB') + '</button>').join('') + '</div>'
+      + '<div class="field__label" style="margin:14px 0 6px">自动缓存听过的歌</div>'
+      + '<div class="chips" style="padding:0">'
+      + '<button class="chip' + (auto ? ' is-active' : '') + '" data-act="set-cache-auto" data-key="1">开启</button>'
+      + '<button class="chip' + (!auto ? ' is-active' : '') + '" data-act="set-cache-auto" data-key="0">关闭</button>'
+      + '</div>'
+      + '<div class="note" style="margin-top:8px">整首播完后自动存到本机。再次播放不再重新取流，弱网下也能听。</div>'
+      + '<div style="display:flex;gap:8px;margin-top:12px">'
+      + '<button class="btn btn--sm btn--ghost" data-act="open-cache-list">查看缓存的歌</button>'
+      + '<button class="btn btn--sm btn--ghost" data-act="clear-cache">清空缓存</button></div>'
+  }
+
+  async function fillCacheBlock() {
+    const el = document.getElementById('cacheStat')
+    if (!el) return
+    const c = window.LXAudioCache
+    if (!c) return
+    try {
+      const s = await c.stats()
+      if (!document.body.contains(el)) return    // 用户已经离开设置页
+      const pct = s.limitMb > 0 ? Math.min(100, Math.round(s.usedBytes / (s.limitMb * MB) * 100)) : 0
+      el.innerHTML = '已缓存 <b>' + s.count + '</b> 首 · 占用 <b>' + fmtBytes(s.usedBytes) + '</b>'
+        + ' / ' + (s.limitMb >= 1024 ? (s.limitMb / 1024) + 'GB' : s.limitMb + 'MB')
+        + '（' + pct + '%）'
+        + (s.writing ? '<span style="color:var(--brand)"> · 正在缓存 ' + s.writing + ' 首…</span>' : '')
+    } catch (e) {
+      el.textContent = '统计失败：' + ((e && e.message) || '')
+    }
+  }
+
+  /**
+   * 缓存清单页。
+   *
+   * 缓存条目里只有 id 与平台（Cache 里存不了歌名），所以这里**刻意复用 `.song`
+   * 那一套行样式**而不是另造一套：既和全站的歌曲列表长得一致，也不用新增 CSS。
+   * 想具体知道是哪首，点「播放」去还原；列表本身只负责「占了多少、能删掉」。
+   */
+  async function pageCache() {
+    view.innerHTML = pageHeader('播放缓存') + '<div id="cacheList">' + skeleton(4) + '</div>'
+    const box = document.getElementById('cacheList')
+    const c = window.LXAudioCache
+    if (!c || !c.supported) { box.innerHTML = emptyState('不可用', '当前环境不支持缓存'); return }
+    let items = []
+    try { items = await c.list() } catch { items = [] }
+    if (!items.length) {
+      box.innerHTML = emptyState('还没有缓存的歌', '整首听完的歌会自动存下来；也可以在歌曲菜单里点「下载到本机」')
+      return
+    }
+    const total = items.reduce((s, x) => s + x.bytes, 0)
+    box.innerHTML = '<div class="section"><div class="note" style="padding:0 14px 10px">'
+      + items.length + ' 首 · 共 ' + fmtBytes(total) + '</div></section>'
+      + '<div class="songlist">' + items.map(it => {
+        const p = App.platformShort[it.song.source] || it.song.source || '未知'
+        return '<div class="song">'
+          + '<div class="song__index">' + ICON.download + '</div>'
+          + '<div class="song__meta"><div class="song__name">' + esc(p) + ' · ' + esc(String(it.song.id)) + '</div>'
+          + '<div class="song__sub">' + esc(it.quality) + '<span class="dot">·</span>' + fmtBytes(it.bytes)
+          + (it.createdAt ? '<span class="dot">·</span>' + fmtTime(it.createdAt) : '') + '</div></div>'
+          + '<div class="song__acts">'
+          + '<button class="song__act" data-act="cache-play" data-key="' + esc(it.key) + '" aria-label="播放">' + ICON.play + '</button>'
+          + '<button class="song__act" data-act="cache-del" data-key="' + esc(it.key) + '" aria-label="删除">' + ICON.trash + '</button>'
+          + '</div></div>'
+      }).join('') + '</div>'
+  }
+
+  function fmtTime(ms) {
+    const d = new Date(Number(ms) || 0)
+    const now = Date.now()
+    const diff = now - d.getTime()
+    if (diff < 60000) return '刚刚'
+    if (diff < 3600000) return Math.round(diff / 60000) + ' 分钟前'
+    if (diff < 86400000) return Math.round(diff / 3600000) + ' 小时前'
+    const p = (x) => String(x).padStart(2, '0')
+    return (d.getMonth() + 1) + '/' + d.getDate() + ' ' + p(d.getHours()) + ':' + p(d.getMinutes())
+  }
+
+  /**
+   * 下载一首歌。
+   *
+   * 优先吃缓存（听过就不必再下一次）；没缓存就现抓。进度直接写在按钮上 ——
+   * 一首无损有几十 MB，没有进度就等于「点了没反应」。
+   */
+  async function downloadSong(song, node) {
+    const c = window.LXAudioCache
+    if (!c || !c.supported) { toast('当前环境不支持下载'); return }
+    const label = song.name || '这首歌'
+    const old = node ? node.textContent : ''
+    let lastPct = -1
+    const onProgress = (p) => {
+      if (!node || p < 0) return
+      const pct = Math.round(p * 100)
+      // 每 5% 才改一次 DOM —— 每帧都改会让长列表里的按钮疯狂重排
+      if (pct === lastPct || pct % 5 !== 0) return
+      lastPct = pct
+      node.textContent = '下载 ' + pct + '%'
+    }
+    if (node) { node.disabled = true; node.textContent = '准备中…' }
+    toast('正在获取「' + label + '」…')
+    try {
+      const r = await c.exportSong(song, Player.state.quality,
+        () => Player.resolveForDownload(song, Player.state.quality), onProgress)
+      if (r && r.ok) {
+        toast('已保存：' + r.filename + '（' + fmtBytes(r.bytes) + '）', 4000)
+      } else {
+        toast('下载失败：' + ((r && r.error) || '未知原因'), 5000)
+      }
+    } catch (e) {
+      toast('下载失败：' + ((e && e.message) || ''), 5000)
+    } finally {
+      if (node) { node.disabled = false; node.textContent = old || '下载' }
+    }
   }
 
   /**
@@ -2271,6 +2553,37 @@
       }
       /* --- 插件相关 --- */
       case 'open-import-plugin': closeSheet(drawer); openPluginImport(); break
+      /* --- 服务器模式的插件导入（见 remotePluginNoteHtml） --- */
+      case 'srv-import-url': {
+        const url = (($('#srvPluginUrl') || {}).value || '').trim()
+        if (!url) { toast('请先填插件 URL'); return }
+        await importPluginToServer({ url }, node)
+        break
+      }
+      case 'srv-import-open': {
+        const box = $('#srvImportBox')
+        if (box) box.hidden = !box.hidden
+        break
+      }
+      case 'srv-import-text': {
+        const text = (($('#srvPluginText') || {}).value || '').trim()
+        if (text.length < 50) { toast('脚本体太短了'); return }
+        await importPluginToServer({ script: text }, node)
+        break
+      }
+      case 'srv-del-plugin': {
+        if (!confirm('从服务器删除这个插件？删掉后取流就不会再用它了。')) return
+        node.disabled = true
+        try {
+          await API.deletePlugin(node.dataset.id)
+          toast('已删除')
+          await refreshServerPlugins()
+        } catch (e) {
+          node.disabled = false
+          toast((e && e.message) || '删除失败')
+        }
+        break
+      }
       case 'import-preset': {
         const preset = LXP.PRESETS[Number(node.dataset.i)]
         if (!preset) return
@@ -2316,6 +2629,81 @@
         const song = (lists[node.dataset.list] || [])[Number(node.dataset.i)]
         if (song) copyText(song.name + ' - ' + (song.singer || ''))
         closeSheet(drawer)
+        break
+      }
+      // 下载要先把菜单收掉：下载进度写在 toast 上，抽屉挡着就看不见
+      case 'download-song': {
+        const song = (lists[node.dataset.list] || [])[Number(node.dataset.i)]
+        closeSheet(drawer)
+        if (song) downloadSong(song, null)
+        break
+      }
+      /* --- 播放缓存页 --- */
+      case 'set-cache-limit': {
+        const n = window.LXAudioCache && window.LXAudioCache.setLimitMb(Number(node.dataset.key))
+        toast('缓存上限已设为 ' + (n >= 1024 ? (n / 1024) + 'GB' : n + 'MB'))
+        fillCacheBlock()
+        break
+      }
+      case 'set-cache-auto': {
+        const on = node.dataset.key === '1'
+        if (window.LXAudioCache) window.LXAudioCache.setAuto(on)
+        toast(on ? '已开启自动缓存' : '已关闭自动缓存')
+        // 重画这一块，让 chip 的选中态跟上
+        const blk = document.getElementById('cacheBlock')
+        if (blk) { blk.innerHTML = cacheBlockHtml(); fillCacheBlock() }
+        break
+      }
+      case 'open-cache-list':
+        go('#/cache')
+        break
+      case 'clear-cache': {
+        if (!confirm('清空全部播放缓存？已下载到本机的文件不受影响。')) return
+        const ok = window.LXAudioCache && await window.LXAudioCache.clear()
+        toast(ok ? '缓存已清空' : '清空失败')
+        fillCacheBlock()
+        break
+      }
+      case 'cache-play': {
+        /**
+         * 缓存清单里只有「平台 + 歌曲 id」（Cache 里存不下歌名与歌手），
+         * 要播就得先把这两个还原成一个完整的 song 对象。
+         *
+         * 没有「按 id 取详情」的接口，所以用搜索接口反查：拿 id 当关键词去搜，
+         * 再在结果里挑 id 对得上的那条。命中率不高是正常的 —— id 不是歌名，
+         * 各平台搜索未必把它当一回事。**因此必须给一句诚实的失败提示**，
+         * 而不是默默什么都不做（那样用户只会以为缓存页坏了）。
+         *
+         * 真正的用途是「我缓存过这首歌，想再听一遍」——这条路径更稳的做法是
+         * 从播放历史/歌单里点它，缓存会在那一刻直接命中。这里是给没留记录的场景兜底。
+         */
+        const key = node.dataset.key || ''
+        const meta = (key.match(/\/audio\/([^/]+)\/([^/]+)\/([^/]+)$/) || [])
+        const src = meta[1] ? decodeURIComponent(meta[1]) : ''
+        const id = meta[2] ? decodeURIComponent(meta[2]) : ''
+        if (!id) { toast('这条缓存记录不完整'); return }
+        const who = (App.platformShort[src] || src) + ' ' + id
+        if (node) { node.disabled = true; node.textContent = '查找中…' }
+        try {
+          const r = await API.search(id, { source: src, limit: 30 })
+          const hit = ((r && r.list) || []).find(s => String(s.id) === id)
+          if (hit) {
+            Player.playSong(hit)
+            toast('播放：' + (hit.name || ''))
+          } else {
+            toast('没能按 id 找回「' + who + '」的信息（缓存还在，从历史或歌单里点它会直接命中）', 5000)
+          }
+        } catch (e) {
+          toast('查找失败：' + ((e && e.message) || ''), 5000)
+        } finally {
+          if (node) { node.disabled = false; node.textContent = '播放' }
+        }
+        break
+      }
+      case 'cache-del': {
+        const ok = window.LXAudioCache && await window.LXAudioCache.dropKey(node.dataset.key)
+        toast(ok ? '已删除' : '删除失败')
+        if (ok) pageCache()
         break
       }
       /* --- 歌单选择器 --- */
@@ -2364,6 +2752,7 @@
       + menuItem('add-queue', listKey, i, ICON.plus, '加入播放队列')
       + menuItem('fav-song', listKey, i, ICON.heart, '收藏 / 取消收藏')
       + menuItem('collect-song', listKey, i, ICON.list, '收藏到歌单')
+      + menuItem('download-song', listKey, i, ICON.download, '下载到本机')
       + (inPl
         ? menuItem('pl-up', listKey, i, ICON.arrowUp, '上移一位')
           + menuItem('pl-down', listKey, i, ICON.arrowDown, '下移一位')

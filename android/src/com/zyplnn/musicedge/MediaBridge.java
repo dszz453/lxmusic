@@ -18,6 +18,7 @@ import java.io.ByteArrayOutputStream;
 import java.io.InputStream;
 import java.net.HttpURLConnection;
 import java.net.URL;
+import java.util.Locale;
 import java.util.concurrent.ExecutorService;
 import java.util.concurrent.Executors;
 import java.util.concurrent.atomic.AtomicInteger;
@@ -584,5 +585,167 @@ public final class MediaBridge {
             Log.w(TAG, "封面缩放失败: " + t.getMessage());
             return src;
         }
+    }
+
+    /* ---------------- 导出到「下载」目录 ---------------- */
+
+    /**
+     * 把 base64 音频写进系统「下载」目录，返回落地的绝对路径（失败返回空串）。
+     *
+     * ── 为什么要分 Android 10 前后两套 ──────────────────────────────
+     * Android 10（API 29）起是**分区存储**：应用不能再直接往公共下载目录写文件，
+     * 必须走 MediaStore 并让系统分配文件句柄。而 API 29 以下没有 MediaStore
+     * 的 Downloads 集合，只能直接写 `Environment.DIRECTORY_DOWNLOADS` 这个路径。
+     * 两套代码都必须留着 —— 这个 App 的最低版本远低于 29。
+     *
+     * ── 为什么不用「用户选保存位置」的 SAF ──────────────────────────
+     * SAF 要弹一个系统文件选择器，可用户点的是「下载」而不是「另存为」，
+     * 多一步选择是纯粹的摩擦。写进公共下载目录正是用户预期的结果。
+     */
+    public static String saveToDownloads(Context ctx, String filename, String b64) {
+        String name = safeFileName(filename);
+        if (name.isEmpty()) return "";
+        byte[] data;
+        try {
+            data = android.util.Base64.decode(b64, android.util.Base64.DEFAULT);
+        } catch (Throwable t) {
+            Log.w(TAG, "base64 解码失败: " + t.getMessage());
+            return "";
+        }
+        if (data.length == 0) return "";
+
+        if (Build.VERSION.SDK_INT >= 29) {
+            return saveViaMediaStore(ctx, name, data);
+        }
+        return saveViaLegacyPath(ctx, name, data);
+    }
+
+    /** 文件名兜底清洗。页面侧已经清过一遍，这里再拦一次 —— 路径穿越不能靠调用方自律 */
+    private static String safeFileName(String raw) {
+        String s = String.valueOf(raw == null ? "" : raw).trim();
+        s = s.replace('\\', '_').replace('/', '_').replace(':', '_');
+        s = s.replaceAll("[\\x00-\\x1f*?\"<>|]", "_");
+        // 只有点开头的名字会被系统当成隐藏文件，看着像「下载没出现」
+        while (s.startsWith(".")) s = s.substring(1);
+        if (s.length() > 120) {
+            int dot = s.lastIndexOf('.');
+            String ext = (dot > 0 && s.length() - dot <= 6) ? s.substring(dot) : "";
+            s = s.substring(0, 120 - ext.length()) + ext;
+        }
+        return s;
+    }
+
+    /** 恰好对应文件名的 MIME。写错了系统图库里会显示成未知类型 */
+    private static String mimeOf(String name) {
+        String s = name.toLowerCase(Locale.US);
+        if (s.endsWith(".flac")) return "audio/flac";
+        if (s.endsWith(".m4a")) return "audio/mp4";
+        if (s.endsWith(".aac")) return "audio/aac";
+        if (s.endsWith(".wav")) return "audio/wav";
+        if (s.endsWith(".ogg") || s.endsWith(".opus")) return "audio/ogg";
+        if (s.endsWith(".ape")) return "audio/ape";
+        return "audio/mpeg";
+    }
+
+    /** API 29+：交给 MediaStore 分配句柄，写完系统图库 / 文件管理器里立刻可见 */
+    private static String saveViaMediaStore(Context ctx, String name, byte[] data) {
+        android.content.ContentValues cv = new android.content.ContentValues();
+        cv.put(android.provider.MediaStore.MediaColumns.DISPLAY_NAME, name);
+        cv.put(android.provider.MediaStore.MediaColumns.MIME_TYPE, mimeOf(name));
+        cv.put(android.provider.MediaStore.MediaColumns.RELATIVE_PATH, android.os.Environment.DIRECTORY_DOWNLOADS);
+        cv.put(android.provider.MediaStore.MediaColumns.IS_PENDING, 1);
+
+        android.content.ContentResolver cr = ctx.getContentResolver();
+        android.net.Uri uri = null;
+        try {
+            uri = cr.insert(android.provider.MediaStore.Downloads.EXTERNAL_CONTENT_URI, cv);
+            if (uri == null) return "";
+            java.io.OutputStream os = cr.openOutputStream(uri);
+            if (os == null) return "";
+            try {
+                os.write(data);
+                os.flush();
+            } finally {
+                try { os.close(); } catch (Throwable ignore) { }
+            }
+            // IS_PENDING 必须在数据写完后清掉 —— 否则这个文件对别的应用一直不可见，
+            // 表现是「保存成功但下载目录里找不到」
+            cv.clear();
+            cv.put(android.provider.MediaStore.MediaColumns.IS_PENDING, 0);
+            cr.update(uri, cv, null, null);
+            return absolutePathOf(cr, uri, name);
+        } catch (Throwable t) {
+            Log.w(TAG, "MediaStore 保存失败: " + t.getMessage());
+            // 插了一半要回滚，否则下载目录里会留一个 0 字节的残件
+            if (uri != null) {
+                try { cr.delete(uri, null, null); } catch (Throwable ignore) { }
+            }
+            return "";
+        }
+    }
+
+    /** API 29 以下：直接写公共下载目录（那时还没有分区存储的限制） */
+    private static String saveViaLegacyPath(Context ctx, String name, byte[] data) {
+        try {
+            java.io.File dir = android.os.Environment.getExternalStoragePublicDirectory(android.os.Environment.DIRECTORY_DOWNLOADS);
+            if (dir == null) return "";
+            if (!dir.exists() && !dir.mkdirs()) return "";
+            java.io.File out = uniqueFile(dir, name);
+            java.io.FileOutputStream fos = new java.io.FileOutputStream(out);
+            try {
+                fos.write(data);
+                fos.flush();
+            } finally {
+                try { fos.close(); } catch (Throwable ignore) { }
+            }
+            // 让系统文件管理器立刻看到它（不然要等一次媒体扫描）
+            try {
+                android.media.MediaScannerConnection.scanFile(
+                    ctx, new String[]{ out.getAbsolutePath() }, new String[]{ mimeOf(name) }, null);
+            } catch (Throwable ignore) { }
+            return out.getAbsolutePath();
+        } catch (Throwable t) {
+            Log.w(TAG, "写入下载目录失败: " + t.getMessage());
+            return "";
+        }
+    }
+
+    /** 重名时加 (1)(2) —— 直接覆盖会把用户之前下的同名文件弄没 */
+    private static java.io.File uniqueFile(java.io.File dir, String name) {
+        java.io.File f = new java.io.File(dir, name);
+        if (!f.exists()) return f;
+        String base = name;
+        String ext = "";
+        int dot = name.lastIndexOf('.');
+        if (dot > 0) { base = name.substring(0, dot); ext = name.substring(dot); }
+        for (int i = 1; i < 500; i++) {
+            java.io.File g = new java.io.File(dir, base + "(" + i + ")" + ext);
+            if (!g.exists()) return g;
+        }
+        return new java.io.File(dir, base + "-" + System.currentTimeMillis() + ext);
+    }
+
+    /** 从 MediaStore 的 uri 反查真实路径；查不到就给一个人类可读的「下载/文件名」 */
+    private static String absolutePathOf(android.content.ContentResolver cr, android.net.Uri uri, String name) {
+        try {
+            android.database.Cursor c = cr.query(uri, new String[]{ android.provider.MediaStore.MediaColumns.DATA }, null, null, null);
+            if (c != null) {
+                try {
+                    if (c.moveToFirst()) {
+                        String p = c.getString(0);
+                        if (p != null && !p.isEmpty()) return p;
+                    }
+                } finally {
+                    c.close();
+                }
+            }
+        } catch (Throwable ignore) { }
+        return android.os.Environment.DIRECTORY_DOWNLOADS + "/" + name;
+    }
+
+    /** API 29 以下写公共目录要不要额外权限（页面侧据此决定是否提示） */
+    public static boolean hasLegacyStorage() {
+        return Build.VERSION.SDK_INT >= 29
+            || android.os.Environment.getExternalStorageState().equals(android.os.Environment.MEDIA_MOUNTED);
     }
 }

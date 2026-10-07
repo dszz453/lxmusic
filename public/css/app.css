@@ -343,6 +343,8 @@ em { font-style: normal; }
   font-variant-numeric: tabular-nums;
 }
 .song__index.is-top { color: var(--brand); font-weight: 700; }
+/* 缓存页把这一格当图标位用（放一个下载图标），文字那套字号不适用 */
+.song__index svg { width: 16px; height: 16px; vertical-align: middle; }
 
 .song__meta { flex: 1 1 auto; min-width: 0; }
 .song__name {
@@ -965,3 +967,76 @@ a.menu-item { display: flex; }
 
 /* 歌曲列表底部留白，避免被迷你播放条压住 */
 .songlist:last-child { padding-bottom: 8px; }
+
+/* ================= 首页入场动画 =================
+ *
+ * 目标：打开 App 到看见内容的这段「空白期」不要是硬切换。
+ *
+ * 三条纪律（不遵守就会从「有质感」变成「花哨且烦」）：
+ *   ① **只播一次**。用 `.is-entering` 这个类来开启动画，动画结束就摘掉 ——
+ *      否则每次从别的页面返回首页都会重播一遍，第三次就让人烦了。
+ *   ② **总时长压在 400ms 内**，且按内容层级错峰（金刚区 → banner → 歌单 → 歌单曲）。
+ *      一起淡入会显得糊，依次出现才有「内容在铺开」的感觉。
+ *   ③ **尊重系统的「减少动态效果」**。前庭功能敏感的用户开了这个开关之后，
+ *      位移类动画会引起不适，必须整体关掉 —— 这不是可选项。
+ */
+.is-entering > * {
+  animation: homeIn .34s var(--ease) both;
+}
+/* 错峰：每一层比上一层晚 45ms。用 nth-child 而不是给每个元素写类，
+   这样 renderHome 里不需要为动画额外改动结构 */
+.is-entering > *:nth-child(1) { animation-delay: 0ms; }
+.is-entering > *:nth-child(2) { animation-delay: 45ms; }
+.is-entering > *:nth-child(3) { animation-delay: 90ms; }
+.is-entering > *:nth-child(4) { animation-delay: 135ms; }
+.is-entering > *:nth-child(n+5) { animation-delay: 180ms; }
+
+@keyframes homeIn {
+  from { opacity: 0; transform: translate3d(0, 10px, 0); }
+  to   { opacity: 1; transform: none; }
+}
+
+/* 金刚区各项再细一档：同一层里从左到右浮出来，比整块一起动更轻 */
+.is-entering .quickbar .quick {
+  animation: homeIn .3s var(--ease) both;
+}
+.is-entering .quickbar .quick:nth-child(1) { animation-delay: 30ms; }
+.is-entering .quickbar .quick:nth-child(2) { animation-delay: 55ms; }
+.is-entering .quickbar .quick:nth-child(3) { animation-delay: 80ms; }
+.is-entering .quickbar .quick:nth-child(4) { animation-delay: 105ms; }
+.is-entering .quickbar .quick:nth-child(5) { animation-delay: 130ms; }
+.is-entering .quickbar .quick:nth-child(n+6) { animation-delay: 155ms; }
+
+/* banner 里的封面图稍晚一点出现 —— 它通常是最后才加载好的那张 */
+.is-entering .banner__art { animation: bannerArtIn .42s var(--ease) both; animation-delay: 90ms; }
+@keyframes bannerArtIn {
+  from { opacity: 0; transform: scale(.94) rotate(-2deg); }
+  to   { opacity: 1; transform: none; }
+}
+
+/* 骨架屏 → 真实内容的交叉过渡。
+   骨架在内容到位时不该「啪」地消失：让它淡出，同时新内容淡入，
+   中间就不会闪一下白。 */
+.skeleton { transition: opacity .18s linear; }
+.skeleton.is-out { opacity: 0; }
+
+/* 首页顶部下拉时露出一小段品牌色，暗示「已经到顶了」（纯装饰，不影响布局） */
+.home-top-glow {
+  position: absolute; top: 0; left: 0; right: 0; height: 120px;
+  pointer-events: none;
+  background: linear-gradient(180deg, rgba(236, 65, 65, .07), transparent);
+  opacity: 0;
+  animation: glowIn .5s var(--ease) .1s both;
+}
+@keyframes glowIn { to { opacity: 1; } }
+
+/* 无障碍：系统开了「减少动态效果」就整体退化成纯淡入（仍保留层级感，但不动） */
+@media (prefers-reduced-motion: reduce) {
+  .is-entering > *,
+  .is-entering .quickbar .quick,
+  .is-entering .banner__art,
+  .home-top-glow {
+    animation: none !important;
+  }
+  .skeleton { transition: none; }
+}

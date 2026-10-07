@@ -152,6 +152,14 @@
     searchSources: () => get('/admin/search-sources'),
     saveSearchSources: (sources, order) => post('/admin/search-sources', order != null ? { sources, order } : { sources }),
     plugins: () => get('/admin/plugins'),
+    /**
+     * 导入一个音源插件到**服务端**（服务器模式下插件跑在服务端）。
+     * 二选一：给 url（由服务端去下载，GitHub 地址会自动走镜像），或直接给 script 正文。
+     * 失败原因（URL 不通 / 内容不像插件 / 脚本加载失败）服务端回 400 带原文，可直接展示。
+     */
+    importPlugin: (payload) => post('/admin/plugins/import', payload),
+    /** 删除一个「用户导入」的插件。内置插件不可删，服务端会回明确的 400。 */
+    deletePlugin: (id) => del('/admin/plugins/import?id=' + encodeURIComponent(id)),
     health: () => get('/admin/health'),
     // 插件评分明细 + 当前调度偏好（自动 / 人工）
     pluginScores: () => get('/admin/plugin-scores'),

@@ -405,8 +405,48 @@
         + '<td>' + (p.ok ? '<span class="pill pill--ok">线上正常</span>' : '<span class="pill pill--bad">加载失败</span>') + built + '</td></tr>'
     }).join('')
 
+    /**
+     * 「导入插件」卡片。
+     *
+     * 这块是用户端那句「需要增删插件请到管理端」的落点 —— 在此之前管理端只有
+     * 列表/评分/启停，没有导入，那句话等于把人指到一个不存在的地方。
+     *
+     * 拆分：内置插件**不可删**（它们是构建产物，删了下次构建又回来，只会造成
+     * 「删了又出现」的困惑 —— 想让它别上岗应该用「停用」）；所以下面这张表只列
+     * 用户导入的那批，删除按钮也只给它们。
+     */
+    const userPlugins = serverPlugins.filter(p => p.origin === 'user')
+    const importBlock = '<div class="admin-card" id="plgImport">'
+      + '<div class="field__label">导入插件</div>'
+      + '<div class="note" style="margin:2px 0 10px">从 URL 导入（GitHub 地址会自动走镜像），'
+      + '或直接粘贴脚本正文。导入后立刻加载并参与取流，不用重启服务。</div>'
+      + '<input class="input" id="plgUrl" placeholder="https://.../latest.js" autocomplete="off">'
+      + '<div style="display:flex;gap:8px;margin-top:8px;flex-wrap:wrap">'
+      + '<button class="btn btn--sm" id="plgUrlBtn">从 URL 导入</button>'
+      + '<button class="btn btn--sm btn--ghost" id="plgPasteBtn">粘贴脚本</button>'
+      + '</div>'
+      + '<div id="plgPasteBox" hidden style="margin-top:10px">'
+      + '<textarea class="textarea" id="plgText" placeholder="/* @name ... */&#10;(function(){ ... })()"></textarea>'
+      + '<button class="btn btn--sm" id="plgTextBtn" style="margin-top:8px">解析并导入</button>'
+      + '</div>'
+      + '<div class="note" id="plgState" style="margin-top:10px"></div>'
+      + (userPlugins.length
+        ? '<div class="admin-scroll" style="margin-top:12px"><table class="admin-table"><thead><tr>'
+          + '<th>已导入</th><th>支持音源</th><th>版本</th><th>大小</th><th></th></tr></thead><tbody>'
+          + userPlugins.map(p => '<tr><td>' + esc(p.name)
+            + (p.ok ? '' : ' <span class="pill pill--bad">加载失败</span>') + '</td>'
+            + '<td>' + ((p.sources || []).map(s => '<span class="pill">' + esc(shortOf(s)) + '</span>').join('') || '—') + '</td>'
+            + '<td>' + (p.version ? '<span class="pill">v' + esc(p.version) + '</span>' : '—') + '</td>'
+            + '<td class="num">' + (p.bytes ? Math.round(p.bytes / 1024) + 'KB' : '—') + '</td>'
+            + '<td><button class="btn btn--sm btn--ghost" data-del-plugin="' + esc(p.id) + '">删除</button></td>'
+            + '</tr>').join('')
+          + '</tbody></table></div>'
+        : '<div class="note" style="margin-top:10px">还没有导入过插件。</div>')
+      + '</div>'
+
     pane.innerHTML =
       sourceToggle
+      + importBlock
       + '<div class="admin-card" id="scoreBlock">' + scoreBlockHtml() + '</div>'
       + '<div id="platHealth">' + platformTableHtml(server, null) + '</div>'
       + '<div class="admin-card"><div class="field__label" style="margin-bottom:8px">服务端内置插件（'
@@ -420,6 +460,7 @@
       + '当前出口取不到，整份脚本就没起来。它们不会被自动删除 —— 那个站点恢复后插件会自己回来。</div></div>'
 
     bindScoreBlock()
+    bindPluginImport(pane)
 
     // 体检在后台跑，回来只重绘「平台可用性」那一张表。
     // 失败也不打扰本页 —— 那块本来就是辅助信息。
@@ -916,6 +957,78 @@
     }))
     const rsBtn = host.querySelector('[data-act="rescore-now"]')
     if (rsBtn) rsBtn.addEventListener('click', rescoreNow)
+  }
+
+  /**
+   * 「导入插件」卡片的交互。
+   *
+   * 两处刻意为之：
+   *
+   * ① **失败时把原因留在页面上**（#plgState），而不只是弹个 toast 就没了。
+   *    toast 两秒后消失，而「URL 不通 / 内容不像插件脚本 / 脚本自身加载失败」
+   *    这三类原因的处置办法完全不同（换地址 / 换文件 / 换插件），用户需要边看边改。
+   *
+   * ② 成功后**重画整页**（renderSources）。不这么做的话，下面「服务端内置插件」
+   *    那张表和池子里的真实状态就对不上了 —— 刚导进来的插件在界面上看不见，
+   *    用户第一反应一定是「导入没生效」然后重复导一遍。
+   */
+  function bindPluginImport(pane) {
+    const host = pane.querySelector('#plgImport')
+    if (!host) return
+    const st = pane.querySelector('#plgState')
+
+    const submit = async (payload, btn, busyText) => {
+      const old = btn.textContent
+      btn.disabled = true
+      btn.textContent = busyText
+      if (st) { st.textContent = '正在下载并加载插件…（大脚本可能要十几秒）'; st.style.color = '' }
+      try {
+        const r = await API.importPlugin(payload)
+        const name = (r.plugin && r.plugin.name) || '插件'
+        toast((r.replaced ? '已更新：' : '已导入：') + name + (r.from ? '（经 ' + r.from + '）' : ''))
+        renderSources()
+      } catch (e) {
+        const msg = (e && e.message) || '导入失败'
+        if (st) { st.textContent = msg; st.style.color = '#d73535' }
+        btn.disabled = false
+        btn.textContent = old
+      }
+    }
+
+    const urlBtn = pane.querySelector('#plgUrlBtn')
+    if (urlBtn) urlBtn.addEventListener('click', () => {
+      const url = (pane.querySelector('#plgUrl').value || '').trim()
+      if (!url) { if (st) { st.textContent = '请先填插件 URL'; st.style.color = '#d73535' } return }
+      submit({ url }, urlBtn, '导入中…')
+    })
+
+    const pasteBtn = pane.querySelector('#plgPasteBtn')
+    if (pasteBtn) pasteBtn.addEventListener('click', () => {
+      const box = pane.querySelector('#plgPasteBox')
+      box.hidden = !box.hidden
+      pasteBtn.textContent = box.hidden ? '粘贴脚本' : '收起'
+    })
+
+    const textBtn = pane.querySelector('#plgTextBtn')
+    if (textBtn) textBtn.addEventListener('click', () => {
+      const text = (pane.querySelector('#plgText').value || '').trim()
+      if (text.length < 50) { if (st) { st.textContent = '脚本体太短了'; st.style.color = '#d73535' } return }
+      submit({ script: text }, textBtn, '导入中…')
+    })
+
+    pane.querySelectorAll('[data-del-plugin]').forEach(b => b.addEventListener('click', async () => {
+      const id = b.dataset.delPlugin
+      if (!confirm('删除这个插件？删掉后取流就不会再用它了。')) return
+      b.disabled = true
+      try {
+        await API.deletePlugin(id)
+        toast('已删除')
+        renderSources()
+      } catch (e) {
+        b.disabled = false
+        toast((e && e.message) || '删除失败')
+      }
+    }))
   }
 
   /**

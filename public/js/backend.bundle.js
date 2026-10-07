@@ -1,6 +1,6 @@
 /* 由 tools/build-app.mjs 自动生成，请勿手动修改。
- * 源摘要: b9b2bebaf9521fe9
- * 模块数: 22
+ * 源摘要: 5bf794c0997e8447
+ * 模块数: 24
  *
  * 这是给安卓壳用的后端展平版：把 src/ 的 ESM 后端打成单个 IIFE，
  * 让 WebView 用普通 <script> 就能加载（file:// 下 ESM 会被同源策略拒绝）。
@@ -36,6 +36,7 @@ const { generatePlaylist, loadAiConfig, chatOnce, AI_PROVIDERS } = __require("sr
 const { PLUGIN_SCORES } = __require("src/generated/plugin-scores.js");
 const { BUNDLED_PLUGINS } = __require("src/generated/plugins.js");
 const db = __require("src/db.js");
+const { importPlugin, removeImportedPlugin } = __require("src/server/plugin-import.mjs");
 const { generateDaily, getDaily, pickPrimaryUser, todayBJ } = __require("src/server/daily.js");
 const { HOME_KEYWORDS } = __require("src/server/keywords.js");
 const { versionInfo } = __require("src/version.js");
@@ -1206,7 +1207,11 @@ async function handleApi(request, env, url) {
         rescore: await readRescoreState(env, db),
         plugins: env.PLUGIN_POOL.summary().map(p => ({
           id: p.id, name: p.name, ok: !!p.ok, error: p.error || null,
+          // origin：builtin = 构建期内置；user = 用户在管理端/App 里导入的。
+          // 界面据此只给「用户导入」的那些显示删除按钮。
+          origin: p.origin || 'builtin',
           sources: p.sources || [], version: p.version || null,
+          bytes: p.bytes || 0,
         })),
         platforms: ALL_SOURCES.map(k => ({ key: k, name: SOURCE_META[k].name, short: SOURCE_META[k].short })),
       })
@@ -1310,6 +1315,56 @@ async function handleApi(request, env, url) {
 
     if (path === '/admin/plugins') {
       return json({ ok: true, list: env.PLUGIN_POOL.summary() })
+    }
+
+    /**
+     * 手动导入 / 删除音源插件（管理端）。
+     *
+     * 这是「用户端为什么没有导入按钮」这个问题的正面回答：服务器模式下插件跑在
+     * 服务端，用户端的插件区只写了一句「需要增删请到管理端」—— 而管理端此前根本
+     * 没有这个功能。现在补上，两处都能用：
+     *   · 管理端网页（/admin → 音源与插件）
+     *   · App 的设置页（远程模式下直接打到这几个接口，见 public/js/app.js）
+     *
+     * 只在自托管下有真实现：求值插件要 new Function，Cloudflare Worker 只允许
+     * 在启动阶段用，请求阶段一律禁止。所以那边如实回 501 并给一句可执行的替代方案。
+     */
+    if (path === '/admin/plugins/import') {
+      if (method === 'POST') {
+        if (!env.RESCORE) {
+          return bad('当前宿主不支持运行时导入插件（需要自托管/Docker 版）；'
+            + '线上版请把插件脚本写进仓库的 plugins/ 目录后重新部署', 501)
+        }
+        const body = await readJson(request)
+        const rawUrl = String(body.url || '').trim()
+        if (rawUrl) {
+          let host = ''
+          try { host = new URL(rawUrl).hostname } catch { return bad('url 不合法') }
+          if (isBlockedHost(host)) return bad('目标地址被禁止', 403)
+        }
+        try {
+          const r = await importPlugin(env.DB, { url: rawUrl, script: body.script, name: body.name })
+          return json({ ok: true, ...r, list: env.PLUGIN_POOL.summary() })
+        } catch (e) {
+          // 输入问题（URL 不通、内容不像插件、脚本加载失败）一律回 400 并带原因，
+          // 不回 500 —— 这类错误是用户能自己改的，500 只会让人以为是服务端坏了
+          if (e && e.userError) return bad(e.message, e.status || 400)
+          throw e
+        }
+      }
+      // 删掉必须是 DELETE 语义 —— 早期想到过用 POST 加 action 参数，但那样
+      // 反代和日志里「删插件」与「读列表」长得一模一样，误操作没有任何痕迹
+      if (method === 'DELETE') {
+        if (!env.RESCORE) return bad('当前宿主不支持运行时删除插件（需要自托管/Docker 版）', 501)
+        try {
+          const r = await removeImportedPlugin(env.DB, url.searchParams.get('id'))
+          return json({ ok: true, ...r, list: env.PLUGIN_POOL.summary() })
+        } catch (e) {
+          if (e && e.userError) return bad(e.message, e.status || 400)
+          throw e
+        }
+      }
+      return bad('不支持的方法', 405)
     }
 
     /**
@@ -4052,6 +4107,59 @@ async function resolveMusicUrlFast(song, quality, pluginPool, options = {}) {
   let releaseBudget = null
   const budget = new Promise((res) => { releaseBudget = res })
 
+  /**
+   * 探测结果的短收敛窗口（毫秒）。
+   *
+   * ── 为什么需要它（这是「同一首歌选不同音质长度不一样」的真凶）──────
+   * 各音源插件对不同音质返回的是**不同来源**的地址：低音质常落到第三方中转源，
+   * 那些源给的是**试听片段**（三十多秒）；Hi-Res 走正版直链，给的是完整曲目。
+   * 而原来的逻辑是「谁先探通就用谁」—— 试听片段只要先探通就会被选中，
+   * 完整版即使也探通了也不会被看一眼。用户看到的就是「换了音质时长就变了」。
+   *
+   * 修法不是「全部探完再选」——那会把起播拖到 3~5 秒，得不偿失（这条是
+   * 上面那段说明的核心诉求）。而是探通第一条之后**再多等一小会儿**，
+   * 把同期探通的候选收进来一起挑。450ms 的依据：同一批候选的 Range 探测
+   * 耗时集中在 120~240ms，多等这几百毫秒远小于「放半首就没了」的代价。
+   *
+   * 窗口内若收到明显更完整的候选就用它；只有片段可用时仍然用片段
+   * （能出声比不出声强），但在 tried 里标明是「疑似试听片段」。
+   */
+  const SETTLE_MS = 450
+  let settleTimer = null
+  let releaseSettle = null
+  const settle = new Promise((res) => { releaseSettle = res })
+  const armSettle = () => {
+    if (settleTimer) return
+    settleTimer = setTimeout(releaseSettle, SETTLE_MS)
+  }
+  const probed = []          // 探通且 ok 的候选，供 pickBest 挑
+
+  /**
+   * 探通多条时怎么选 —— 与下面的 compareCandidates **必须同档位同顺序**。
+   *
+   * 这里曾经把 official 排在第一档、weak 排到第三档，和 compareCandidates
+   * （weak → official → size）是两套顺序。后果不是「选得不最优」这么轻：
+   * WEAK_HOSTS 是**已知死接口**名单（music.163.com 的 outer/url 实测
+   * 302 → /404），一个死接口只要 HEAD 探测时侥幸回了 content-range，
+   * 就会在 pickBest 这一路被抬到健康的官方 CDN 前面，而它恰恰是放不出声的那条。
+   * 同一份文件里两个sort 顺序不一致 ⇒ 走哪条路径结果不同 ⇒ 极难复现的偶发。
+   *
+   * 档位与 compareCandidates 逐条对齐：
+   *   ① weak 最后   ② official 优先   ③ 体积大优先   ④ native 优先
+   * 两边改一处就要改另一处；test/stream-pick.mjs 有一条一致性断言盯着它们。
+   */
+  const pickBest = (list) => {
+    if (!list.length) return null
+    return list.slice().sort((a, b) => {
+      if (!!a.weak !== !!b.weak) return a.weak ? 1 : -1
+      if (!!a.official !== !!b.official) return a.official ? -1 : 1
+      const as = a.size || 0
+      const bs = b.size || 0
+      if (as !== bs) return bs - as               // 体积大 = 完整版
+      return (b.native ? 1 : 0) - (a.native ? 1 : 0)
+    })[0]
+  }
+
   const flow = Promise.all(thunks.map(async (t) => {
     let r = null
     try { r = await withDeadline(t(), deadline) } catch { return }
@@ -4079,24 +4187,43 @@ async function resolveMusicUrlFast(song, quality, pluginPool, options = {}) {
     cands.push(rec)                       // 先入列：哪怕探测没赶上预算也要能返回
     const p = await withDeadline(probeAudioBytes(url), probeDeadline)
     Object.assign(rec, p)
-    if (rec.ok && !earlyPayload) {
-      earlyPayload = rec
-      releaseBudget()                     // 探通了 → 不用再等预算
+    if (rec.ok) {
+      probed.push(rec)
+      // 探通了：不再立刻收工，而是开一个短窗口多收几条再挑（见上面 SETTLE_MS 说明）。
+      // earlyPayload 仍然记第一条 —— 窗口到点时若还没第二条，用的就是它。
+      if (!earlyPayload) earlyPayload = rec
+      armSettle()
     }
   }))
 
   const timer = setTimeout(releaseBudget, totalBudget)
   try {
-    await Promise.race([budget, flow.then(() => null, () => null)])
+    // 等三件事里先到的那个：
+    //   ① 收敛窗口到点（有候选探通了）—— 正常路径，此时手上已有一批可挑的
+    //   ② 全部 flow 跑完 —— 没有候选探通时的自然结束
+    //   ③ 总预算到点 —— 兜底，防止个别源把整条链路拖死
+    await Promise.race([budget, settle, flow.then(() => null, () => null)])
   } finally {
     clearTimeout(timer)
+    if (settleTimer) clearTimeout(settleTimer)
   }
 
   if (earlyPayload) {
+    // 在窗口内收集到的候选里挑「最完整的那条」，而不是「最先探通的那条」
+    const best = pickBest(probed) || earlyPayload
+    if (best !== earlyPayload) {
+      tried.push(`已优先选用更完整的候选（${best.from}，${best.size ? Math.round(best.size / 1024) + 'KB' : '体积未知'}）`
+        + `，放弃先探通的 ${earlyPayload.from}（${earlyPayload.size ? Math.round(earlyPayload.size / 1024) + 'KB' : '体积未知'}，疑似试听片段）`)
+    }
+    // 次要候选一并交出去：客户端那条首条失败就往下试的降级链正好用得上，
+    // 而且它们已经被探过一遍（verified），比让客户端从零开始试要快。
+    const ordered = [best, ...probed.filter(x => x !== best)]
+      .map((x) => ({ url: x.url, from: x.from, size: x.size || 0 }))
     return {
-      urls: [{ url: earlyPayload.url, from: earlyPayload.from, size: earlyPayload.size || 0 }],
-      url: earlyPayload.url,
-      from: earlyPayload.from,
+      urls: ordered,
+      url: best.url,
+      from: best.from,
+      size: best.size || 0,
       tried,
       unverified: false,
     }
@@ -6917,6 +7044,373 @@ async function listAllPlayHistory(db, limit = 200) {
   __exports.listAllPlayHistory = listAllPlayHistory;
 };
 
+__modules["src/server/plugin-import.mjs"] = function (__exports, __require) {
+/**
+ * 服务端「手动导入插件」。
+ *
+ * ── 为什么必须有这一块 ────────────────────────────────────────────
+ * 用户端的插件管理分成两种模式（见 public/js/app.js）：
+ *   · 本机模式 —— 插件跑在浏览器/App 自己身上，导入落在本机 IndexedDB；
+ *   · 服务器模式 —— 插件由服务端统一加载调度，用户端只显示一句
+ *     「需要增删插件请到管理端」。
+ * 但**管理端此前根本没有导入功能**（只有列表 / 评分 / 启停），服务端也没有导入接口 ——
+ * 等于那句话把人指到了一个不存在的地方。用户的原话就是「插件没有办法手动导入新的插件」。
+ *
+ * ── 为什么用 settings 表存，不开新表 ──────────────────────────────
+ * 三个宿主（Cloudflare D1 / 容器 SQLite / 壳内 SQLite）共用同一段建表 SQL，
+ * 加一张表就要同时改 schema + 两侧适配层 + app-bundle 的替身登记表。而插件清单
+ * 本来就是一份「全局唯一、整体读整体写」的数据，用 KV 存语义上完全吻合，改动面最小。
+ *
+ * ── 为什么只在自托管（Node）下真的能用 ───────────────────────────
+ * 求值插件要 `new Function`。Cloudflare Worker 只在**启动阶段**允许它，
+ * 请求处理阶段一律禁止（见 src/plugins.js 顶部）。所以那边如实回 501，
+ * 而不是假装支持然后 500。
+ */
+const { parseScriptMeta } = __require("src/lib/lxruntime.js");
+const { getSetting, setSetting } = __require("src/db.js");
+const { outboundFetch } = __require("src/lib/http.js");
+/*
+ * ⚠️ 这里**不能**静态 import 下面这些东西：
+ *
+ *   node:fs / node:child_process / node:url   —— 裸模块说明符，打包器直接拒绝
+ *   import.meta                              —— 展平后的非模块脚本里是**语法错误**
+ *   ../plugins.js                            —— 最隐蔽的一个：它顶层会求值全部内置插件，
+ *                                               其中 pdone-lx 求值时**直接把 JS 引擎杀死**。
+ *                                               它一进 bundle，产物加载即崩
+ *                                               （本轮实测：模块数 22 → 26，
+ *                                                新增的正是 plugins.js / lxruntime.js /
+ *                                                plugin-rank.js，进程无异常直接退出）。
+ *
+ * 这些全是**宿主相关**的能力，统一改成注入（见下面 setPluginHost）。
+ * src/ 这边只认函数签名，谁提供都行 —— 于是 WebView 打包不再被绊住。
+ */
+
+/** settings 表里的键。整体是一份 JSON 数组 */
+const USER_PLUGINS_KEY = 'user_plugins'
+
+/** 单个插件脚本的体量上限。落落雪插件实测最大约 340KB，给到 2MB 足够宽松 */
+const MAX_SCRIPT_BYTES = 2 * 1024 * 1024
+
+/** 抓脚本的超时。镜像站偶发慢，给足 20s */
+const FETCH_TIMEOUT = 20000
+
+/**
+ * GitHub 镜像降级链（与服务端无关，是为了「服务器本身也连不上 raw.githubusercontent」）。
+ * 顺序与 public/js/lxplugin.js 保持一致：ghfast.top 优先（老板指定），原地址兜底。
+ */
+function mirrorCandidates(url) {
+  const rawRe = /^https:\/\/raw\.githubusercontent\.com\//
+  const blobRe = /^https:\/\/github\.com\/([^/]+)\/([^/]+)\/blob\/([^/]+)\/(.+)$/
+  const out = []
+  let raw = ''
+  if (rawRe.test(url)) raw = url
+  else if (blobRe.test(url)) {
+    const m = blobRe.exec(url)
+    raw = `https://raw.githubusercontent.com/${m[1]}/${m[2]}/${m[3]}/${m[4]}`
+  }
+  if (raw) {
+    out.push('https://ghfast.top/' + raw)
+    out.push('https://gh-proxy.com/' + raw)
+    out.push('https://ghproxy.net/' + raw)
+    out.push(raw)
+  } else {
+    out.push(url)
+  }
+  // 原地址永远兜底（非 GitHub 地址时它本来就是唯一一项）
+  if (out[out.length - 1] !== url) out.push(url)
+  return Array.from(new Set(out))
+}
+
+/** 内容像不像一份落雪插件脚本。镜像挂了常回 200 的 HTML 错误页，不能只看状态码 */
+function looksLikePlugin(text) {
+  const s = String(text || '')
+  if (s.length < 50) return false
+  if (/^\s*<(!doctype|html)/i.test(s)) return false
+  return true
+}
+
+/** 同步短哈希（免 crypto 的异步），用来给脚本生成稳定的 id */
+function shortHash(s) {
+  let h1 = 0x811c9dc5
+  let h2 = 0x01000193
+  for (let i = 0; i < s.length; i++) {
+    const c = s.charCodeAt(i)
+    h1 = ((h1 ^ c) * 16777619) >>> 0
+    h2 = ((h2 + c) * 31) >>> 0
+  }
+  return (h1.toString(36) + h2.toString(36)).slice(0, 10)
+}
+
+/* ---------------- 子进程预筛（宿主注入） ---------------- */
+/*
+ * 预筛要 spawn 子进程，是**纯 Node 能力**，所以实现在 server/plugin-import-node.mjs，
+ * 由 server/index.mjs 启动时注入进来（见那里的 setProbeRunner）。
+ *
+ * 为什么不直接在 src/ 里 import 那个文件：src/ 会被 tools/build-app.mjs
+ * 展平成给 WebView 用单文件 IIFE。那边一旦引入 node:child_process 或 import.meta，
+ * 轻则报「不支持裸模块说明符」打断打包，重则产物一加载就炸
+ * （import.meta 在非模块脚本里是**语法错误**，不是运行时才出错）。
+ * 用注入就把这层依赖反转掉了：src/ 侧只认一个函数签名，谁提供都行。
+ */
+
+/** 当前的预筛实现。null = 当前宿主没有这项能力（Cloudflare / 壳内） */
+let probeRunner = null
+
+/**
+ * 注入预筛实现。server/index.mjs 启动时调用一次。
+ * 传 null 可显式关掉（测试里想跳过子进程时用）。
+ */
+function setProbeRunner(fn) {
+  probeRunner = typeof fn === 'function' ? fn : null
+}
+
+/* ---------------- 插件池与求值器（宿主注入） ---------------- */
+
+/**
+ * 插件池 + 求值函数，由宿主注入 —— **不能**从 ../plugins.js 静态 import。
+ *
+ * ../plugins.js 顶层有一句 `if (!globalThis.__LX_DEFER_PLUGIN_EVAL) evaluateBundledPlugins()`，
+ * 而内置插件里 pdone-lx 求值时会**直接把 JS 引擎杀死**（不抛异常、try/catch 拦不住）。
+ * 在 Node 宿主里那句被 boot-flags 挡掉了（改成启动时显式求值），所以自托管没问题；
+ * 但**打包产物**（给 WebView 的单文件 IIFE）里没有那个旗标，一旦 plugins.js 被带进去，
+ * 产物一加载就整个进程消失 —— 表现是测试「只输出两三行就退出，连报错都没有」。
+ *
+ * 本轮实测：给 plugin-import.mjs 加了 `import { pluginPool } from '../plugins.js'`，
+ * bundle 模块数从 22 涨到 26（新增 plugins.js / lxruntime.js / plugin-rank.js），
+ * test/app-bundle.mjs 立刻从 22 通过变成「加载即死」。
+ * 所以池子和求值器都走注入：api.js 那边本来就用 env.PLUGIN_POOL（见它全文），
+ * 这里保持同一个口径。
+ */
+let pluginHost = null
+
+/**
+ * 注入插件池与求值器。
+ * @param {{pool:object, evaluate:(entry:object, origin:string)=>object}} host
+ */
+function setPluginHost(host) {
+  pluginHost = host && host.pool ? host : null
+}
+
+/** 拿池子。没注入就当空池处理（WebView / Worker 走不到这些分支） */
+function hostPool() {
+  return (pluginHost && pluginHost.pool) || null
+}
+
+/** 求值一个插件。没注入求值器时抛「宿主不支持」而不是静默失败 */
+function hostEvaluate(entry, origin) {
+  if (!pluginHost || typeof pluginHost.evaluate !== 'function') {
+    throw Object.assign(new Error('当前宿主不支持运行时求值插件'), { userError: true })
+  }
+  return pluginHost.evaluate(entry, origin)
+}
+
+/**
+ * 在**子进程**里求值这个脚本，判断它会不会把 JS 引擎搞死。
+ *
+ * 判定纪律（与 tools/plugin-prescreen.mjs 一致，很重要）：
+ *   只有「进程被打死 / 超时无输出」才算危险；
+ *   「脚本未发送 inited 事件」「取不到远端配置」这类是**环境类**失败 ——
+ *   服务器出口到不了那个站点而已，换个网络可能就是好的。这类**不算危险**，
+ *   照常让主进程去求值并如实把错误显示出来。
+ *
+ * 没有注入实现时（Cloudflare / 安卓壳）如实返回 error 而不是 crash ——
+ * 上层据此「不拦」，让主进程自己去求值。把「没能力筛」当成「脚本危险」
+ * 会把正常插件也拒掉。
+ *
+ * @returns {Promise<{state:'ok'|'error'|'crash'|'timeout', error?:string|null}>}
+ */
+async function probePluginInChild(id, script) {
+  if (!probeRunner) {
+    return { state: 'error', error: '当前宿主不支持子进程预筛，已跳过这一步（由主进程直接求值）' }
+  }
+  return probeRunner(id, script)
+}
+
+/** 读回全部用户导入的插件 */
+async function readUserPlugins(db) {
+  const raw = await getSetting(db, USER_PLUGINS_KEY, '')
+  if (!raw) return []
+  try {
+    const list = JSON.parse(raw)
+    return Array.isArray(list) ? list.filter(x => x && x.id && x.script) : []
+  } catch { return [] }
+}
+
+async function writeUserPlugins(db, list) {
+  await setSetting(db, USER_PLUGINS_KEY, JSON.stringify(list))
+}
+
+/** 抓一份插件脚本，逐个镜像降级。返回 { script, from } */
+async function fetchPluginScript(url) {
+  const errors = []
+  for (const u of mirrorCandidates(url)) {
+    let host = u
+    try { host = new URL(u).host } catch { /* 保持原样 */ }
+    const controller = new AbortController()
+    const timer = setTimeout(() => controller.abort(), FETCH_TIMEOUT)
+    try {
+      const res = await outboundFetch(u, {
+        headers: { 'User-Agent': 'Mozilla/5.0 (lxmusic plugin importer)' },
+        redirect: 'follow',
+        signal: controller.signal,
+      })
+      const text = await res.text()
+      if (!res.ok) { errors.push(host + ': HTTP ' + res.status); continue }
+      if (!looksLikePlugin(text)) { errors.push(host + ': 内容不像插件脚本'); continue }
+      return { script: text, from: host }
+    } catch (e) {
+      errors.push(host + ': ' + String((e && e.message) || e).slice(0, 60))
+    } finally {
+      clearTimeout(timer)
+    }
+  }
+  throw Object.assign(new Error('下载失败（已试 ' + mirrorCandidates(url).length + ' 个地址）— ' + errors.join('；')), { userError: true })
+}
+
+/**
+ * 导入一个插件：接受 URL 或脚本正文。
+ *
+ * 落库策略是「**先在子进程摸底 → 再在主进程求值 → 成功才落库**」。
+ * 这三个顺序都有理由：
+ *   · 不先摸底 —— 一个会搞死引擎的脚本（实测 pdone/lx 就是）能把整台服务器打死；
+ *   · 不先求值就落库 —— 会留下一条让容器**下次启动**起不来的记录；
+ *   · 落库放在最后 —— 上面两步任何一步失败，都不会在库里留下半个残骸。
+ * 宁可导入失败报错，也不留一个「重启就挂」的定时炸弹。
+ *
+ * @returns {Promise<{ok:true, plugin:object, replaced:boolean, from?:string}>}
+ */
+async function importPlugin(db, { url, script, name } = {}) {
+  let text = String(script || '')
+  let from = null
+  if (!text) {
+    const raw = String(url || '').trim()
+    if (!raw) throw Object.assign(new Error('请填写插件 URL 或粘贴脚本'), { userError: true })
+    if (!/^https?:\/\//i.test(raw)) throw Object.assign(new Error('URL 必须以 http(s):// 开头'), { userError: true })
+    const got = await fetchPluginScript(raw)
+    text = got.script
+    from = got.from
+  }
+  if (text.length > MAX_SCRIPT_BYTES) {
+    throw Object.assign(new Error('脚本过大（' + Math.round(text.length / 1024) + 'KB，上限 ' + (MAX_SCRIPT_BYTES / 1024 / 1024) + 'MB）'), { userError: true })
+  }
+  if (!looksLikePlugin(text)) throw Object.assign(new Error('内容不像插件脚本'), { userError: true })
+
+  const meta = parseScriptMeta(text)
+  const id = 'user_' + shortHash(text)
+  const record = {
+    id,
+    name: String(name || meta.name || '未命名插件').slice(0, 60),
+    version: meta.version || '',
+    author: meta.author || '',
+    url: String(url || '').trim(),
+    from: from || null,
+    script: text,
+    bytes: text.length,
+    createdAt: Date.now(),
+  }
+
+  // ① 先在子进程里摸一遍 —— 确认这个脚本不会把 JS 引擎搞死。
+  //    主进程直接求值一个坏脚本 = 整台服务器的容器被打死，这一步省不得。
+  const probe = await probePluginInChild(id, text)
+  if (probe.state === 'crash' || probe.state === 'timeout') {
+    throw Object.assign(new Error(
+      '这个插件脚本不能加载：' + (probe.error || '求值异常')
+      + '。为了不让它把整个服务弄挂，已经拒绝导入。'
+    ), { userError: true })
+  }
+
+  // ② 摸底通过 → 在主进程里正式装载。求值失败不留半个残骸在池子里。
+  //    注意「先求值成功、再落库」的顺序：反过来会留下一条让容器下次起不来的记录。
+  const r = hostEvaluate({ id, script: text, url: record.url, name: record.name }, 'user')
+  if (!r.ok) {
+    const p = hostPool()
+    if (p) p.remove(id)
+    throw Object.assign(new Error('插件未能就绪：' + (r.error || '未知原因')
+      + '（脚本本身加载了，但初始化没成功 —— 常见原因是它要拉一份远端配置而服务器出口取不到）'), { userError: true })
+  }
+
+  const list = await readUserPlugins(db)
+  const at = list.findIndex(x => x.id === id)
+  const replaced = at >= 0
+  if (replaced) list[at] = record
+  else list.push(record)
+  await writeUserPlugins(db, list)
+
+  return { ok: true, plugin: { id, name: record.name, version: record.version, bytes: record.bytes, from }, replaced, from }
+}
+
+/**
+ * 删除一个「用户导入」的插件。
+ * 内置插件不给删 —— 它们是构建产物，删了下次构建又回来，只会造成「删了又出现」的困惑；
+ * 想让它别上岗应该用「停用」（走 plugin-prefs）。
+ */
+async function removeImportedPlugin(db, id) {
+  const key = String(id || '')
+  if (!key) throw Object.assign(new Error('缺少 id'), { userError: true })
+  if (!key.startsWith('user_')) {
+    throw Object.assign(new Error('内置插件不能删除，请改用「停用」'), { userError: true })
+  }
+  const list = await readUserPlugins(db)
+  const next = list.filter(x => x.id !== key)
+  if (next.length === list.length) throw Object.assign(new Error('没有这个插件'), { userError: true, status: 404 })
+  await writeUserPlugins(db, next)
+  const p0 = hostPool()
+  if (p0) p0.remove(key)
+  return { ok: true, removed: key, left: next.length }
+}
+
+/**
+ * 启动时把用户导入的插件装回池子。
+ *
+ * `skip` 里的是「上一次启动求值它时把进程搞死了」的 id（见 server/index.mjs 的
+ * pending 标记自愈）—— 这类插件不装进池子，但要在池子里留一条说明，
+ * 否则管理端的列表里它凭空消失，用户只会以为「导入的记录丢了」。
+ */
+async function loadUserPlugins(db, skip = new Set()) {
+  let list = []
+  try { list = await readUserPlugins(db) } catch { return { total: 0, loaded: 0 } }
+  if (!list.length) return { total: 0, loaded: 0 }
+
+  const say = (s) => process.stdout.write(s + '\n')
+  const pool = hostPool()
+  if (!pool) return { total: 0, loaded: 0 }
+  let loaded = 0
+  for (const rec of list) {
+    if (skip.has(rec.id)) {
+      pool.add({
+        ok: false, id: rec.id, url: rec.url || '', origin: 'user',
+        error: '已跳过：该脚本求值会杀死 JS 引擎（删掉它或改用别的插件）',
+        meta: { name: rec.name, version: rec.version, author: rec.author },
+      })
+      continue
+    }
+    let r
+    try { r = hostEvaluate({ id: rec.id, script: rec.script, url: rec.url, name: rec.name }, 'user') } catch (e) {
+      r = { ok: false, error: String((e && e.message) || e) }
+      pool.add({
+        ok: false, id: rec.id, url: rec.url || '', origin: 'user',
+        error: r.error, meta: { name: rec.name, version: rec.version, author: rec.author },
+      })
+    }
+    if (r.ok) loaded++
+  }
+  say(`[server] 用户导入插件 ${loaded}/${list.length} 可用`)
+  return { total: list.length, loaded }
+}
+
+  /* 导出挂载 */
+  __exports.USER_PLUGINS_KEY = USER_PLUGINS_KEY;
+  __exports.mirrorCandidates = mirrorCandidates;
+  __exports.setProbeRunner = setProbeRunner;
+  __exports.setPluginHost = setPluginHost;
+  __exports.probePluginInChild = probePluginInChild;
+  __exports.readUserPlugins = readUserPlugins;
+  __exports.fetchPluginScript = fetchPluginScript;
+  __exports.importPlugin = importPlugin;
+  __exports.removeImportedPlugin = removeImportedPlugin;
+  __exports.loadUserPlugins = loadUserPlugins;
+};
+
 __modules["src/server/daily.js"] = function (__exports, __require) {
 /**
  * 每日推荐（AI 生成版）
@@ -7177,10 +7671,10 @@ __modules["src/version.js"] = function (__exports, __require) {
  */
 
 /** 产品版本（对外展示用）。每发一版升 0.1。 */
-const APP_VERSION = 'V1.1'
+const APP_VERSION = 'V1.2'
 
 /** Android versionCode：整数、单调递增、跨次发布不可重复。每发一版 +1。 */
-const APP_VERSION_CODE = 101
+const APP_VERSION_CODE = 102
 
 /** 人类可读的完整标识，日志/关于页用。 */
 const APP_ID = 'lxmusic'
@@ -9115,6 +9609,498 @@ async function getQishuiPlaylist(playlistId) {
   __exports.douyinCover = douyinCover;
   __exports.parseQishuiPlaylistPage = parseQishuiPlaylistPage;
   __exports.getQishuiPlaylist = getQishuiPlaylist;
+};
+
+__modules["src/lib/lxruntime.js"] = function (__exports, __require) {
+/**
+ * 落雪音乐（LX Music）自定义源插件运行时
+ *
+ * 关键约束（实测）：
+ *   Cloudflare Workers 在「请求处理阶段」禁止 eval / new Function，
+ *   但自 compatibility_date >= 2025-06-01 起，`allow_eval_during_startup` 默认开启，
+ *   「启动阶段」（模块顶层）允许动态代码生成。
+ *   => 插件脚本必须在模块顶层求值注册；请求阶段只能调用已注册的 handler。
+ *
+ * 同时：启动阶段禁止任何 I/O（fetch / setTimeout / 随机数），
+ *   所以 lx.request 只定义闭包、不在启动阶段调用；插件脚本自身也不能在顶层发请求。
+ */
+const { md5, aesEncryptRaw, aesDecryptRaw, rsaEncryptRaw, randomBytes, bytesToBase64, base64ToBytes, hexToBytes, utf8Encode, utf8Decode } = __require("src/lib/crypto.js");
+const { createBufferShim, bufToString, inflateRaw, deflateRaw } = __require("src/lib/util.js");
+const { outboundFetch } = __require("src/lib/http.js");
+
+const LX_API_VERSION = '2.0.0'
+
+const EVENT_NAMES = {
+  request: 'request',
+  inited: 'inited',
+  updateAlert: 'updateAlert',
+}
+
+/**
+ * 构造一个 lx 宿主对象。
+ * @param {(url:string, options:object, cb:Function)=>Function} httpImpl 实际发起 HTTP 的实现
+ */
+function createLxHost(httpImpl, scriptInfo) {
+  const handlers = new Map()
+  const state = { inited: null, updateAlert: null, logs: [] }
+
+  const ByteBuf = createBufferShim()
+
+  const lx = {
+    version: LX_API_VERSION,
+    env: 'desktop',
+    currentScriptInfo: scriptInfo || null,
+    EVENT_NAMES,
+
+    on(eventName, handler) {
+      if (typeof handler !== 'function') return
+      handlers.set(eventName, handler)
+    },
+
+    send(eventName, data) {
+      if (eventName === EVENT_NAMES.inited) {
+        state.inited = data || null
+      } else if (eventName === EVENT_NAMES.updateAlert) {
+        if (!state.updateAlert) state.updateAlert = data || null
+      }
+    },
+
+    request(url, options, callback) {
+      return httpImpl(url, options || {}, callback)
+    },
+
+    utils: {
+      buffer: {
+        from: (value, encoding) => ByteBuf.from(value, encoding),
+        bufToString: (buf, format) => bufToString(buf, format),
+      },
+      crypto: {
+        md5: str => md5(typeof str === 'string' ? str : bufToString(str)),
+        randomBytes: size => ByteBuf.from(randomBytes(Number(size) || 16)),
+        aesEncrypt(buffer, mode, key, iv) {
+          const data = toBytes(buffer)
+          const k = toBytes(key)
+          const normalizedMode = normalizeMode(mode)
+          const out = aesEncryptRaw(data, k, normalizedMode, iv ? toBytes(iv) : undefined)
+          return ByteBuf.from(out)
+        },
+        aesDecrypt(buffer, mode, key, iv) {
+          const data = toBytes(buffer)
+          const k = toBytes(key)
+          const normalizedMode = normalizeMode(mode)
+          const out = aesDecryptRaw(data, k, normalizedMode, iv ? toBytes(iv) : undefined)
+          return ByteBuf.from(out)
+        },
+        rsaEncrypt(buffer, key) {
+          const out = rsaEncryptRaw(toBytes(buffer), bufToString(key, 'utf8'))
+          return ByteBuf.from(out)
+        },
+      },
+      zlib: {
+        async inflate(buffer) {
+          const out = await inflateRaw(toBytes(buffer))
+          return ByteBuf.from(out)
+        },
+        async deflate(buffer) {
+          const out = await deflateRaw(toBytes(buffer))
+          return ByteBuf.from(out)
+        },
+      },
+    },
+  }
+
+  return { lx, handlers, state }
+}
+
+function toBytes(v) {
+  if (v == null) return new Uint8Array(0)
+  if (v instanceof Uint8Array) return v
+  if (v instanceof ArrayBuffer) return new Uint8Array(v)
+  if (ArrayBuffer.isView(v)) return new Uint8Array(v.buffer, v.byteOffset, v.byteLength)
+  if (typeof v === 'string') return utf8Encode(v)
+  if (Array.isArray(v)) return Uint8Array.from(v)
+  return utf8Encode(String(v))
+}
+
+/** 兼容 crypto-js / Node / 字符串三种 mode 写法 */
+function normalizeMode(mode) {
+  const s = String(mode || 'cbc').toLowerCase()
+  if (s.includes('ecb')) return 'ecb'
+  return 'cbc'
+}
+
+/** 从脚本头部注释里解析 @name / @version / @author / @description / @homepage */
+function parseScriptMeta(script) {
+  const head = String(script).slice(0, 4000)
+  const block = head.match(/\/\*\*([\s\S]*?)\*\//) || head.match(/\/\*([\s\S]*?)\*\//)
+  const meta = {}
+  const region = block ? block[1] : head
+  for (const line of region.split('\n')) {
+    const m = line.match(/@(\w+)\s+(.*)/)
+    if (!m) continue
+    const key = m[1].toLowerCase()
+    if (['name', 'version', 'author', 'description', 'homepage', 'repository'].includes(key)) {
+      meta[key] = m[2].trim().replace(/\*\/\s*$/, '').trim()
+    }
+  }
+  return {
+    name: meta.name || '未命名音源',
+    version: meta.version || '1.0.0',
+    author: meta.author || '未知',
+    description: meta.description || '',
+    homepage: meta.homepage || meta.repository || '',
+  }
+}
+
+/**
+ * 请求阶段使用的 HTTP 实现，语义对齐 LX 的 lx.request：
+ *   lx.request(url, options, (err, resp, body) => {}) => cancelHttp
+ * options 支持 method / headers / body / form / formData / timeout
+ */
+function makeHttpImpl() {
+  return function httpImpl(url, options, callback) {
+    const controller = new AbortController()
+    const timeout = Number(options.timeout) > 0 ? Number(options.timeout) : 15000
+    const timer = setTimeout(() => controller.abort(), timeout)
+
+    const finish = (err, resp, body) => {
+      clearTimeout(timer)
+      try { callback(err, resp, body) } catch (e) { console.warn('[lx] request 回调异常:', e && e.message) }
+    }
+
+    ;(async () => {
+      try {
+        const method = String(options.method || 'get').toUpperCase()
+        const headers = { ...(options.headers || {}) }
+        let payload
+        if (options.form) {
+          payload = new URLSearchParams(options.form).toString()
+          if (!hasHeader(headers, 'content-type')) headers['Content-Type'] = 'application/x-www-form-urlencoded'
+        } else if (options.formData) {
+          const fd = new FormData()
+          for (const [k, v] of Object.entries(options.formData)) fd.append(k, v)
+          payload = fd
+        } else if (options.body !== undefined) {
+          payload = typeof options.body === 'string' ? options.body : JSON.stringify(options.body)
+          if (!hasHeader(headers, 'content-type')) headers['Content-Type'] = 'application/json'
+        }
+
+        const res = await outboundFetch(url, { method, headers, body: payload, signal: controller.signal, redirect: 'follow' })
+        const text = await res.text()
+        let parsed = text
+        if (options.json !== false) {
+          try { parsed = JSON.parse(text) } catch { /* 保留原文 */ }
+        }
+        const resp = {
+          statusCode: res.status,
+          status: res.status,
+          headers: Object.fromEntries(res.headers),
+          raw: text,
+          body: parsed,
+        }
+        finish(null, resp, resp.body)
+      } catch (e) {
+        finish(e, null, null)
+      }
+    })()
+
+    return () => {
+      clearTimeout(timer)
+      try { controller.abort() } catch { /* ignore */ }
+    }
+  }
+}
+
+function hasHeader(headers, name) {
+  const lower = name.toLowerCase()
+  return Object.keys(headers).some(k => k.toLowerCase() === lower)
+}
+
+/**
+ * 在启动阶段求值一个插件脚本。必须只在模块顶层调用。
+ * @returns {{ok:boolean, meta:object, sources:object, error?:string, host:object}}
+ */
+function evaluatePluginAtStartup(id, script, scriptInfo) {
+  const host = createLxHost(makeHttpImpl(), scriptInfo)
+  const previous = globalThis.lx
+  globalThis.lx = host.lx
+  try {
+    // eslint-disable-next-line no-new-func
+    const fn = new Function(String(script))
+    fn.call(globalThis)
+    const inited = host.state.inited
+    if (!inited || !inited.sources || typeof inited.sources !== 'object') {
+      throw new Error('脚本未发送 inited 事件或未声明 sources')
+    }
+    return {
+      ok: true,
+      id,
+      meta: parseScriptMeta(script),
+      sources: inited.sources,
+      updateAlert: host.state.updateAlert,
+      host,
+    }
+  } catch (e) {
+    return {
+      ok: false,
+      id,
+      meta: parseScriptMeta(script),
+      error: String((e && e.message) || e),
+      host,
+    }
+  } finally {
+    if (previous === undefined) delete globalThis.lx
+    else globalThis.lx = previous
+  }
+}
+
+/**
+ * 插件池：管理已注册插件，按优先级为 (source, action) 选择可用插件
+ */
+class PluginPool {
+  constructor() {
+    this.plugins = []
+    this.bySource = new Map() // source -> plugin[]
+    this.rank = null          // { source: [pluginId, ...] }，实测得分降序
+    this._rankIndex = null
+    this.userPrefs = null     // 见 setUserPrefs()
+    this._prefIndex = null
+  }
+
+  /**
+   * 装载「插件实测得分排序表」，让候选顺序由实测结果决定，而不是写入 manifest 的顺序。
+   *
+   * 为什么需要：取流时只会试候选列表的前 N 个（resolveMusicUrlFast 的 maxTries、
+   * openAudioStream 的 maxCandidates）。池子里插件一多，排在后面的根本轮不到，
+   * 而「谁排前面」原本只取决于构建时的书写顺序 —— 等于随机。
+   *
+   * 排序是**按平台各自排**的：同一个插件可能在网易云上很稳、在咪咕上一塌糊涂，
+   * 一个全局名次表达不了这种差异。
+   *
+   * 未上榜（新加的、没测过的）排在已上榜之后；同档内保持原注册顺序（稳定排序）。
+   * @param {{[source:string]: string[]}} rankBySource
+   */
+  setRank(rankBySource) {
+    this.rank = (rankBySource && typeof rankBySource === 'object') ? rankBySource : null
+    this._rankIndex = null
+    if (!this.rank) return 0
+    this._rankIndex = new Map()
+    for (const [src, ids] of Object.entries(this.rank)) {
+      if (!Array.isArray(ids)) continue
+      this._rankIndex.set(src, new Map(ids.map((id, i) => [id, i])))
+    }
+    return this._rankIndex.size
+  }
+
+  /**
+   * 装载「用户调度偏好」—— 管理员在「音源与插件」页手动设的那份。
+   *
+   * 两种模式：
+   *   auto   —— 吃实测排序表（setRank 那份），系统自己挑最优的排在前面；
+   *   manual —— 吃用户给每个平台排的顺序；用户没排过的平台仍回落实测排序。
+   *
+   * `disabled` 是全局停用清单，两种模式下都生效（用户说不用就不用）。
+   *
+   * 这里是 isolate 级单例状态，但设置本来就是全局唯一的一份（不是按用户存的），
+   * 所以并发请求之间不存在「串用户」的问题 —— 最坏情况是某个请求读到上一版
+   * 偏好，而偏好本身是幂等的（顺序变一变，取流结果不会错，只是可能多试一个插件）。
+   *
+   * @param {{mode?:'auto'|'manual', order?:{[source:string]:string[]}, disabled?:string[]}} prefs
+   * @returns {{mode:string, disabled:number, manualSources:number}}
+   */
+  setUserPrefs(prefs) {
+    this.userPrefs = (prefs && typeof prefs === 'object') ? prefs : null
+    this._prefIndex = null
+    if (!this.userPrefs) return { mode: 'auto', disabled: 0, manualSources: 0 }
+    const mode = this.userPrefs.mode === 'manual' ? 'manual' : 'auto'
+    const disabled = new Set(Array.isArray(this.userPrefs.disabled) ? this.userPrefs.disabled : [])
+    const order = new Map()
+    const rawOrder = this.userPrefs.order
+    if (rawOrder && typeof rawOrder === 'object') {
+      for (const [src, ids] of Object.entries(rawOrder)) {
+        if (Array.isArray(ids) && ids.length) order.set(src, new Map(ids.map((id, i) => [id, i])))
+      }
+    }
+    this._prefIndex = { disabled, order }
+    return { mode, disabled: disabled.size, manualSources: order.size }
+  }
+
+  /**
+   * 取某平台所有可用的 musicUrl 插件。
+   *
+   * 排序分两层，缺一不可：
+   *   ① 人工模式下用户排过的插件按他的顺序；
+   *   ② 剩下的按**实测评分**垫后 —— 注意不是按注册顺序。
+   *      这里踩过坑：一开始人工模式未排到的插件落回注册顺序，于是用户一切到
+   *      人工模式，他没动过的十几个插件顺序整体重排一遍（wsl-quandou 从第 3
+   *      掉到第 17），看起来像设置被重置了。
+   *
+   * 两种模式都先把「用户停用」的插件剔掉。
+   */
+  musicUrlPlugins(source, action = 'musicUrl') {
+    let list = (this.bySource.get(source) || []).filter(p => this._supportsAction(p, source, action))
+    const disabled = this._prefIndex && this._prefIndex.disabled
+    if (disabled && disabled.size) list = list.filter(p => !disabled.has(p.id))
+    if (list.length < 2) return list
+
+    const MAX = Number.MAX_SAFE_INTEGER
+    const rankIdx = (this._rankIndex && this._rankIndex.get(source)) || null
+    const manual = (this._prefIndex && this.userPrefs && this.userPrefs.mode === 'manual')
+      ? this._prefIndex.order.get(source) || null
+      : null
+    if (!rankIdx && !manual) return list // 没有任何排序依据，保持注册顺序
+
+    return list
+      .map((p, i) => ({
+        p, i,
+        m: manual && manual.has(p.id) ? manual.get(p.id) : MAX,
+        r: rankIdx && rankIdx.has(p.id) ? rankIdx.get(p.id) : MAX,
+      }))
+      .sort((a, b) => (a.m - b.m) || (a.r - b.r) || (a.i - b.i))
+      .map(x => x.p)
+  }
+
+  add(entry) {
+    /**
+     * `origin` 区分「构建期内置」与「用户自己导入的」（见 src/server/plugin-import.mjs）。
+     * 用途只有一个但很重要：管理端要能只对用户导入的那些显示「删除」——
+     * 内置插件是构建产物，删了下次构建又回来，只会造成「删了又出现」的困惑。
+     */
+    const origin = entry.origin === 'user' ? 'user' : 'builtin'
+
+    /**
+     * 同 id 先摘掉旧的，再登记新的 —— 否则「重复导入同一份脚本」会在池子里
+     * 留下两条同 id 记录（落库那边按 id 去重了，池子这边没有）。
+     * 后果很难看：管理端列出两行一模一样的插件；`remove()` 只摘得掉第一条，
+     * 删完它仍留在取流候选里（实测就是这个现象）。
+     * 内置插件逐 id 各登记一次，这条对它们没有影响。
+     */
+    if (this.plugins.some(p => p.id === entry.id)) this.remove(entry.id)
+
+    if (!entry.ok) {
+      this.plugins.push({ ...entry, origin, enabled: false, sources: entry.sources || {} })
+      return
+    }
+    const record = { ...entry, origin, enabled: true }
+    this.plugins.push(record)
+    for (const sourceKey of Object.keys(entry.sources)) {
+      if (!this.bySource.has(sourceKey)) this.bySource.set(sourceKey, [])
+      this.bySource.get(sourceKey).push(record)
+    }
+  }
+
+  /**
+   * 从池子里摘掉一个插件。
+   *
+   * 两个索引都要清 —— 只从 `plugins` 里 splice、忘了 `bySource` 的话，取流时
+   * 仍会把这个已经删掉的插件当候选去调（`invokePlugin` 拿到一个没有 host 的残骸），
+   * 表现是「删了插件，点歌却报一个不存在的插件名」。
+   */
+  remove(id) {
+    const i = this.plugins.findIndex(p => p.id === id)
+    if (i < 0) return false
+    const [rec] = this.plugins.splice(i, 1)
+    for (const sourceKey of Object.keys(rec.sources || {})) {
+      const arr = this.bySource.get(sourceKey)
+      if (!arr) continue
+      const j = arr.indexOf(rec)
+      if (j >= 0) arr.splice(j, 1)
+      if (!arr.length) this.bySource.delete(sourceKey)
+    }
+    return true
+  }
+
+  /** 某平台是否有插件支持 */
+  supports(source, action = 'musicUrl') {
+    const list = this.bySource.get(source) || []
+    return list.some(p => this._supportsAction(p, source, action))
+  }
+
+  _supportsAction(plugin, source, action) {
+    const info = plugin.sources && plugin.sources[source]
+    if (!info) return false
+    const actions = info.actions
+    if (!Array.isArray(actions)) return action === 'musicUrl'
+    return actions.includes(action)
+  }
+
+  /** 调用单个插件；返回 {ok, value, plugin} 或 {ok:false, error, plugin} */
+  async invokePlugin(plugin, source, action, info, { timeout = 20000 } = {}) {
+    const name = (plugin.meta && plugin.meta.name) || '未命名音源'
+    const handler = plugin.host.handlers.get(EVENT_NAMES.request)
+    if (!handler) return { ok: false, plugin: name, error: '未注册 request 处理器' }
+    try {
+      const result = await withTimeout(
+        Promise.resolve(handler({ source, action, info })),
+        timeout,
+        `${name} 调用超时`
+      )
+      if (action === 'musicUrl') {
+        if (typeof result === 'string' && /^https?:\/\//.test(result)) return { ok: true, plugin: name, value: result }
+      } else if (result) {
+        return { ok: true, plugin: name, value: result }
+      }
+      return { ok: false, plugin: name, error: '返回空结果' }
+    } catch (e) {
+      return { ok: false, plugin: name, error: (e && e.message) || String(e) }
+    }
+  }
+
+  /** 依次尝试各插件，返回第一个成功的结果 */
+  async invoke(source, action, info, opts = {}) {
+    const candidates = this.musicUrlPlugins(source, action)
+    const errors = []
+    for (const plugin of candidates) {
+      const r = await this.invokePlugin(plugin, source, action, info, opts)
+      if (r.ok) return { value: r.value, plugin: r.plugin }
+      errors.push(`${r.plugin}: ${r.error}`)
+    }
+    return { value: null, errors }
+  }
+
+  /** 支持的各平台音质定义，供前端选择 */
+  qualityMap(source) {
+    const list = this.bySource.get(source) || []
+    const qualities = new Set()
+    for (const p of list) {
+      const info = p.sources && p.sources[source]
+      if (info && Array.isArray(info.qualitys)) info.qualitys.forEach(q => qualities.add(q))
+    }
+    return Array.from(qualities)
+  }
+
+  summary() {
+    return this.plugins.map(p => ({
+      id: p.id,
+      ok: !!p.ok,
+      origin: p.origin || 'builtin',
+      error: p.error || null,
+      bytes: p.bytes || 0,
+      name: p.meta.name,
+      version: p.meta.version,
+      author: p.meta.author,
+      description: p.meta.description,
+      homepage: p.meta.homepage,
+      sources: Object.keys(p.sources || {}),
+      updateAlert: p.updateAlert || null,
+    }))
+  }
+}
+
+function withTimeout(promise, ms, message) {
+  return new Promise((resolve, reject) => {
+    const timer = setTimeout(() => reject(new Error(message)), ms)
+    promise.then(
+      v => { clearTimeout(timer); resolve(v) },
+      e => { clearTimeout(timer); reject(e) }
+    )
+  })
+}
+
+  /* 导出挂载 */
+  __exports.parseScriptMeta = parseScriptMeta;
+  __exports.evaluatePluginAtStartup = evaluatePluginAtStartup;
+  __exports.PluginPool = PluginPool;
 };
 
 var __api = __require("src/server/api.js");

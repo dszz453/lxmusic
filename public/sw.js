@@ -7,7 +7,7 @@
  *
  * 每次发版记得把 VERSION 往上抬一格，否则用户手机上会一直吃旧缓存。
  */
-const VERSION = 'v23'
+const VERSION = 'v24'
 const STATIC_CACHE = 'lxmusic-static-' + VERSION
 const SHELL_CACHE = 'lxmusic-shell-' + VERSION
 
@@ -26,6 +26,8 @@ const PRECACHE = [
   // 不预缓存的话离线时 Worker 起不来，插件取流整级失效。
   '/js/lib/crypto.js',
   '/js/lib/util.js',
+  '/js/tone.js',
+  '/js/audiocache.js',
   '/js/app.js',
   '/icons/icon-192.png',
   '/icons/icon-512.png',

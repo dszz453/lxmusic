@@ -472,6 +472,37 @@ public class MainActivity extends Activity {
         public void askNotificationPermission() {
             askNotifications(true);
         }
+
+        /**
+         * 导出一首歌到系统「下载」目录。
+         *
+         * 为什么不用网页的 `a[download]`：WebView 里它**在部分机型上只是静默失败**
+         * （尤其页面是从本地拦截层喂出来的非真实 https 响应时），用户看不到任何反馈 ——
+         * 这正是「点了下载没反应」这类问题的标准成因。所以壳里走原生写文件，
+         * 页面侧拿返回值判定成功与否，失败时再回退到网页那套。
+         *
+         * 参数用 base64 而不是字节数组：@JavascriptInterface 的可跨语言边界类型里
+         * 没有 byte[]，字符串是唯一稳的通道（页面侧分块编码，见 audiocache.js）。
+         *
+         * @param filename 目标文件名（含扩展名）
+         * @param b64      文件内容的 base64
+         * @return 成功返回绝对路径，失败返回空串（页面据此回退）
+         */
+        @JavascriptInterface
+        public String saveAudio(final String filename, final String b64) {
+            try {
+                return MediaBridge.saveToDownloads(MainActivity.this, filename, b64);
+            } catch (Throwable t) {
+                Log.w(TAG, "保存文件失败: " + t.getMessage());
+                return "";
+            }
+        }
+
+        /** 保存能力的探测：页面据此决定要不要优先走原生 */
+        @JavascriptInterface
+        public boolean canSaveAudio() {
+            return Build.VERSION.SDK_INT >= 29 || MediaBridge.hasLegacyStorage();
+        }
     }
 
     /* ---------------- 通知权限 ---------------- */

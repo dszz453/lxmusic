@@ -23,11 +23,16 @@ import path from 'node:path'
 import http from 'node:http'
 import { spawn } from 'node:child_process'
 import { fileURLToPath } from 'node:url'
+import os from 'node:os'
 
 const __dirname = path.dirname(fileURLToPath(import.meta.url))
 const ROOT = path.resolve(__dirname, '..')
 const PUBLIC = path.join(ROOT, 'public')
-const TMP = path.join(ROOT, 'probe', 'tmp')
+/**
+ * 临时目录放**系统临时区**，不要放项目里 —— 理由同 test/audiocache.mjs：
+ * 收尾时删项目内的 Chrome profile 会撞上「批量删除保护」，测试直接跑不起来。
+ */
+const TMP = path.join(os.tmpdir(), 'lxmusic-app-native')
 
 const CHROME = [
   process.env.CHROME_PATH,

@@ -347,16 +347,53 @@ export class PluginPool {
   }
 
   add(entry) {
+    /**
+     * `origin` 区分「构建期内置」与「用户自己导入的」（见 src/server/plugin-import.mjs）。
+     * 用途只有一个但很重要：管理端要能只对用户导入的那些显示「删除」——
+     * 内置插件是构建产物，删了下次构建又回来，只会造成「删了又出现」的困惑。
+     */
+    const origin = entry.origin === 'user' ? 'user' : 'builtin'
+
+    /**
+     * 同 id 先摘掉旧的，再登记新的 —— 否则「重复导入同一份脚本」会在池子里
+     * 留下两条同 id 记录（落库那边按 id 去重了，池子这边没有）。
+     * 后果很难看：管理端列出两行一模一样的插件；`remove()` 只摘得掉第一条，
+     * 删完它仍留在取流候选里（实测就是这个现象）。
+     * 内置插件逐 id 各登记一次，这条对它们没有影响。
+     */
+    if (this.plugins.some(p => p.id === entry.id)) this.remove(entry.id)
+
     if (!entry.ok) {
-      this.plugins.push({ ...entry, enabled: false, sources: entry.sources || {} })
+      this.plugins.push({ ...entry, origin, enabled: false, sources: entry.sources || {} })
       return
     }
-    const record = { ...entry, enabled: true }
+    const record = { ...entry, origin, enabled: true }
     this.plugins.push(record)
     for (const sourceKey of Object.keys(entry.sources)) {
       if (!this.bySource.has(sourceKey)) this.bySource.set(sourceKey, [])
       this.bySource.get(sourceKey).push(record)
     }
+  }
+
+  /**
+   * 从池子里摘掉一个插件。
+   *
+   * 两个索引都要清 —— 只从 `plugins` 里 splice、忘了 `bySource` 的话，取流时
+   * 仍会把这个已经删掉的插件当候选去调（`invokePlugin` 拿到一个没有 host 的残骸），
+   * 表现是「删了插件，点歌却报一个不存在的插件名」。
+   */
+  remove(id) {
+    const i = this.plugins.findIndex(p => p.id === id)
+    if (i < 0) return false
+    const [rec] = this.plugins.splice(i, 1)
+    for (const sourceKey of Object.keys(rec.sources || {})) {
+      const arr = this.bySource.get(sourceKey)
+      if (!arr) continue
+      const j = arr.indexOf(rec)
+      if (j >= 0) arr.splice(j, 1)
+      if (!arr.length) this.bySource.delete(sourceKey)
+    }
+    return true
   }
 
   /** 某平台是否有插件支持 */
@@ -422,7 +459,9 @@ export class PluginPool {
     return this.plugins.map(p => ({
       id: p.id,
       ok: !!p.ok,
+      origin: p.origin || 'builtin',
       error: p.error || null,
+      bytes: p.bytes || 0,
       name: p.meta.name,
       version: p.meta.version,
       author: p.meta.author,

@@ -26,11 +26,16 @@ import path from 'node:path'
 import http from 'node:http'
 import { spawn } from 'node:child_process'
 import { fileURLToPath } from 'node:url'
+import os from 'node:os'
 
 const __dirname = path.dirname(fileURLToPath(import.meta.url))
 const ROOT = path.resolve(__dirname, '..')
 const PUBLIC = path.join(ROOT, 'public')
-const TMP = path.join(ROOT, 'probe', 'tmp')
+/**
+ * 临时目录放**系统临时区**，不要放项目里 —— 理由同 test/audiocache.mjs：
+ * 收尾时删项目内的 Chrome profile 会撞上「批量删除保护」，测试直接跑不起来。
+ */
+const TMP = path.join(os.tmpdir(), 'lxmusic-app-media')
 
 const CHROME = [
   process.env.CHROME_PATH,
@@ -289,6 +294,17 @@ const BRIDGE_STUB = `
     },
     askNotificationPermission: function () { window.__askedNotif = true },
     openAppSettings: function () { window.__openedSettings = true },
+    // 真机形态：下载时页面优先走原生写「下载」目录。
+    // 替身记下每次调用（文件名 + 字节数），并回一个成功路径 ——
+    // 页面侧拿返回值判定成功与否，回空串会被当成失败而回退到 a[download]。
+    saveAudio: function (filename, b64) {
+      window.__savedAudio = window.__savedAudio || [];
+      var bytes = 0;
+      try { bytes = atob(b64).length } catch (e) { bytes = -1 }
+      window.__savedAudio.push({ filename: filename, bytes: bytes });
+      return '/storage/emulated/0/Download/' + filename;
+    },
+    canSaveAudio: function () { return true },
   };
 })();
 `

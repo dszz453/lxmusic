@@ -327,10 +327,21 @@
         if (!r || !r.ok) { directCache = []; return directCache }
         const raw = (r.urls && r.urls.length) ? r.urls : [{ url: r.url, from: r.from }]
         const list = raw
-          .map(x => ({ url: upgradeHttps(x.url), from: x.from || r.from || '直链' }))
+          .map(x => ({ url: upgradeHttps(x.url), from: x.from || r.from || '直链', size: Number(x.size) || 0 }))
           // 本宿主播不了的地址不必浪费一次尝试（网页里是 http，壳里没有这种限制）
           .filter(x => x.url && isPlayable(x.url))
-          .map(x => ({ url: x.url, from: x.from + ' · 直连' }))
+          .map(x => ({ url: x.url, from: x.from + ' · 直连', size: x.size }))
+        /**
+         * 体积大优先 —— 这条排序是为了「别放到一半就没了」。
+         *
+         * 各源对不同音质给的是**不同来源**：低音质常落到第三方中转的试听片段
+         * （三十多秒），Hi-Res 走正版直链给完整曲目。服务端已经按体积预排过，
+         * 但它是在自己的出口探的，和手机网络不是一回事；这里再排一次不花什么
+         * 代价，却能把「服务端探不出来的那条完整版」顶到前面去。
+         * size 为 0 表示探不出体积（未知），排到已知的后面 —— 未知不等于小，
+         * 但「已知的完整版」比「未知的」更值得先试。
+         */
+        list.sort((a, b) => (b.size || 0) - (a.size || 0))
         directCache = list
         // 服务端把「全部候选一个都没探通」如实标成 verified=false。
         // 这种直连地址可信度不高 —— 探测是在 Cloudflare 出口做的，和用户手机
@@ -424,9 +435,109 @@
   /** 把一条候选挂到 <audio> 上 */
   function applySrc(hit) {
     audio.dataset.stage = String(STAGES.indexOf(curStageName))
+    audio.dataset.cached = '0'
     audio.src = hit.url
     setFooter('音源：' + hit.from + (curList.length > 1 && curPos > 0 ? '（备选 ' + curPos + '）' : ''))
     armStall()
+    lastHit = hit
+  }
+
+  /**
+   * 这条候选是不是「疑似试听片段」。
+   *
+   * 不算精确：只有拿得到体积、且比同级里最大的那条小一大截时才算。
+   * 用途只有一个 —— 播放中真的发现放完了但歌明显没结束，好给用户一句解释。
+   * 不能靠它拦掉候选：体积小的也可能就是正常短歌（小样、间奏、纯音乐）。
+   */
+  const SNIPPET_RATIO = 0.5
+  function looksLikeSnippet(hit) {
+    if (!hit || !hit.size) return false
+    const max = curList.reduce((m, x) => Math.max(m, x.size || 0), 0)
+    return max > 0 && hit.size < max * SNIPPET_RATIO
+  }
+
+  /* ---------------- 播放缓存 ---------------- */
+
+  /**
+   * 当前这首有没有命中缓存。
+   *
+   * `cachedPlay` 只对**当前这一轮 load** 有效（load 开头会重置），
+   * 靠它把「命中的那条响应」带到 applyCachedSrc —— 缓存取字节是异步的，
+   * 不能在同步的 applySrc 里等。
+   */
+  let lastHit = null
+  let cachedPlay = null
+
+  function cacheApi() {
+    const c = global.LXAudioCache
+    return (c && c.supported) ? c : null
+  }
+
+  function cacheLabel(song) {
+    return '本地缓存' + (song && song._cacheQuality ? ' · ' + song._cacheQuality : '')
+  }
+
+  /** 命中缓存就取出一条可直接喂 <audio> 的响应，否则 null */
+  async function cacheHitFor(song) {
+    cachedPlay = null
+    const c = cacheApi()
+    if (!c || !song) return null
+    try {
+      const res = await c.get(song, state.quality, '')
+      if (!res) return null
+      cachedPlay = res
+      return res
+    } catch { return null }
+  }
+
+  /**
+   * 挂上缓存里的字节。
+   *
+   * 这里走 Blob URL 而不是直接给缓存 URL —— `<audio>` 会自己发 Range 请求，
+   * 而 Service Worker 对 Range 请求是直接放行（见 sw.js），拦不到；
+   * 给一个已经切好的完整 200 响应最省事，也不需要再和缓存层对话。
+   * 代价是内存里多驻留一份（一首 320k 约 10MB），播放结束会 revoke。
+   */
+  function applyCachedSrc(song, res) {
+    Promise.resolve(res.blob()).then((b) => {
+      if (!current() || current().id !== song.id) return
+      if (cacheBlobUrl) { try { URL.revokeObjectURL(cacheBlobUrl) } catch { /* ignore */ } }
+      cacheBlobUrl = URL.createObjectURL(b)
+      audio.dataset.stage = '-1'
+      audio.dataset.cached = '1'
+      audio.src = cacheBlobUrl
+      setFooter('音源：本地缓存（省去重新取流）')
+      lastHit = { url: 'cache://' + song.id, from: '本地缓存' }
+      armStall()
+      if (wantPlay) { wantPlay = false; audio.play().catch(() => {}) }
+    }).catch(() => {
+      // 缓存读坏了（极少见，通常是存储被系统清了）→ 当作没命中，走正常链路
+      cache3Retry(song)
+    })
+  }
+
+  let cacheBlobUrl = null
+
+  /** 缓存读失败时的兜底：把命中标记清掉，重新走一遍正常取流 */
+  function cache3Retry(song) {
+    cachedPlay = null
+    if (!current() || current().id !== song.id) return
+    setFooter('本地缓存不可用，正在重新取流…')
+    load(!audio.paused)
+  }
+
+  /** 播放结束后的「听完整首就存」；已经在缓存里的不会重复下 */
+  function maybeStoreToCache() {
+    const song = current()
+    const c = cacheApi()
+    if (!c || !song) return
+    // 命中缓存起播的这首本来就在缓存里，不必再走一遍
+    if (audio.dataset.cached === '1') return
+    if (!lastHit || !lastHit.url) return
+    if (global.LX_NATIVE === false && !c.autoEnabled()) return
+    c.cacheAfterPlay(song, state.quality, lastHit).then((r) => {
+      if (r && r.ok && !r.skipped) emit('cached', { song, bytes: r.bytes })
+    }).catch(() => { /* 缓存失败不影响播放 */ })
   }
 
   /**
@@ -499,6 +610,33 @@
     order = STAGES.slice()
     directCache = null
     curStage = 0; curList = []; curPos = 0; curStageName = order[0]
+
+    /**
+     * 缓存优先 —— 听过的歌直接吃本地字节，连解析都不做。
+     *
+     * 这一条必须在「取直连候选」之前：整条取流链路的开销（问 /api/url →
+     * 插件逐级解析 → Range 探测）省掉才是缓存真正的收益。放到后面就只能
+     * 省流量、省不了时间，用户感受不到。
+     */
+    const cached = await cacheHitFor(song)
+    if (token !== loadToken) return
+    if (cached) {
+      curStageName = 'cache'
+      curList = [{ url: 'cache://' + song.id, from: cacheLabel(song) }]
+      curPos = 0
+      applyCachedSrc(song, cached)
+      loading = false
+      state.loading = false
+      emit('loading', false)
+      applyResume(song)
+      if (wantPlay) {
+        wantPlay = false
+        try { await audio.play() } catch { /* 自动播放被拦，等用户手势 */ }
+      }
+      document.dispatchEvent(new CustomEvent('lx:song', { detail: song }))
+      return
+    }
+
     // 先取一次直连候选：既拿到地址，也拿到服务端的探测结论，
     // 在正式挑级别之前把 order 定下来（unverified 时会把插件级提前）。
     await stageCandidates(song, 'direct')
@@ -663,12 +801,58 @@
     renderLyric()
   }
 
+  /**
+   * 把歌词列表位移到「某一行正好落在可视区正中」的位置。传 null 表示对齐第一行。
+   *
+   * ⚠️ 这里踩过一个很大的坑，改动前务必读完：
+   *
+   * 不能拿 `active.offsetTop` 去算位移。`.lyric-scroll` 自己带着 transform（就是本函数
+   * 写的那个），而**带 transform 的元素会成为后代的 offsetParent** —— 于是
+   * `active.offsetTop` 变成「相对歌词列表自己」的坐标；偏偏 `.lyric-scroll` 又被
+   * `.player__lyric` 的 `align-items:center` 推到了可视区上方（63 行时 offsetTop ≈ −859）。
+   * 两套坐标系一混，算出来的位移整整偏掉「列表高度的一半」。实测后果：
+   * 高亮行被推到可视区**上方 860px** 处 —— 屏幕上你读到的那句，永远比正在唱的那句
+   * 晚好几行。用户的原话就是「歌词和进度对照不住」。
+   *
+   * 正确做法：不碰 DOM，用两个 **同时受该 transform 影响** 的矩形相减把 transform 抵消掉，
+   * 剩下纯布局量；再加上 `scroll.offsetTop`（布局值，不受 transform 影响）换算到
+   * 「相对可视区」的同一个坐标系里。
+   */
+  function alignLyricTo(node) {
+    const scroll = dom.lyricScroll
+    const box = scroll && scroll.parentElement
+    if (!box) return
+    const h = box.clientHeight
+    // 播放器没打开时可视区高度为 0，量出来必然是错的 —— 宁可不动，
+    // 也别把本来正确的位置污染掉（这正是「开播放器后歌词停在错位」的成因）。
+    if (!h) return
+    const target = node || scroll.firstElementChild
+    // 目标行相对「歌词列表顶部」的位移。列表与目标行同时受同一个 transform 影响，
+    // 相减后抵消 —— 所以不必先把 transform 清零，量出来直接就是纯布局值。
+    // （清零再量也想过，但读 rect 会强制一次样式重算，过渡动画会把那个临时的 0
+    //   当成起点，表现为「每换一句整列先跳一下」，所以刻意不碰 DOM。）
+    const sr = scroll.getBoundingClientRect()
+    const tr = target ? target.getBoundingClientRect() : null
+    const inList = tr ? (tr.top - sr.top) : 0
+    const targetH = tr ? tr.height : 0
+    // scroll.offsetTop 是**布局**值（不受 transform 影响），相对 #playerLyric 的 padding box。
+    // 与 clientHeight / 2 是同一套坐标原点，可以直接相减。
+    const top = scroll.offsetTop + inList
+    scroll.style.transform = 'translateY(' + (h / 2 - top - targetH / 2) + 'px)'
+  }
+
+  /** 按当前进度重摆一次位置。播放器开合、歌词刚回来、用户调偏移之后都要来一次 */
+  function realignLyric() {
+    if (!state.lines.length) return
+    syncLyric(audio.currentTime, true)
+  }
+
   function renderLyric() {
     if (!dom.lyricScroll) return
     if (!state.lines.length) {
       dom.lyricScroll.innerHTML = '<div class="lyric-line" style="color:rgba(255,255,255,.5)">'
         + (state.lyric === null ? '歌词加载中…' : '暂无歌词') + '</div>'
-      dom.lyricScroll.style.transform = 'translateY(0)'
+      dom.lyricScroll.style.transform = 'translateY(0px)'
       return
     }
     dom.lyricScroll.innerHTML = state.lines.map((l, i) => {
@@ -676,12 +860,18 @@
       return '<div class="lyric-line' + (i === state.lineIndex ? ' is-active' : '') + '" data-i="' + i + '">'
         + U.escapeHtml(l.text) + sub + '</div>'
     }).join('')
-    dom.lyricScroll.style.transform = 'translateY(' + (dom.lyricScroll.parentElement.clientHeight / 2 - 28) + 'px)'
+    // 首句居中：歌词还没开始唱时，让第一句先停在中间，后面的句子在下方候着
+    alignLyricTo(null)
     // 歌词可能是播到一半才回来的，渲染完补一次启动（空闲时是空操作）
     startLyricLoop()
   }
 
-  function syncLyric(time) {
+  /**
+   * 按时间戳定高亮行并摆好位置。
+   * `force` 为真时忽略「行没变就不用重摆」的短路 —— 播放器刚打开、旋屏、
+   * 调完偏移这些时候，行号往往没变但**位置必须重算**（可视区尺寸变了）。
+   */
+  function syncLyric(time, force) {
     if (!state.lines.length) return
     // 判定时刻 = 播放位置 - 偏移。偏移为正表示歌词延后 → 用更早的时刻去比，
     // 于是每一行都会「晚一点」才亮。
@@ -692,23 +882,16 @@
       if (state.lines[n].t <= at) i = n
       else break
     }
-    if (i === state.lineIndex) return
+    if (!force && i === state.lineIndex) return
     state.lineIndex = i
     const nodes = dom.lyricScroll.children
     for (let n = 0; n < nodes.length; n++) nodes[n].classList.toggle('is-active', n === i)
-    const active = nodes[i]
-    if (active) {
-      // 只用 transform 定位，**不要再调 scrollIntoView**。
-      // .player__lyric 是 overflow:hidden 的滚动容器 —— scrollIntoView 会去改它的
-      // scrollTop，而这里算 offsetTop 用的是「未受 transform 影响」的布局坐标，
-      // 两套位移一叠加，高亮行就会系统性偏离画布中心，越往后偏得越多。
-      const offset = dom.lyricScroll.parentElement.clientHeight / 2 - active.offsetTop - active.offsetHeight / 2
-      dom.lyricScroll.style.transform = 'translateY(' + offset + 'px)'
-    } else {
-      // 拖回到第一句之前（i === -1）：没有高亮行，把歌词拉回顶部，
-      // 否则列表停在上次滚到的位置，看起来像「歌词卡住了」。
-      dom.lyricScroll.style.transform = 'translateY(' + (dom.lyricScroll.parentElement.clientHeight / 2 - 28) + 'px)'
-    }
+    // 只用 transform 定位，**不要再调 scrollIntoView**。
+    // .player__lyric 是 overflow:hidden 的滚动容器，scrollIntoView 会去改它的
+    // scrollTop，和这里的位移叠加后高亮行会系统性偏离中心。
+    // i === -1（还没唱到第一句）时对齐第一行，否则列表会停在上次滚到的位置，
+    // 看起来像「歌词卡住了」。
+    alignLyricTo(i >= 0 ? nodes[i] : null)
     emit('line', i)
   }
 
@@ -727,8 +910,7 @@
    * `sign` 为 +1 表示「歌词再晚一点」（声音比字幕慢时按这个），-1 相反。
    *
    * 改完必须**立刻重算一次高亮**：syncLyric 里 `i === state.lineIndex` 会直接
-   * 早退，所以先把 lineIndex 打成一个不可能等于 i 的哨兵值（用 -2，因为
-   * -1 是「无高亮」的合法值），下一帧才会真正重新定位。
+   * 早退，而调偏移往往跨不过行边界（行没变），所以这里强制重算。
    */
   function nudgeLyricDelay(sign) {
     const next = Math.round((lyricDelay + sign * LYRIC_DELAY_STEP) * 10) / 10
@@ -743,8 +925,7 @@
     lyricDelay = next
     U.store.set('lx.lyricDelay', next)
     paintLyricCal()
-    state.lineIndex = -2
-    syncLyric(audio.currentTime)
+    syncLyric(audio.currentTime, true)
     return lyricDelay
   }
 
@@ -986,6 +1167,8 @@
     if (!dur) return
     audio.currentTime = Math.max(0, Math.min(1, ratio)) * dur
     paintProgress()
+    // 跳进度后歌词必须立刻跟上（同 seekRatioPreview，是另一条入口）
+    syncLyric(audio.currentTime, true)
   }
 
   function setQuality(key) {
@@ -1063,7 +1246,19 @@
     setPlayIcon(!audio.paused)
     dom.player.hidden = false
     dom.view && dom.view.classList.add('is-player-open')
-    requestAnimationFrame(() => dom.player.classList.add('is-open'))
+    /**
+     * 立刻按真实高度重摆一次歌词。
+     *
+     * 播放器关着时 `.player__lyric` 的高度是 0（display:none 的祖先），
+     * 而歌词的 rAF 循环**不管你开没开播放器都在跑** —— 于是它一路按「高度 0」
+     * 算位移。等用户再打开时，行号多半没变（一句歌词好几秒），
+     * syncLyric 的短路会让它一直不重算，歌词就停在错的位置上。
+     */
+    realignLyric()
+    requestAnimationFrame(() => {
+      dom.player.classList.add('is-open')
+      realignLyric()            // 入场动画期间尺寸可能还在变，再校一次更稳
+    })
     emit('open')
   }
   function closePlayer() {
@@ -1077,6 +1272,12 @@
 
   /* ---------------- 进度条拖拽 ---------------- */
 
+  /** 拖动开始/结束。拖动时关掉歌词的过渡动画 —— 跟着手指走才跟手 */
+  function setSeeking(on) {
+    state.seeking = !!on
+    if (dom.lyricScroll) dom.lyricScroll.style.transition = on ? 'none' : ''
+  }
+
   function bindRange(node) {
     if (!node) return
     let dragging = false
@@ -1088,13 +1289,13 @@
       const pt = e.touches ? e.touches[0] : e
       seekRatioPreview(ratioOf(pt.clientX))
     }
-    node.addEventListener('touchstart', (e) => { dragging = true; state.seeking = true; move(e) }, { passive: true })
+    node.addEventListener('touchstart', (e) => { dragging = true; setSeeking(true); move(e) }, { passive: true })
     node.addEventListener('touchmove', (e) => { if (dragging) move(e) }, { passive: true })
-    node.addEventListener('touchend', () => { dragging = false; state.seeking = false })
+    node.addEventListener('touchend', () => { dragging = false; setSeeking(false) })
     node.addEventListener('pointerdown', (e) => {
       if (e.pointerType === 'touch') return
-      dragging = true; state.seeking = true; move(e)
-      const up = () => { dragging = false; state.seeking = false; window.removeEventListener('pointermove', moveEvent); window.removeEventListener('pointerup', up) }
+      dragging = true; setSeeking(true); move(e)
+      const up = () => { dragging = false; setSeeking(false); window.removeEventListener('pointermove', moveEvent); window.removeEventListener('pointerup', up) }
       const moveEvent = (ev) => { if (dragging) move(ev) }
       window.addEventListener('pointermove', moveEvent)
       window.addEventListener('pointerup', up)
@@ -1109,17 +1310,29 @@
     if (dom.progressThumb) dom.progressThumb.style.left = pct
     if (dom.curTime) dom.curTime.textContent = U.formatTime(dur * r)
     if (dur) audio.currentTime = dur * r
+    /**
+     * 歌词要跟着进度条一起走。
+     *
+     * 不补这一句的话，拖动期间歌词是**完全不动**的：timeupdate 里有一道
+     * `if (state.seeking) return`（防它和手指抢进度条），而 timeupdate 正是
+     * 平时唯一驱动歌词的东西。用户看到的就是「进度条拖过去了，歌词还在原地」
+     * —— 这也是「歌词和进度对照不住」的成因之一。
+     */
+    if (dur) syncLyric(audio.currentTime, true)
   }
 
   /* ---------------- 音频事件 ---------------- */
 
   audio.addEventListener('timeupdate', () => {
-    if (state.seeking) return
-    paintProgress()
+    // 拖动进度条期间不碰进度条与上报（和手指抢会抖），但**歌词照跟** ——
+    // 这一条和 seekRatioPreview 里的那次是同一件事的两个入口，都不能少。
+    if (!state.seeking) {
+      paintProgress()
+      // 进度上报搭 timeupdate 的车（约 4Hz），内部自己做 5 秒节流
+      tickListening()
+      flushProgress(audio.currentTime, audio.duration, false)
+    }
     syncLyric(audio.currentTime)
-    // 进度上报搭 timeupdate 的车（约 4Hz），内部自己做 5 秒节流
-    tickListening()
-    flushProgress(audio.currentTime, audio.duration, false)
   })
   audio.addEventListener('durationchange', paintProgress)
   audio.addEventListener('loadedmetadata', () => { clearStall(); paintProgress() })
@@ -1136,10 +1349,41 @@
     stopLyricLoop()
     // 播完 = 最确定的一次「听过了」，先把这一条发出去再换歌
     flushProgress(audio.currentTime, audio.duration, true)
+    warnIfSnippet()
+    maybeStoreToCache()       // 整首听完才落缓存（见 audiocache.js 顶部「为什么不边听边存」）
     session = null            // 本轮到此为止；单曲循环由 play 事件重新开一轮
     resumeToken++             // 作废可能还在路上的续播请求
     next(false)
   })
+
+  /**
+   * 放完了，但这首歌按元数据应该还没结束 —— 说清楚原因。
+   *
+   * 这是「同一首歌选不同音质长度不一样」这个问题的可见部分。真因在源侧：
+   * 低音质常落到第三方中转的**试听片段**，Hi-Res 走正版直链给完整曲目。
+   * 服务端已经会优先挑体积大的候选（见 src/lib/stream.js 的 SETTLE_MS），
+   * 但候选里要是根本没出现过完整版，就只能放到这里 —— 此时**必须让用户知道
+   * 是音源的问题、以及可以怎么绕**，否则他只会以为播放器坏了或者歌就是这样。
+   *
+   * 判定要足够保守：只有「歌曲声明时长 > 60 秒」且「实播不到声明的一半」才提示，
+   * 免得把正常短歌、纯音乐里的长静音误報成片段。
+   */
+  function warnIfSnippet() {
+    const song = current()
+    if (!song) return
+    const declared = Number(song.interval) || 0          // 秒
+    const played = Number(audio.duration) || 0
+    if (declared < 60 || !played) return
+    if (audio.dataset.cached === '1') return             // 本地缓存不算音源的锅
+    if (played >= declared * 0.6) return
+    const why = looksLikeSnippet(lastHit)
+      ? '当前音源只提供了试听片段'
+      : '当前音源提供的内容不完整'
+    U.toast('「' + song.name + '」' + why
+      + '（' + Math.round(played) + 's / ' + declared + 's）——'
+      + '可换个音质或换条音源再试', 6000)
+    setFooter('音源：' + ((lastHit && lastHit.from) || '未知') + ' · 疑似试听片段')
+  }
   audio.addEventListener('error', () => { if (audio.src) { stopLyricLoop(); handleError() } })
   audio.addEventListener('waiting', () => emit('buffering', true))
   audio.addEventListener('playing', () => { clearStall(); emit('buffering', false); emit('state', true) })
@@ -1210,6 +1454,10 @@
       flushProgress(audio.currentTime, audio.duration, true)
     })
 
+    // 旋屏 / 窗口尺寸变化 → 可视区高度变了，歌词要重摆（行号通常没变，必须强制）
+    window.addEventListener('resize', () => realignLyric())
+    window.addEventListener('orientationchange', () => setTimeout(realignLyric, 120))
+
     const prevIdx = U.store.get('lx.index', -1)
     if (state.queue.length) {
       state.index = Math.max(0, Math.min(Number(prevIdx) || 0, state.queue.length - 1))
@@ -1230,7 +1478,7 @@
     toggleFavorite, setFavorites, loadFavorites,
     openPlayer, closePlayer, isPlayerOpen,
     current,
-    syncLyric, setLyricDelay, nudgeLyricDelay,
+    syncLyric, setLyricDelay, nudgeLyricDelay, realignLyric,
     get lyricDelay() { return lyricDelay },
     LYRIC_DELAY_MAX, LYRIC_DELAY_STEP,
     get queue() { return state.queue },
@@ -1244,5 +1492,39 @@
     PROGRESS_INTERVAL, PLAYED_MIN_SEC, PLAYED_RATIO,
     // 音效：换音效后要按新设置重取一次流（直连 ⇄ 代理），换音质则保留位置
     reloadForTone, keepPosition,
+    // 播放缓存 / 下载（见 public/js/audiocache.js）——
+    // 这两件事都需要「按正常链路解析出一条可用地址」，而那条链路只在这里，
+    // 所以由播放器暴露出去，而不是让缓存层自己重造一遍
+    resolveForDownload,
+  }
+
+  /**
+   * 按正常取流链路解析出一条**当前可下载**的地址。
+   *
+   * 缓存层不该知道「直连 / 插件 / 服务端代理」这三级的差别 —— 那是播放器的知识。
+   * 这里复用同一套候选（顺带享受直连候选缓存），只把结果交给调用方。
+   * @returns {Promise<{url:string, from:string}|null>}
+   */
+  async function resolveForDownload(song, quality) {
+    if (!song) return null
+    const keepQ = state.quality
+    const keepOrder = order
+    const keepCache = directCache
+    try {
+      if (quality && quality !== state.quality) state.quality = quality
+      order = STAGES.slice()
+      directCache = null
+      await stageCandidates(song, 'direct')
+      const hit = await advance(0, 0)
+      return hit || null
+    } catch {
+      return null
+    } finally {
+      // 解析是「借」播放器的状态跑一遍，跑完必须还原 ——
+      // 否则会串改用户当前正在听的音质或降级顺序
+      state.quality = keepQ
+      order = keepOrder
+      directCache = keepCache
+    }
   }
 })(window)

@@ -50,9 +50,11 @@ export function pluginBrief(item) {
 /**
  * 求值一个插件并登记进池。调用方负责隔离 ——
  * 这个函数不保证返回：混淆脚本可能直接终止 JS 引擎。
+ * @param {{id:string, script:string, url?:string, name?:string}} item
+ * @param {'builtin'|'user'} [origin] 内置 / 用户导入（见 src/server/plugin-import.mjs）
  * @returns {{ok:boolean, error?:string}}
  */
-export function evaluateOne(item) {
+export function evaluateOne(item, origin = 'builtin') {
   const meta = parseScriptMeta(item.script)
   const result = evaluatePluginAtStartup(item.id, item.script, {
     name: meta.name,
@@ -62,7 +64,13 @@ export function evaluateOne(item) {
     homepage: meta.homepage,
     rawScript: null, // 不保留原文，避免内存翻倍
   })
-  pluginPool.add({ ...result, id: item.id, url: item.url || '', meta: { ...meta, ...(result.meta || {}) } })
+  pluginPool.add({
+    ...result, id: item.id, url: item.url || '', origin,
+    // bytes：管理端「已导入插件」列表要显示体量，用户导入的脚本从 200KB 到 2MB 都有，
+    // 不给这个数就没法判断「我导的到底是不是那个完整版」
+    bytes: item.script.length,
+    meta: { ...meta, ...(result.meta || {}) },
+  })
   return { ok: !!result.ok, error: result.error || null }
 }
 

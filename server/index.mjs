@@ -37,6 +37,14 @@ import { handleApi } from '../src/server/api.js'
 import { handleSubsonic } from '../src/server/subsonic.js'
 import { versionInfo, versionLine, APP_VERSION } from '../src/version.js'
 import { pluginPool, pluginBrief, evaluateOne, PLUGIN_MANIFEST } from '../src/plugins.js'
+import { loadUserPlugins, setProbeRunner, setPluginHost } from '../src/server/plugin-import.mjs'
+/*
+ * 子进程预筛是纯 Node 能力，实现在 server/ 下 —— 由这里注入给 src/server/plugin-import.mjs。
+ * 这样 src/ 侧就不会被 node:child_process / import.meta 污染（那些东西会打断 APK 打包，
+ * 且 import.meta 在展平后的非模块脚本里是**语法错误**，产物一加载就炸）。
+ * 必须在 loadUserPlugins / 处理导入请求**之前**注入。
+ */
+import { probePluginInChild } from './plugin-import-node.mjs'
 import { ensureSchema, getSetting, setSetting } from '../src/db.js'
 import { PLUGIN_SKIP } from '../src/generated/plugin-skip.js'
 import { createD1, openDatabase } from './d1-sqlite.mjs'
@@ -243,6 +251,13 @@ function loadPlugins() {
 
   // 插件把我们的 console 换掉了（见 REAL_CONSOLE 的说明），装回来
   restoreConsole()
+
+  /**
+   * 把 skip 集合交出去 —— 用户导入的插件也要吃同一份黑名单。
+   * 不返回的话，那个「上一次启动死在谁手上」的判断只对内置信，用户导入的
+   * 那个 killer 每次重启都会被重新求值一遍，容器永远起不来（无限重启）。
+   */
+  return skip
 }
 
 /* ---------------- 运行时评分：结果落库与装载 ---------------- */
@@ -361,7 +376,24 @@ async function main() {
 
   // 插件要在开始收请求之前就位 —— 池子空着的时候搜索会「成功但零结果」，
   // 那比启动失败更难排查
-  loadPlugins()
+  const pluginSkip = loadPlugins()
+
+  /**
+   * 把「子进程预筛」和「插件池 + 求值器」注入给 src/server/plugin-import.mjs。
+   * 必须赶在 loadUserPlugins（它内部会对每个插件调预筛与求值）之前。
+   *
+   * 为什么池子也要注入而不是让那边 import：src/plugins.js 顶层会求值内置插件，
+   * 而 pdone-lx 求值即杀死 JS 引擎 —— 它一进 APK 打包产物，产物加载就整个消失。
+   * 详见 src/server/plugin-import.mjs 里 setPluginHost 的说明。
+   */
+  setProbeRunner(probePluginInChild)
+  setPluginHost({ pool: pluginPool, evaluate: evaluateOne })
+
+  /**
+   * 用户自己导入的插件（管理端 / App 的「导入插件」）。同样要在收请求前装好，
+   * 理由和上面一样。黑名单与内置插件共用 —— 见 loadPlugins 末尾的说明。
+   */
+  await loadUserPlugins(db, pluginSkip)
 
   /**
    * 运行时评分的结果优先于构建期那份（见 loadRuntimeRank 的说明）。

@@ -17,6 +17,7 @@ import { generatePlaylist, loadAiConfig, chatOnce, AI_PROVIDERS } from '../lib/a
 import { PLUGIN_SCORES } from '../generated/plugin-scores.js'
 import { BUNDLED_PLUGINS } from '../generated/plugins.js'
 import * as db from '../db.js'
+import { importPlugin, removeImportedPlugin } from './plugin-import.mjs'
 import { generateDaily, getDaily, pickPrimaryUser, todayBJ } from './daily.js'
 import { HOME_KEYWORDS } from './keywords.js'
 import { versionInfo } from '../version.js'
@@ -1187,7 +1188,11 @@ export async function handleApi(request, env, url) {
         rescore: await readRescoreState(env, db),
         plugins: env.PLUGIN_POOL.summary().map(p => ({
           id: p.id, name: p.name, ok: !!p.ok, error: p.error || null,
+          // origin：builtin = 构建期内置；user = 用户在管理端/App 里导入的。
+          // 界面据此只给「用户导入」的那些显示删除按钮。
+          origin: p.origin || 'builtin',
           sources: p.sources || [], version: p.version || null,
+          bytes: p.bytes || 0,
         })),
         platforms: ALL_SOURCES.map(k => ({ key: k, name: SOURCE_META[k].name, short: SOURCE_META[k].short })),
       })
@@ -1291,6 +1296,56 @@ export async function handleApi(request, env, url) {
 
     if (path === '/admin/plugins') {
       return json({ ok: true, list: env.PLUGIN_POOL.summary() })
+    }
+
+    /**
+     * 手动导入 / 删除音源插件（管理端）。
+     *
+     * 这是「用户端为什么没有导入按钮」这个问题的正面回答：服务器模式下插件跑在
+     * 服务端，用户端的插件区只写了一句「需要增删请到管理端」—— 而管理端此前根本
+     * 没有这个功能。现在补上，两处都能用：
+     *   · 管理端网页（/admin → 音源与插件）
+     *   · App 的设置页（远程模式下直接打到这几个接口，见 public/js/app.js）
+     *
+     * 只在自托管下有真实现：求值插件要 new Function，Cloudflare Worker 只允许
+     * 在启动阶段用，请求阶段一律禁止。所以那边如实回 501 并给一句可执行的替代方案。
+     */
+    if (path === '/admin/plugins/import') {
+      if (method === 'POST') {
+        if (!env.RESCORE) {
+          return bad('当前宿主不支持运行时导入插件（需要自托管/Docker 版）；'
+            + '线上版请把插件脚本写进仓库的 plugins/ 目录后重新部署', 501)
+        }
+        const body = await readJson(request)
+        const rawUrl = String(body.url || '').trim()
+        if (rawUrl) {
+          let host = ''
+          try { host = new URL(rawUrl).hostname } catch { return bad('url 不合法') }
+          if (isBlockedHost(host)) return bad('目标地址被禁止', 403)
+        }
+        try {
+          const r = await importPlugin(env.DB, { url: rawUrl, script: body.script, name: body.name })
+          return json({ ok: true, ...r, list: env.PLUGIN_POOL.summary() })
+        } catch (e) {
+          // 输入问题（URL 不通、内容不像插件、脚本加载失败）一律回 400 并带原因，
+          // 不回 500 —— 这类错误是用户能自己改的，500 只会让人以为是服务端坏了
+          if (e && e.userError) return bad(e.message, e.status || 400)
+          throw e
+        }
+      }
+      // 删掉必须是 DELETE 语义 —— 早期想到过用 POST 加 action 参数，但那样
+      // 反代和日志里「删插件」与「读列表」长得一模一样，误操作没有任何痕迹
+      if (method === 'DELETE') {
+        if (!env.RESCORE) return bad('当前宿主不支持运行时删除插件（需要自托管/Docker 版）', 501)
+        try {
+          const r = await removeImportedPlugin(env.DB, url.searchParams.get('id'))
+          return json({ ok: true, ...r, list: env.PLUGIN_POOL.summary() })
+        } catch (e) {
+          if (e && e.userError) return bad(e.message, e.status || 400)
+          throw e
+        }
+      }
+      return bad('不支持的方法', 405)
     }
 
     /**

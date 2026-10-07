@@ -241,6 +241,8 @@
                                     必须在 api.js、app.js 之前，才能赶在它们发第一个请求前生效。
                                     桥不存在时（普通浏览器）本文件直接返回，行为与线上完全一致。
     4. api.js / lxplugin.js / player.js / app.js —— 前端主体，全部零改动
+    5. audiocache.js              —— 音频缓存与导出下载。必须在 player.js 之前：
+                                    播放器取流时要先问它有没有缓存，挂不到就白做。
 -->
 <script src="/js/util.js"></script>
 <script src="/js/plugins.data.js"></script>
@@ -249,6 +251,7 @@
 <script src="/js/api.js"></script>
 <script src="/js/lxplugin.js"></script>
 <script src="/js/tone.js"></script>
+<script src="/js/audiocache.js"></script>
 <script src="/js/player.js"></script>
 <script src="/js/app.js"></script>
 </body>

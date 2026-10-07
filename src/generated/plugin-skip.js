@@ -9,7 +9,7 @@
  * 在用户的服务器上可能是好的，凭构建机的网络删插件是错的。
  *
  * 重新生成：node tools/plugin-prescreen.mjs
- * 生成时间：2026-10-01T07:58:45.122Z
+ * 生成时间：2026-10-06T23:23:07.158Z
  * 生成环境：Node v22.22.2 / win32-x64
  */
 export const PLUGIN_SKIP = [
@@ -18,7 +18,7 @@ export const PLUGIN_SKIP = [
 
 /** 免得出名单是空的时候有人以为文件坏了 */
 export const PLUGIN_SKIP_META = {
-  generatedAt: "2026-10-01T07:58:45.128Z",
+  generatedAt: "2026-10-06T23:23:07.162Z",
   node: "v22.22.2",
   platform: "win32-x64",
   loadErrors: ["pdone-sixyin","pdone-flower","pdone-grass","pdone-juhe","pdone-changqing","liuyun-yc"],
