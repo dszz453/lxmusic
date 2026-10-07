@@ -1,6 +1,6 @@
 {
-  "name": "云音乐 · 在线音乐聚合",
-  "short_name": "云音乐",
+  "name": "music-edge · 在线音乐聚合",
+  "short_name": "music-edge",
   "description": "聚合酷狗、网易云、酷我、QQ音乐的多平台在线音乐应用，兼容落雪插件，支持歌单导入与 Subsonic 客户端接入。",
   "id": "/",
   "start_url": "/#/",

@@ -430,9 +430,21 @@ export async function handleApi(request, env, url) {
      * 版本号。三个宿主都从这里取，前端「关于」处也用它。
      * 公开、不需登录 —— 用户报问题时第一件事就是问「你跑的哪版」，
      * 要登录才能看会白白多一轮来回。
+     *
+     * ── host 字段是干什么的 ────────────────────────────────────────
+     * 老板要求 Docker 版显示 LX-MUSIC、CF 版显示 music-edge，而两个客户端
+     * **共用同一份前端资源**，所以「我是谁」必须由服务端告诉前端。
+     * 前端拿到 host 才知道该显示哪个名字（见 public/js/brand.js）。
+     *
+     * 为什么不用响应头 / CDN 特征来判：那些都可能被反向代理、中间设备抹掉，
+     * 而 host 是我们自己的代码写出去的字面量，最稳。
+     *
+     * 取值由宿主在启动时挂到 env 上（src/index.js 为 'cf'，server/index.mjs 为 'docker'）。
+     * 没挂时不硬编码成某一个 —— 回 null，让前端走它自己的兜底判据，
+     * 免得「不知道」被当成一个确定的答案。
      */
     if (path === '/version') {
-      return json({ ok: true, ...versionInfo() })
+      return json({ ok: true, ...versionInfo(), host: env.LX_HOST_KIND || null })
     }
 
     if (path === '/setup' && method === 'POST') {

@@ -1937,6 +1937,38 @@
     }
   }
 
+  /* ================= 客户端品牌名 ================= */
+
+  /**
+   * 当前客户端的展示名（Docker → LX-MUSIC，CF/壳 → music-edge）。
+   *
+   * 收成一个函数是为了**没有任何硬编码的退路**：万一 brand.js 没加载成功
+   * （脚本 404、被 CSP 拦），也只会退到一个中性名字，而不是某个写死的旧品牌名 ——
+   * 以前的 bug 正是「名字散在四处、改一处漏一处」，这里不再重蹈。
+   */
+  function brandName() {
+    return (global.LXBrand && global.LXBrand.name) || '音乐'
+  }
+
+  /**
+   * 让服务端确认「我到底是哪个客户端」，据此把名字刷成 LX-MUSIC 或 music-edge。
+   *
+   * 为什么必须有这一步：brand.js 加载时只能用**同步**判据猜（壳里？远程模式？），
+   * 那条路在「浏览器直接打开 Docker 网页端」和「浏览器直接打开 CF 线上」这两种
+   * 最常见的情况下**给出的答案一样** —— 都是 docker。所以要靠服务端
+   * /api/version 的 host 字段来定论（那边 src/index.js / server/index.mjs 各写各的）。
+   *
+   * 为什么不 await：这是个纯显示问题，不该拖慢首屏。品牌猜错顶多是标题先显示
+   * 一会儿默认名、随后纠正；而 await 会让整个 boot 卡在网络上。
+   */
+  function bindBrand() {
+    if (!global.LXBrand) return
+    API.version().then((v) => {
+      // applyHost 只在真的变了的时候返回 true（并自己重刷标题、manifest、派事件）
+      global.LXBrand.applyHost(v && v.host)
+    }).catch(() => { /* 接口不通就保持兜底判据，不打扰用户 */ })
+  }
+
   /**
    * 把版本号填进设置页。
    *
@@ -2009,7 +2041,7 @@
     // 用户名预填：设置页里配过「登录用户名」的话直接带上，不用每次手输
     const presetUser = (window.LXApp && window.LXApp.serverUser) || ''
     view.innerHTML = '<div class="login-wrap">'
-      + '<h1>云音乐</h1><p>登录后即可搜索播放、导入歌单，并用 Subsonic 客户端连接。</p>'
+      + '<h1>' + esc(brandName()) + '</h1><p>登录后即可搜索播放、导入歌单，并用 Subsonic 客户端连接。</p>'
       + '<div class="field"><div class="field__label">用户名</div><input class="input" id="loginUser" autocomplete="username" value="' + esc(presetUser) + '"></div>'
       + '<div class="field"><div class="field__label">密码</div><input class="input" id="loginPwd" type="password" autocomplete="current-password"></div>'
       + '<button class="btn btn--block" id="btnLogin" style="margin-top:8px">登录</button>'
@@ -2317,7 +2349,7 @@
 
     /* --- 播放器状态同步 --- */
     Player.on('song', (song) => {
-      if (song) document.title = (song.name || '云音乐') + ' - ' + (song.singer || '')
+      if (song) document.title = (song.name || brandName()) + ' - ' + (song.singer || '')
       renderQueueIfOpen()
       syncFavIcons(song)
     })
@@ -2798,6 +2830,13 @@
   /* ================= 启动 ================= */
 
   async function boot() {
+    // 品牌名要在**最早**就确认，而且与登录状态无关 —— 放在这里而不是下面
+    // 「已登录」之后，是因为未登录时走的是两个提前 return 的分支
+    // （需要初始化 / 需要登录），那两页恰恰是**最需要正确品牌名**的：
+    // 登录页正中就是一个大标题。放晚了它永远显示兜底猜的名字。
+    // 本函数不 await（见它的说明），所以放这儿不会拖慢首屏。
+    bindBrand()
+
     let status = { needsSetup: false }
     try { status = await API.setupStatus() } catch { /* ignore */ }
 

@@ -26,6 +26,10 @@ export default {
 
     // 把插件池挂到 env 上，供各层使用
     env.PLUGIN_POOL = pluginPool
+    // 宿主体征：本宿主是 CF Worker。前端据此把客户端名显示成 music-edge
+    // （Docker 那边是 server/index.mjs 挂 'docker' → LX-MUSIC）。
+    // 见 public/js/brand.js 与 src/server/api.js 的 /version。
+    env.LX_HOST_KIND = 'cf'
     // waitUntil 挂到 env 上：/api/home 发现当天每日推荐还没生成时，
     // 用它把「后台生成」挂到请求生命周期上（响应先回，生成继续跑）。
     env.waitUntil = (p) => ctx.waitUntil(p)

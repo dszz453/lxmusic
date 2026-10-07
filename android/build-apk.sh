@@ -37,6 +37,24 @@ W() { cygpath -w "$1"; }                          # MSYS 路径 → Windows 路�
 LIST_WIN() { find "$@" | while read -r f; do cygpath -w "$f"; done; }
 
 APP_NAME="music-edge"
+# 1.3：两个客户端各自独立命名 —— Docker 版叫 LX-MUSIC，CF 版（含本壳）叫 music-edge。
+#  ① 需求是「两个客户端相互独立」，而两个宿主**共用同一份 public/ 前端资源**，
+#     所以「我是谁」只能在运行时判定，不能靠打包两份代码（那样以后每个改动都要同步两处）。
+#  ② 名字以前散在四处（manifest.json、index.html 的 <title> 与 apple 短名、
+#     app.js 的登录页大标题与 document.title），必然改一处漏一处。
+#     新增 public/js/brand.js 收成唯一事实来源，其余地方一律取 LXBrand.name。
+#  ③ 判据用**服务端自报**：/api/version 新增 host 字段（CF 入口写 'cf'、
+#     Node 入口写 'docker'），比响应头 / CDN 特征可靠 —— 那些会被反代抹掉。
+#     前端先用同步判据兜底（壳里 / 远程模式），接口回来再纠正。
+#  ④ ⚠️ 实测踩到的真 bug：bindBrand() 原本放在 boot() 里「已登录」之后那段，
+#     而未登录走的是两个**提前 return** 的分支 → 登录页（正中一个大标题，
+#     最需要正确名字的地方）永远显示兜底猜的名。而兜底猜在 Docker 与 CF 上
+#     答案一样（都是 docker）→ **CF 线上会显示成 LX-MUSIC**。
+#     已提到 boot() 最前面，并加了断言钉住（test/brand.test.mjs）。
+#  ⑤ manifest 由前端合成（抓原文件 → 改 name/short_name/**id** → Blob 换 link）。
+#     改 id 是必须的：id 相同的话两个客户端装到同一台设备会**互相顶掉**。
+#     SW 的 VERSION 一并抬到 v25，预缓存补上 brand.js。
+#
 # 1.2：修两个报障 + 加两个功能 + 一处动画优化。
 #  ① 修「同一首歌换个音质，长度就不一样」（三十多秒 vs 四分钟，Hi-Res 最完整）。
 #     真因**不在播放器**，在服务端挑候选：各音源插件对不同音质返回的是**不同来源**
@@ -221,7 +239,7 @@ cp -r "$HERE/../public/." "$ASSETS/www/"
   [ -f "$HERE/../public/$f" ] || { rm -f "$f"; echo "   清理残留: ${f#./}"; }
 done)
 # 缺任何一个都会让 App 白屏，所以这里逐个点检而不是想当然
-for f in index.html css/app.css js/util.js js/api.js js/app.js js/player.js \
+for f in index.html css/app.css js/util.js js/brand.js js/api.js js/app.js js/player.js \
          js/lxplugin.js js/lxworker.js js/native.js js/backend.bundle.js js/plugins.data.js; do
   [ -f "$ASSETS/www/$f" ] || { echo "❌ assets 缺少 $f（先跑 node tools/build-app.mjs）"; exit 1; }
 done

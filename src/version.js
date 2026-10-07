@@ -32,10 +32,10 @@
  */
 
 /** 产品版本（对外展示用）。每发一版升 0.1。 */
-export const APP_VERSION = 'V1.2'
+export const APP_VERSION = 'V1.3'
 
 /** Android versionCode：整数、单调递增、跨次发布不可重复。每发一版 +1。 */
-export const APP_VERSION_CODE = 102
+export const APP_VERSION_CODE = 103
 
 /** 人类可读的完整标识，日志/关于页用。 */
 export const APP_ID = 'lxmusic'

@@ -1,6 +1,6 @@
 # music-edge · 安卓 APP（自包含） + Cloudflare Workers 源码包
 
-> **当前版本：V1.2**
+> **当前版本：V1.3**
 >
 > 同一份 `src/` 同时服务三个宿主，靠**运行时宿主能力判定**分支，不做编译期分叉：
 > Cloudflare Workers（线上）、安卓壳（APK 内自带）、Docker（你自己的服务器）。

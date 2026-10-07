@@ -6,9 +6,13 @@
 <meta name="theme-color" content="#ffffff">
 <meta name="apple-mobile-web-app-capable" content="yes">
 <meta name="apple-mobile-web-app-status-bar-style" content="default">
-<meta name="apple-mobile-web-app-title" content="云音乐">
+<meta name="apple-mobile-web-app-title" content="music-edge">
 <meta name="format-detection" content="telephone=no">
-<title>云音乐 · 在线音乐聚合</title>
+<!-- 标题由 /js/brand.js 按宿主改写（Docker → LX-MUSIC，CF → music-edge）。
+     这里写 music-edge 只是**首屏兜底**：brand.js 在 native.js 之后加载，
+     在那之前浏览器已经显示了这个标题，所以它必须与 CF 那条线的名字一致，
+     免得线上首屏先闪一下别的名字。 -->
+<title>music-edge · 在线音乐聚合</title>
 <link rel="manifest" href="/manifest.json">
 <link rel="icon" type="image/png" sizes="32x32" href="/icons/favicon-32.png">
 <link rel="apple-touch-icon" sizes="180x180" href="/icons/apple-touch-icon.png">
@@ -240,6 +244,11 @@
     3. native.js                 —— 桥接层：换掉 fetch / DB，并把 /api/* 接到本地后端。
                                     必须在 api.js、app.js 之前，才能赶在它们发第一个请求前生效。
                                     桥不存在时（普通浏览器）本文件直接返回，行为与线上完全一致。
+    3.5 brand.js                 —— 品牌名（Docker 显示 LX-MUSIC / CF 显示 music-edge）。
+                                    **必须排在 native.js 之后**：它靠 LX_NATIVE 判断
+                                    自己是不是在壳里，晚于 native.js 才读得到（见 brand.js
+                                    的 guessHost）。同时要早于 app.js —— 得抢在首屏渲染
+                                    与浏览器取 manifest 之前把名字刷对，否则会闪一下旧名。
     4. api.js / lxplugin.js / player.js / app.js —— 前端主体，全部零改动
     5. audiocache.js              —— 音频缓存与导出下载。必须在 player.js 之前：
                                     播放器取流时要先问它有没有缓存，挂不到就白做。
@@ -248,6 +257,7 @@
 <script src="/js/plugins.data.js"></script>
 <script src="/js/backend.bundle.js"></script>
 <script src="/js/native.js"></script>
+<script src="/js/brand.js"></script>
 <script src="/js/api.js"></script>
 <script src="/js/lxplugin.js"></script>
 <script src="/js/tone.js"></script>

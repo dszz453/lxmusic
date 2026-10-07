@@ -433,6 +433,12 @@ async function main() {
   })
   env.RESCORE = scheduler
   /**
+   * 宿主体征：本宿主是自托管（Docker / 本机 node）。
+   * 前端据此把客户端名显示成 LX-MUSIC（CF 那边是 'cf' → music-edge）。
+   * 见 public/js/brand.js 与 src/server/api.js 的 /version。
+   */
+  env.LX_HOST_KIND = 'docker'
+  /**
    * 上次评分状态（重启后仍能看到）。
    *
    * ── 为什么不是「启动时读一次就存着」────────────────────────────
