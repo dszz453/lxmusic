@@ -1951,6 +1951,22 @@
   }
 
   /**
+   * 品牌名确认后，把已经渲染出来的登录页大标题也纠正过来。
+   *
+   * 浏览器模式下 brand.js 首屏不动任何落点（防闪错名，见它的文件尾），
+   * 所以登录页第一次渲染时 h1 可能还是**兜底猜**的名字 —— 在 CF 线上
+   * 猜的是 docker → 大标题短暂显示 LX-MUSIC。brand.test 的静态断言管不到
+   * 这种「渲染时机 vs 异步确认」的竞态，所以这里用事件把它接上：
+   * applyHost 确认真变了 → 派 lx-brand → 这里直接改 h1 文本。
+   */
+  function watchBrandForLogin() {
+    global.addEventListener('lx-brand', () => {
+      const h = document.getElementById('loginBrand')
+      if (h) h.textContent = brandName()
+    })
+  }
+
+  /**
    * 让服务端确认「我到底是哪个客户端」，据此把名字刷成 LX-MUSIC 或 music-edge。
    *
    * 为什么必须有这一步：brand.js 加载时只能用**同步**判据猜（壳里？远程模式？），
@@ -2041,7 +2057,7 @@
     // 用户名预填：设置页里配过「登录用户名」的话直接带上，不用每次手输
     const presetUser = (window.LXApp && window.LXApp.serverUser) || ''
     view.innerHTML = '<div class="login-wrap">'
-      + '<h1>' + esc(brandName()) + '</h1><p>登录后即可搜索播放、导入歌单，并用 Subsonic 客户端连接。</p>'
+      + '<h1 id="loginBrand">' + esc(brandName()) + '</h1><p>登录后即可搜索播放、导入歌单，并用 Subsonic 客户端连接。</p>'
       + '<div class="field"><div class="field__label">用户名</div><input class="input" id="loginUser" autocomplete="username" value="' + esc(presetUser) + '"></div>'
       + '<div class="field"><div class="field__label">密码</div><input class="input" id="loginPwd" type="password" autocomplete="current-password"></div>'
       + '<button class="btn btn--block" id="btnLogin" style="margin-top:8px">登录</button>'
@@ -2881,6 +2897,7 @@
   function init() {
     Player.init()
     bindGlobalEvents()
+    watchBrandForLogin()
     // 安卓壳里不注册 Service Worker：页面资源整包都在 APK 内（由原生按需提供），
     // 离线本来就成立；再叠一层 SW 缓存只会带来「改了包但页面还是旧的」这类时序问题。
     if ('serviceWorker' in navigator && !window.LX_NATIVE) {

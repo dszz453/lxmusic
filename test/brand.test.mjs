@@ -192,6 +192,25 @@ console.log('\n== 5. manifest 按宿主合成 ==')
   ok('合成时会改 id（否则两个客户端装同一台设备会互相顶掉）', /raw\.id\s*=/.test(BRAND))
   ok('静态 manifest.json 的兜底名已是 music-edge（CF 线上直接吃这份）',
     /"short_name":\s*"music-edge"/.test(MANIFEST))
+
+  /**
+   * 浏览器模式首屏**不得**同步应用 title/manifest。
+   *
+   * 原因（实测踩到）：浏览器上同步判据猜不出 Docker 与 CF（两者 LX_REMOTE 都是假），
+   * 猜的结果在 CF 上是 docker → 同步应用等于把静态的 music-edge 覆盖成 LX-MUSIC，
+   * 接口回来再纠正 —— 线上出现「music-edge → LX-MUSIC → music-edge」两次切换，
+   * 中间还是个**错名字**。所以立即生效段必须只在壳内（LX_NATIVE，判据可靠）执行。
+   */
+  const tail = BRAND.slice(BRAND.indexOf('立即生效'))
+  ok('立即生效段被 LX_NATIVE 守卫（浏览器模式不动静态落点，防闪错名）',
+    /if \(global\.LX_NATIVE\)/.test(tail))
+  ok('浏览器模式的 manifest 合成延后到服务端确认（applyHost 里做）',
+    /manifestDone\s*=\s*true[\s\S]{0,120}installManifest/.test(BRAND.slice(BRAND.indexOf('applyHost ='))))
+
+  // 登录页大标题的竞态：首屏渲染时品牌可能还是猜的，确认后要纠正
+  ok('登录页 h1 带 id（确认后可被纠正）', /<h1 id="loginBrand">/.test(APP))
+  ok('app.js 监听 lx-brand 事件纠正登录页标题', /watchBrandForLogin/.test(APP) && /addEventListener\('lx-brand'/.test(APP))
+  ok('init() 里注册了品牌监听', /init\(\)\s*\{[\s\S]{0,200}watchBrandForLogin\(\)/.test(APP))
 }
 
 console.log('\n== 6. APK 构建清单跟得上 ==')

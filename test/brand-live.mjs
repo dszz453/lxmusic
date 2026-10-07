@@ -47,12 +47,25 @@ function ok(name, cond, extra) {
 
 const PORT = 9900 + Math.floor(Math.random() * 90)
 const profile = fs.mkdtempSync(path.join(os.tmpdir(), 'lxbrand-'))
+/**
+ * 额外的 Chrome 启动参数（用 @@ 分隔多条，LX_CHROME_EXTRA 传入）。
+ *
+ * 为什么用 @@ 而不是空格：有的参数值本身就带空格（host-resolver-rules 的
+ * 「MAP 域名 [IP]」），按空格切会把一条参数拆成三段。
+ *
+ * 为什么需要：测 localhost 时要 --no-proxy-server（直连本机）；
+ * 测 CF 线上时沙箱 IPv4 到 Cloudflare 不通，得靠 host-resolver-rules
+ * 把域名钉到已知可达的边缘 IPv6 上，例如：
+ *   LX_CHROME_EXTRA='--host-resolver-rules=MAP music.zyplnn.dpdns.org [2606:4700:3030::6815:ada]'
+ */
+const EXTRA = (process.env.LX_CHROME_EXTRA || '').split('@@').map((s) => s.trim()).filter(Boolean)
 const chrome = spawn(CHROME, [
   '--headless=new', '--disable-gpu', '--no-first-run', '--no-default-browser-check',
   '--disable-extensions', '--mute-audio',
   `--remote-debugging-port=${PORT}`, `--user-data-dir=${profile}`,
   '--no-proxy-server', '--proxy-bypass-list=<-loopback>', '--ignore-certificate-errors',
   '--window-size=390,844', 'about:blank',
+  ...EXTRA,
 ], { stdio: 'ignore' })
 
 let wsUrl = ''

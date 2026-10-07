@@ -146,10 +146,25 @@
 
   /* ---------------- 服务端确认与纠正 ---------------- */
 
+  /** manifest 是否已经合成过（避免确认路径与立即路径重复造 blob） */
+  var manifestDone = false
+
+  /**
+   * 标题是否已经被我们写过。
+   *
+   * 为什么需要它（Docker 上实测踩到）：浏览器模式的首屏**不动** title（防闪错名），
+   * 于是页面标题是 index.html 的静态名（music-edge）。确认回来时若只看
+   * 「品牌键变没变」—— Docker 上兜底猜的恰好也是 docker，键没变 → 不应用 →
+   * **Docker 的标题永远停在静态的 music-edge**。
+   * 所以第一次确认必须无条件应用一次：比较的对象是「静态名 vs 确认名」，
+   * 不是「猜的键 vs 确认的键」。
+   */
+  var titleApplied = false
+
   /**
    * 用服务端回的 host 纠正品牌。由 app.js 在 /api/version 返回后调用。
    *
-   * 只在**真的变了**的时候派发事件 —— 每次首屏都发一遍会让监听者白干活，
+   * 「派事件」只在键真的变了的时候 —— 每次首屏都发一遍会让监听者白干活，
    * 而「名字没变」是最常见的情况，没必要惊动重渲染。
    *
    * @param {string} rawHost 服务端 /api/version 的 host 字段
@@ -161,10 +176,19 @@
     var changed = key !== host
     host = key
     resolved = true
-    if (changed) {
-      // 名字变了，已经渲染出来的静态落点要跟着改
-      brand.applyDocumentTitle('')
+    // manifest 现在合成：浏览器模式下立即执行段不再碰它（见文件尾），
+    // 确认之后才合成，装出来的 PWA 名字就一定是对的
+    if (!manifestDone) {
+      manifestDone = true
       try { installManifest() } catch (e) { /* 忽略 */ }
+    }
+    // 标题：键变了、或还一次都没写过（浏览器模式首屏没动过它）都要写。
+    // 只看 changed 的话，Docker 上「猜的=确认的」会让静态名永远不被纠正。
+    if (changed || !titleApplied) {
+      titleApplied = true
+      brand.applyDocumentTitle('')
+    }
+    if (changed) {
       try {
         global.dispatchEvent(new CustomEvent('lx-brand', { detail: { host: host, name: brand.name } }))
       } catch (e) { /* 老浏览器没有 CustomEvent，忽略 */ }
@@ -176,14 +200,30 @@
 
   /* ---------------- 立即生效 ---------------- */
 
-  // 这两件事要赶在浏览器取 manifest、以及 app.js 渲染首屏之前做完。
-  // 此时拿到的名字可能还是兜底猜的；接口回来后 applyHost 会纠正并重刷。
+  /**
+   * 立即应用的范围**分宿主**，这是防「闪错误名字」的关键：
+   *
+   *   · 壳（LX_NATIVE）—— 判据**可靠**（Java 桥就在那儿，不依赖网络），
+   *     立即应用 title 与 manifest，零闪烁。
+   *
+   *   · 浏览器 —— 同步判据**猜不出** Docker 与 CF 的区别（两者 LX_REMOTE 都是假），
+   *     此刻应用只会把 index.html 的静态名（music-edge）覆盖成**猜的**。
+   *     在 CF 线上那是一次「music-edge → LX-MUSIC → music-edge」的两次切换，
+   *     中间还是个错名字。所以浏览器模式**什么都不动**：静态标题保持原样，
+   *     manifest 等服务端确认后再合成（applyHost 里做）。
+   *     代价是 Docker 网页首屏短暂显示静态的 music-edge、确认后切到 LX-MUSIC ——
+   *     一次切换、且切换前显示的不是「错误的 Docker 名」，比 CF 闪错名好得多。
+   */
   try {
-    brand.applyDocumentTitle('')
-    if (document.readyState === 'loading') {
-      document.addEventListener('DOMContentLoaded', installManifest, { once: true })
-    } else {
-      installManifest()
+    if (global.LX_NATIVE) {
+      titleApplied = true
+      brand.applyDocumentTitle('')
+      manifestDone = true
+      if (document.readyState === 'loading') {
+        document.addEventListener('DOMContentLoaded', installManifest, { once: true })
+      } else {
+        installManifest()
+      }
     }
   } catch (e) { /* 非浏览器环境，忽略 */ }
 })(window)
