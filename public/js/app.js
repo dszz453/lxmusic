@@ -2002,7 +2002,11 @@
     if (!host) return   // 用户已经离开设置页
     try {
       const v = await API.version()
-      const same = !v.version || v.version === window.LX_VERSION
+      // 浏览器模式的 LX_VERSION 是 'web' 占位（真实版本只存在于壳里），
+      // 网页客户端与服务端出自同一次部署、天然同步 —— 拿占位去比必然「不一致」，
+      // 之前每个浏览器用户都会看到假的「⚠ 与服务端版本不一致」，这里只在壳里才比。
+      const clientVer = String(window.LX_VERSION || '')
+      const same = !v.version || clientVer === 'web' || v.version === clientVer
       host.innerHTML = '服务端 ' + esc(v.full || v.version || '?')
         + (same ? '' : '<span style="color:var(--warn,#e6a23c)"> ⚠ 与服务端版本不一致</span>')
       window.LX_VERSION_LINE = (window.LX_VERSION_LINE || '') + ' · 服务端 ' + (v.version || '?')
