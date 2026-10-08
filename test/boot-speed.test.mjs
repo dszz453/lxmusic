@@ -153,6 +153,56 @@ ok('App.user 取自 me 的结果（不再取自被吞掉的局部变量）',
 ok('App.ready 在身份确定之后才置位',
   boot.indexOf('App.ready = true') > boot.indexOf('App.user = meRes.user'))
 
+/* ============================================================
+   4. 客户端首屏：别再解析 1.9 MB 用不到的本机后端
+   ============================================================ */
+
+console.log('\n== 4. 客户端远程档案：不加载本机后端那两个大文件（合计 1.9 MB）==')
+
+const CA = stripComments(read('client/src/com/zyplnn/lxclient/ClientActivity.java'))
+const shell = sliceBetween(CA, 'private String injectClientShell(', 'private WebResourceResponse serveAsset(')
+
+ok('injectClientShell 切出来了（否则下面几条是空断言）', shell.length > 500)
+ok('远程档案下摘掉 plugins.data.js 的 script 标签',
+  /replace\([^)]*plugins\.data\.js/.test(shell))
+ok('远程档案下摘掉 backend.bundle.js 的 script 标签',
+  /replace\([^)]*backend\.bundle\.js/.test(shell))
+ok('摘除被 !builtin 守着（老壳走内置模式，这两个文件是命根子）',
+  /if\s*\(\s*!\s*builtin\s*\)/.test(shell))
+
+const NJ = stripComments(read('public/js/native.js'))
+const njBoot = sliceBetween(NJ, 'function boot() {', 'function waitForLxp(')
+
+ok('native.js 的 boot() 切出来了（否则下一条是空断言）', njBoot.length > 100)
+ok('远程模式下 boot() 直接放行、不碰本机后端与插件预置（这才是「摘掉」成立的前提）',
+  /if\s*\(\s*serverBase\s*\)\s*\{[\s\S]{0,500}?releaseBootstrap\s*\(\s*\)[\s\S]{0,200}?return/.test(njBoot))
+ok('LXBackend 的消费者仍只有本机侧（远程模式下没人再读它）',
+  !/LXBackend/.test(stripComments(read('public/js/util.js')))
+  && !/LXBackend/.test(stripComments(read('public/js/player.js')))
+  && !/LXBackend/.test(stripComments(read('public/js/app.js'))))
+ok('LX_PLUGIN_DATA 的消费者仍只有 seedPlugins 那条路（远程模式读不到它）',
+  (stripComments(read('public/js/native.js')).match(/LX_PLUGIN_DATA/g) || []).length === 1)
+
+/* ============================================================
+   5. 首屏空白：boot 异常要兜底，插件预置不许抢首屏
+   ============================================================ */
+
+console.log('\n== 5. 首屏不许留白：boot 异常兜底 + 插件预置让路 ==')
+
+const initFn = sliceBetween(stripComments(APPJS), 'function init()', 'global.App = App')
+
+ok('init() 切出来了（否则下面两条是空断言）', initFn.length > 100)
+ok('boot() 挂了也兜底再渲染一次当前路由（否则 #view 永远空着，只能靠点底栏救）',
+  /boot\s*\(\s*\)\s*\.\s*catch/.test(initFn) && /route\s*\(\s*\)\s*\.\s*catch/.test(initFn))
+ok('不再是无 catch 的裸 boot()（异常会把整屏静默吞掉）',
+  !/^\s*boot\s*\(\s*\)\s*$/m.test(initFn))
+
+ok('seedPlugins 不再直接挂在 bootstrap 链上（会跟首屏渲染抢主线程）',
+  !/\.then\s*\(\s*\(\s*\)\s*=>\s*seedPlugins\s*\(\s*\)\s*\)/.test(njBoot))
+ok('seedPlugins 改到空闲时才跑（requestIdleCallback，老 WebView 回退到定时器）',
+  /requestIdleCallback/.test(njBoot) && /setTimeout\s*\(\s*run\s*,/.test(njBoot))
+ok('种子插件导入本身还在（别连同「延后」一起删掉）', /seedPlugins\s*\(\s*\)/.test(NJ))
+
 console.log('\n' + '='.repeat(62))
 if (fails.length === 0) {
   console.log(`✅ 首屏启动速度护栏：${pass} 项全部通过`)

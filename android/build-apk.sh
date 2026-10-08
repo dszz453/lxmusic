@@ -37,6 +37,25 @@ W() { cygpath -w "$1"; }                          # MSYS 路径 → Windows 路�
 LIST_WIN() { find "$@" | while read -r f; do cygpath -w "$f"; done; }
 
 APP_NAME="music-edge"
+# 1.6：修「客户端首页要手动点一下底栏才加载 / 我的歌单要等十秒」。
+#   两个现象同一个根源：**客户端每次冷启动都在解析 1.9 MB 根本用不到的东西**。
+#   ① 远程档案下页面里仍挂着本机后端那两个文件 —— backend.bundle.js（1.29 MB，
+#      挂 window.LXBackend）与 plugins.data.js（596 KB，挂 window.LX_PLUGIN_DATA）。
+#      而它们的唯一消费者都在 native.js 的**本机分支**里：远程模式在 boot() 第一句
+#      就 releaseBootstrap() 返回了，这两个全局一个都不会被读到。两者又都是**同步**
+#      script，解析与执行都排在首屏之前；浏览器那边有 HTTP 缓存 + SW，第二次打开几乎
+#      不花这笔钱，而客户端是把静态资源从包内直出（shouldInterceptRequest），没有那层
+#      缓存 —— 于是每次冷启动都白白解析 1.9 MB。现在按档案类型在注入 HTML 时摘掉
+#      （老壳走内置模式，那两个文件是命根子，保留）。
+#   ② 内置模式首次启动时 seedPlugins() 要起 24 个 Worker、逐个求值 542 KB 混淆脚本，
+#      正好和首页渲染抢主线程 —— 表现就是「首页转好几秒」「点歌单要等十秒」。改成
+#      主线程空闲时再跑（requestIdleCallback，老 WebView 退回 2.5 s 定时器）；
+#      插件晚几秒可用不影响听歌（用户从打开到点播放本来也要这么久）。
+#   另外给 init() 里的 boot() 补了兜底：启动流程中任何**未预期**异常都不许把页面留在
+#   空白上。首次加载没有任何 hashchange，boot 一旦中断就只剩顶栏 + 底栏 + 空内容区，
+#   用户唯一的自救方式是点一下底栏（那会重新路由）—— 这正是报障里
+#   「要点一下才发现」的形状，一个从没被观察到的异常被掩盖成了玄学体验。
+#   护栏：test/boot-speed.test.mjs 24 → 38 项（新增第 4、5 节）。
 # 1.5：修「安卓客户端首页比网页（PWA）慢一大截」。两处都是**接线方式**的代价，
 #   不是哪个功能坏了 —— 所以单元测试永远抓不到，只能靠静态审计钉住。
 #  ① 客户端的 /api 请求逐个冷启动。HttpBridge / Handshake 读完响应就 disconnect()

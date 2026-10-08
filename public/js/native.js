@@ -676,8 +676,24 @@
         releaseBootstrap()          // 放行所有 /api/* 请求
         return waitForLxp()
       })
-      .then(() => seedPlugins())
-      .catch(e => log('插件预置异常：' + ((e && e.message) || e)))
+      .then(() => {
+        /**
+         * 预置内置插件是「后台工程」，不该和首屏抢主线程。
+         *
+         * 24 个插件要逐个起 Web Worker、求值 542 KB 混淆脚本，还要写 localStorage ——
+         * 在这一步直接跑，正好和首页的渲染撞在一起，表现就是「首页转好几秒才出来」
+         * 「点开我的歌单要等十秒」。插件晚几秒可用不影响听歌（用户从打开到点播放
+         * 至少也要这么久），所以延到主线程空闲时再做。
+         * 没有 requestIdleCallback 的老 WebView 退回定时器 —— 一样是「等首屏先画」。
+         */
+        const run = () => seedPlugins()
+          .catch(e => log('插件预置异常：' + ((e && e.message) || e)))
+        if (typeof global.requestIdleCallback === 'function') {
+          global.requestIdleCallback(run, { timeout: 5000 })
+        } else {
+          global.setTimeout(run, 2500)
+        }
+      })
   }
 
   function waitForLxp(timeout = 8000) {

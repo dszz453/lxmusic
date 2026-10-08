@@ -768,6 +768,31 @@ public class ClientActivity extends Activity {
         String layer = "<script src=\"/js/client-layer.js\"></script>";
 
         String out = html;
+
+        /**
+         * 远程档案下，把「本机后端」那两个大文件从页面里摘掉。
+         *
+         * 为什么能摘：它们唯一的消费者都在 native.js 的**本机分支**里，而远程模式
+         * 在 native.js 第 9 节的 boot() 第一句就 releaseBootstrap() 返回了 ——
+         *   · backend.bundle.js 挂 window.LXBackend，只被 localCall() 调用；
+         *   · plugins.data.js   挂 window.LX_PLUGIN_DATA，只被 seedPlugins() 读取，
+         *     而 seedPlugins 只在内置模式预置插件时才跑。
+         * 已逐一 grep 过消费点，远程模式下一个都用不到。
+         *
+         * 为什么必须摘：两者合计 **1.9 MB**（backend.bundle.js 1.29 MB +
+         * plugins.data.js 596 KB），而且都是**同步** script —— 解析与执行都卡在
+         * 首屏之前。浏览器那边有 HTTP 缓存 + Service Worker，第二次打开几乎不花
+         * 这笔钱；本客户端把静态资源从包内直出（shouldInterceptRequest），没有那层
+         * 缓存，于是**每次冷启动都要重新解析这 1.9 MB**。这正是「同一个前端，网页
+         * 秒开、App 要等、点一下底栏才出来」的主因。
+         *
+         * 老壳（music-edge）走内置模式，这两个文件是命根子，所以只在远程档案下摘。
+         */
+        if (!builtin) {
+            out = out.replace("<script src=\"/js/plugins.data.js\"></script>", "")
+                    .replace("<script src=\"/js/backend.bundle.js\"></script>", "");
+        }
+
         int head = out.indexOf("<head>");
         if (head >= 0) {
             out = out.substring(0, head + 6) + boot + css + out.substring(head + 6);

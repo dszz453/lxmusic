@@ -3193,7 +3193,20 @@
         navigator.serviceWorker.register('/sw.js').catch(() => {})
       })
     }
-    boot()
+    /**
+     * boot 里的任何**未预期**异常都不许把页面停在空白上。
+     *
+     * 为什么这条兜底必须存在：`route()` 只有两条触发路径 —— boot 走到最后一步，
+     * 以及 hashchange。首次加载时没有任何 hash 变化，所以 boot 一旦在渲染之前
+     * 中断（某个我们没预料到的异常），`#view` 就一直是空的：顶栏底栏都在、
+     * 内容区空白。用户唯一的自救方式是**点一下底栏的标签**（那会派 hashchange
+     * 重新路由，于是"点一下才加载"）—— 现象被掩盖成一个玄学体验，根因却是一个
+     * 从未被观察到的异常。所以这里必须兜住，并把它印到控制台。
+     */
+    boot().catch((e) => {
+      try { console.warn('[lx] 启动流程异常，改为直接渲染当前路由：', e) } catch { /* ignore */ }
+      route().catch(() => {})
+    })
   }
 
   global.App = App
