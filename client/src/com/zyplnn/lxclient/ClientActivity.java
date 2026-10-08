@@ -269,16 +269,25 @@ public class ClientActivity extends Activity {
      *
      * 搜索胶囊点了走跨端层的 #/search —— 位置、形状、点击行为都跟网页版一致，
      * 用户从浏览器换到 App 不会找不到搜索在哪。
+     *
+     * ── 高度（老板反馈「顶部空白太多」）──────────────────────────
+     * 高 = Ui.TOPBAR_H（46dp，比网页版的 52px 收一档），按钮 Ui.TOPBAR_BTN。
+     *
+     * 更要紧的是**状态栏那一份**：本工程的主题不是 edge-to-edge，系统已经把内容区
+     * 摆到状态栏下面了，原来又按 statusBarHeight() 补了一份上内距 → **双份状态栏**，
+     * 顶上白白多出一条和状态栏一样高的空白。现在改成 wrap_content + minHeight，
+     * 状态栏内距交给 Ui.fitStatusBarTop 按真实 inset 补（这种窗口里 inset 是 0，等于不补）。
      */
     private View buildTopBar() {
         LinearLayout bar = new LinearLayout(this);
         bar.setOrientation(LinearLayout.HORIZONTAL);
         bar.setGravity(android.view.Gravity.CENTER_VERTICAL);
         bar.setBackgroundColor(Ui.color(this, R.color.surface));
-        int sb = Ui.statusBarHeight(this);
-        bar.setPadding(Ui.dp(this, 6), sb, Ui.dp(this, 6), 0);
+        bar.setMinimumHeight(Ui.dp(this, Ui.TOPBAR_H));
+        bar.setPadding(Ui.dp(this, 6), 0, Ui.dp(this, 6), 0);
         bar.setLayoutParams(new LinearLayout.LayoutParams(
-                ViewGroup.LayoutParams.MATCH_PARENT, Ui.dp(this, 52) + sb));
+                ViewGroup.LayoutParams.MATCH_PARENT, ViewGroup.LayoutParams.WRAP_CONTENT));
+        Ui.fitStatusBarTop(bar);
 
         // 左：菜单。网页那个抽屉（#btnMenu 背后）还有用 —— 插件导入、音源选择都在里面，
         // 所以原生按钮直接去点那个被隐藏的按钮，逻辑一份不重写。
@@ -324,7 +333,7 @@ public class ClientActivity extends Activity {
         wrap.setContentDescription(desc);
         wrap.setBackground(Ui.ripple(this, Ui.shape(this, Color.TRANSPARENT, 999, 0, 0), 0x14000000));
         wrap.setOnClickListener(cb);
-        wrap.setLayoutParams(new LinearLayout.LayoutParams(Ui.dp(this, 42), Ui.dp(this, 42)));
+        wrap.setLayoutParams(new LinearLayout.LayoutParams(Ui.dp(this, Ui.TOPBAR_BTN), Ui.dp(this, Ui.TOPBAR_BTN)));
         return wrap;
     }
 
@@ -403,8 +412,12 @@ public class ClientActivity extends Activity {
     /**
      * 底部导航条：四项，跟网页 tabbar 一一对应。
      *
-     * 高度 = 52dp + 系统导航栏高度（手势条/虚拟键区域）—— 不加后面这个的话，
-     * 在虚拟键机型上底栏会被系统栏压住，用户点不到最后一行文字。
+     * 高度 = 52dp + **真实导航栏 inset**（手势条 / 虚拟键区域）。
+     *
+     * 原来写的是 `52 + navBarHeight()`（读资源高度）。本工程不是 edge-to-edge，
+     * 系统已经把内容区摆在导航栏上面了，再补一份 → 底栏下面多一条和导航栏一样高的白色空白。
+     * 现在改成 inset 驱动（见 Ui.fitNavBarBottom）：这种窗口里 inset 是 0，等于不补；
+     * 哪天真改成 edge-to-edge 也会自动补上。
      */
     private View buildBottomNav() {
         LinearLayout nav = new LinearLayout(this);
@@ -419,9 +432,8 @@ public class ClientActivity extends Activity {
         wrap.addView(top, new LinearLayout.LayoutParams(
                 ViewGroup.LayoutParams.MATCH_PARENT, Math.max(1, Ui.dp(this, 0.7f))));
         wrap.addView(nav, new LinearLayout.LayoutParams(
-                ViewGroup.LayoutParams.MATCH_PARENT,
-                Ui.dp(this, 52) + Ui.navBarHeight(this)));
-        nav.setPadding(0, 0, 0, Ui.navBarHeight(this));
+                ViewGroup.LayoutParams.MATCH_PARENT, Ui.dp(this, Ui.NAV_H)));
+        Ui.fitNavBarBottom(nav, Ui.dp(this, Ui.NAV_H));
 
         tabViews = new LinearLayout[TAB_KEYS.length];
         tabIcons = new ImageView[TAB_KEYS.length];
@@ -729,13 +741,18 @@ public class ClientActivity extends Activity {
          * 隐藏网页自带的顶栏与底栏（原生接管），并把版式里为它们预留的空间收回来：
          *   · --safe-top / --safe-bottom 归零 —— 状态栏与手势条现在由原生顶栏/底栏消化，
          *     网页再各让一份就会出现「底下莫名多一条白」。
+         *   · **--tabbar-h 也必须归零**（这条最容易漏，漏了表现是「迷你播放条悬在半空」）：
+         *     网页里 .miniplayer 和 .toast 都按「底栏是网页自己画的」来定位，
+         *     bottom 里带着一个 --tabbar-h。客户端底栏是原生的、在 WebView **外面**，
+         *     网页里再让出 52px，迷你条就会浮在底栏上方 58px 处，跟下面的空白连成一片、
+         *     看着完全不贴底。归零后它才真正落到原生底栏的头顶上（6px，与网页版一致）。
          *   · .view 的 padding-bottom 原本给「迷你播放条 + 底栏」留位置，底栏没了，
          *     只留迷你条的高度。
          *   · #serverBlock 是网页设置页里的「服务端」卡片 —— 客户端里由原生
          *     「服务器连接」页管理，留着两个入口必然打架（改了原生那边、网页这边还显示旧值）。
          */
         String css = "<style id=\"lxClientChrome\">"
-                + ":root{--safe-top:0px !important;--safe-bottom:0px !important}"
+                + ":root{--safe-top:0px !important;--safe-bottom:0px !important;--tabbar-h:0px !important}"
                 + ".topbar{display:none !important}"
                 + ".tabbar{display:none !important}"
                 + ".view{padding-bottom:calc(var(--mini-h) + 10px) !important}"

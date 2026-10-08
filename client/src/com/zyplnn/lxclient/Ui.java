@@ -50,13 +50,43 @@ public final class Ui {
                 ctx.getResources().getDisplayMetrics()));
     }
 
-    /** 状态栏高度。用它做顶栏的上内距，避免内容钻到状态栏底下 */
+    /**
+     * 顶栏内容区高度（不含状态栏），单位 dp。
+     *
+     * 网页版是 52px；客户端收窄到 46dp —— 老板反馈「客户端顶部空白太多，那一行显得空」。
+     * 主界面顶栏（ClientActivity.buildTopBar）与原生子页面的标题栏（titleBar）**共用**这个值，
+     * 否则从主界面点进设置页时顶栏会忽然又变高，看起来像两个 App。
+     */
+    public static final int TOPBAR_H = 46;
+
+    /** 顶栏里的圆形图标按钮直径（dp）。原 42，跟着顶栏一起收一档 */
+    public static final int TOPBAR_BTN = 40;
+
+    /**
+     * 底部导航条内容高度（不含导航栏 inset），单位 dp。与网页的 `--tabbar-h: 52px` 对齐。
+     * 导航栏那一份由 {@link #fitNavBarBottom(View, int)} 按真实 inset 补。
+     */
+    public static final int NAV_H = 52;
+
+    /**
+     * 状态栏高度（读系统资源 status_bar_height）。
+     *
+     * ⚠️ **不要拿它当 padding 用**（见 fitStatusBarTop 的详细说明）：
+     * 本工程不是 edge-to-edge，系统已经把内容区摆到状态栏下面了，再补一份内距就是**双份**，
+     * 表现正是「顶部一大条空白」。要避开状态栏请用 {@link #fitStatusBarTop(View)}。
+     */
     public static int statusBarHeight(Context ctx) {
         int id = ctx.getResources().getIdentifier("status_bar_height", "dimen", "android");
         return id > 0 ? ctx.getResources().getDimensionPixelSize(id) : dp(ctx, 24);
     }
 
-    /** 底部导航栏（手势条）高度，底栏要用它把内容顶上去 */
+    /**
+     * 底部导航栏（手势条 / 虚拟键）高度（读系统资源 navigation_bar_height）。
+     *
+     * ⚠️ 同上：**不要拿它当 padding 用**。本工程不是 edge-to-edge，系统已经把内容区
+     * 摆在导航栏上面了，再补一份就是**底下多一条空白**。底栏请用
+     * {@link #fitNavBarBottom(View, int)}。
+     */
     public static int navBarHeight(Context ctx) {
         int id = ctx.getResources().getIdentifier("navigation_bar_height", "dimen", "android");
         return id > 0 ? ctx.getResources().getDimensionPixelSize(id) : dp(ctx, 0);
@@ -141,7 +171,9 @@ public final class Ui {
 
     /**
      * 原生页面的根容器：垂直的 LinearLayout 装在 ScrollView 里，整体灰底。
-     * 返回的容器已经带了状态栏内距 —— 页面代码不用自己操心刘海屏。
+     *
+     * 这里**不**加状态栏内距：内容区的第一块是 {@link #titleBar}，由它按真实 inset 补
+     * （写在根容器上会让整页内容一起下移，标题栏反而悬在中间）。
      *
      * @param padBottom 内容底部额外留白（避免最后一行贴着手势条）
      */
@@ -160,20 +192,25 @@ public final class Ui {
     }
 
     /**
-     * 顶栏：白底、左返回、居中标题、右侧可选文字按钮。
+     * 顶栏：白底、左返回、居中标题、右侧可选文字按钮。高度与主界面顶栏同档（Ui.TOPBAR_H）。
      *
      * 为什么标题居中而不是靠左：和跨端页面里那些二级页的标题位置一致，
      * 切换页面时标题不会左右跳。
+     *
+     * 高度用 wrap_content + minHeight 算、状态栏内距交给 fitStatusBarTop（按真实 inset 补）——
+     * 原来写的是 height = 52 + statusBarHeight()，在非 edge-to-edge 的窗口里是**双份状态栏**，
+     * 顶上会多出一条空白。
      */
     public static View titleBar(Activity a, String title, String rightText, View.OnClickListener right) {
         LinearLayout bar = new LinearLayout(a);
         bar.setOrientation(LinearLayout.HORIZONTAL);
         bar.setGravity(Gravity.CENTER_VERTICAL);
         bar.setBackgroundColor(color(a, R.color.surface));
-        int sb = statusBarHeight(a);
-        bar.setPadding(dp(a, 4), sb, dp(a, 4), 0);
+        bar.setMinimumHeight(dp(a, TOPBAR_H));
+        bar.setPadding(dp(a, 4), 0, dp(a, 4), 0);
         bar.setLayoutParams(new LinearLayout.LayoutParams(
-                ViewGroup.LayoutParams.MATCH_PARENT, dp(a, 52) + sb));
+                ViewGroup.LayoutParams.MATCH_PARENT, ViewGroup.LayoutParams.WRAP_CONTENT));
+        fitStatusBarTop(bar);
 
         ImageView back = icon(a, R.drawable.ic_back, color(a, R.color.text), 24);
         LinearLayout backWrap = new LinearLayout(a);
@@ -186,7 +223,7 @@ public final class Ui {
                 a.finish();
             }
         });
-        bar.addView(backWrap, new LinearLayout.LayoutParams(dp(a, 44), dp(a, 44)));
+        bar.addView(backWrap, new LinearLayout.LayoutParams(dp(a, TOPBAR_BTN), dp(a, TOPBAR_BTN)));
 
         TextView t = text(a, title, 17, color(a, R.color.text), true);
         t.setGravity(Gravity.CENTER);
@@ -197,13 +234,13 @@ public final class Ui {
             TextView r = text(a, rightText, 15, color(a, R.color.brand), false);
             r.setGravity(Gravity.CENTER);
             r.setPadding(dp(a, 12), 0, dp(a, 12), 0);
-            r.setMinWidth(dp(a, 44));
+            r.setMinWidth(dp(a, TOPBAR_BTN));
             r.setBackground(ripple(a, shape(a, Color.TRANSPARENT, 999, 0, 0), 0x14EC4141));
             if (right != null) r.setOnClickListener(right);
             bar.addView(r, new LinearLayout.LayoutParams(
-                    ViewGroup.LayoutParams.WRAP_CONTENT, dp(a, 44)));
+                    ViewGroup.LayoutParams.WRAP_CONTENT, dp(a, TOPBAR_BTN)));
         } else {
-            bar.addView(new View(a), new LinearLayout.LayoutParams(dp(a, 44), dp(a, 1)));
+            bar.addView(new View(a), new LinearLayout.LayoutParams(dp(a, TOPBAR_BTN), dp(a, 1)));
         }
         return bar;
     }
@@ -364,18 +401,74 @@ public final class Ui {
         }
     }
 
-    /** 让某个视图的顶部避开状态栏（少数不适合用 titleBar 的场景） */
-    public static void padStatusBar(final View v) {
-        if (Build.VERSION.SDK_INT >= 21) {
-            v.setOnApplyWindowInsetsListener(new View.OnApplyWindowInsetsListener() {
-                @Override
-                public WindowInsets onApplyWindowInsets(View view, WindowInsets insets) {
-                    int top = insets.getSystemWindowInsetTop();
-                    view.setPadding(view.getPaddingLeft(), top,
-                            view.getPaddingRight(), view.getPaddingBottom());
-                    return insets;
+    /**
+     * 顶栏顶部避开状态栏 —— 只补 padding-top，高度交给 wrap_content + minHeight 算。
+     *
+     * 高度用 minHeight 而不是写死「52 + statusBarHeight()」是**有意的**：
+     * 见 fitInsets 里那段「不能用 statusBarHeight() 当 padding」的说明。
+     *
+     * 用法：`bar.setMinimumHeight(dp(a, TOPBAR_H)); bar.setPadding(l, 0, r, 0); fitStatusBarTop(bar);`
+     */
+    public static void fitStatusBarTop(final View v) {
+        fitInsets(v, 0, false);
+    }
+
+    /**
+     * 底栏底部避开导航栏（手势条 / 虚拟键），并把补出来的高度算进 layoutParams。
+     *
+     * @param baseHeightPx 内容本身的高度（不含 inset）。传 0 表示「高度不用管」（靠 wrap_content）。
+     */
+    public static void fitNavBarBottom(final View v, int baseHeightPx) {
+        fitInsets(v, baseHeightPx, true);
+    }
+
+    /**
+     * 按**真实窗口 inset** 在**一侧**补内距，可选地把补出来的高度算进 layoutParams。
+     *
+     * ── 为什么不能拿 statusBarHeight() / navBarHeight() 当 padding ──────
+     * 本工程的主题是 Theme.Material.Light.NoActionBar，**不是 edge-to-edge**
+     * （没有 FLAG_LAYOUT_NO_LIMITS、没有 windowTranslucentStatus、也不调
+     * decorFitsSystemWindows(false)，aapt2 link 的 targetSdk 是 34 ——
+     * 系统只在 target 35+ 才强制 edge-to-edge）。
+     *
+     * 这种窗口里，DecorView 已经把内容区摆到状态栏**下面**、导航栏**上面**了，
+     * 并且把 inset 消费掉 —— 子视图拿到的是 0。此时再按资源高度补一份内距，
+     * 就是**双份系统栏**：顶上多一条和状态栏一样高的空白、底下多一条和导航栏一样高的空白。
+     * 老板反馈的「客户端顶部空白太多」就是顶栏那一份。
+     *
+     * 走 inset 回调则在两种模式下都对：非 edge-to-edge → inset 为 0，等于不补；
+     * 哪天真改成 edge-to-edge → 拿到真实高度，自动补上，不用再回来改这里。
+     *
+     * 只动**一侧**也是刻意的：顶栏不该被底部 inset 撑高，底栏也不该被顶部 inset 撑高。
+     *
+     * @param baseHeightPx > 0 时把 layoutParams.height 设为 baseHeightPx + 该侧 inset；
+     *                      ≤ 0 时不动高度
+     * @param bottomSide    true = 处理底部 inset（底栏），false = 处理顶部 inset（顶栏）
+     */
+    private static void fitInsets(final View v, final int baseHeightPx, final boolean bottomSide) {
+        if (Build.VERSION.SDK_INT < 20) return;
+        v.setOnApplyWindowInsetsListener(new View.OnApplyWindowInsetsListener() {
+            @Override
+            public WindowInsets onApplyWindowInsets(View view, WindowInsets insets) {
+                int pad = bottomSide
+                        ? insets.getSystemWindowInsetBottom()
+                        : insets.getSystemWindowInsetTop();
+                int pt = bottomSide ? view.getPaddingTop() : pad;
+                int pb = bottomSide ? pad : view.getPaddingBottom();
+                if (view.getPaddingTop() != pt || view.getPaddingBottom() != pb) {
+                    view.setPadding(view.getPaddingLeft(), pt, view.getPaddingRight(), pb);
                 }
-            });
-        }
+                if (baseHeightPx > 0) {
+                    ViewGroup.LayoutParams lp = view.getLayoutParams();
+                    int want = baseHeightPx + pad;
+                    if (lp != null && lp.height != want) {
+                        lp.height = want;
+                        view.setLayoutParams(lp);
+                    }
+                }
+                return insets;
+            }
+        });
+        v.requestApplyInsets();
     }
 }

@@ -366,6 +366,45 @@ console.log('\n== 8. 底层能力层、权限与主题 ════════�
     /static LinearLayout page\(/.test(UI_JAVA) && /static View titleBar\(/.test(UI_JAVA))
 }
 
+/* ══════════════ 9. 原生外壳版式：系统栏内距 ══════════════ */
+
+console.log('\n== 9. 原生外壳版式：顶栏高度与系统栏内距 ══════════════')
+{
+  const styles = read('client/res/values/styles.xml') + read('client/res/values-v23/styles.xml')
+
+  // 这一整节的前提：客户端**不是 edge-to-edge**，系统已经把内容区摆到状态栏下面、
+  // 导航栏上面了。哪天主题或 targetSdk 变了，这两条会红 —— 那时候正需要回头
+  // 重新审视顶栏/底栏那两份内距（见 Ui.fitSystemBars 的说明）。
+  ok('客户端主题没开半透明状态栏（不是 edge-to-edge）',
+    !/windowTranslucentStatus|windowTranslucentNavigation/.test(styles))
+  ok('aapt2 link 的 targetSdk 仍是 34（35 起系统会强制 edge-to-edge）',
+    /--target-sdk-version 34/.test(BUILD))
+
+  ok('Ui 按**真实窗口 inset** 补系统栏内距（而不是按资源高度硬加）',
+    /private static void fitInsets\(final View v, final int baseHeightPx, final boolean bottomSide\)/.test(UI_JAVA)
+    && /getSystemWindowInsetTop\(\)/.test(UI_JAVA)
+    && /getSystemWindowInsetBottom\(\)/.test(UI_JAVA))
+
+  // 老板反馈「客户端顶部空白太多」——根因就是下面这两条：按资源高度补内距 = 双份系统栏
+  ok('主界面顶栏不再把 statusBarHeight() 当内距（否则顶上多一条和状态栏一样高的空白）',
+    /Ui\.fitStatusBarTop\(bar\)/.test(CLIENT_ACT)
+    && !/Ui\.statusBarHeight\(/.test(CLIENT_ACT))
+  ok('原生子页面的标题栏同样走 fitStatusBarTop（进设置页不会忽然又多一条空白）',
+    /fitStatusBarTop\(bar\)/.test(UI_JAVA)
+    && !/statusBarHeight\(a\)/.test(UI_JAVA)
+    && !/dp\(a, TOPBAR_H\) \+ sb/.test(UI_JAVA))
+  ok('底栏不再把 navBarHeight() 当内距（否则底下多一条和导航栏一样高的空白）',
+    /Ui\.fitNavBarBottom\(nav, Ui\.dp\(this, Ui\.NAV_H\)\)/.test(CLIENT_ACT)
+    && !/Ui\.navBarHeight\(/.test(CLIENT_ACT))
+
+  ok('顶栏/底栏高度只有 Ui.TOPBAR_H / Ui.NAV_H 一个来源（主界面与原生页共用，不许各写各的）',
+    /public static final int TOPBAR_H = \d+/.test(UI_JAVA)
+    && /public static final int NAV_H = \d+/.test(UI_JAVA))
+  ok('顶栏比网页版矮一档（52 → 46dp），按钮跟着收到 40dp',
+    /public static final int TOPBAR_H = 46/.test(UI_JAVA)
+    && /public static final int TOPBAR_BTN = 40/.test(UI_JAVA))
+}
+
 /* ══════════════ 收尾 ══════════════ */
 
 console.log('\n' + '='.repeat(62))
