@@ -214,6 +214,9 @@ public class HttpBridge {
             is = conn.getErrorStream();
         }
         if (is == null) {
+            // 这处**可以**断开：连响应体都没有（204 / 304 这类），连接状态无从判断，
+            // 留回池里也没法确定还能不能用。与下面 finally 里那条规矩不冲突 ——
+            // 那里是「读完了」的正常路径，这里的连接已经被放弃。
             closeQuietly(conn);
             return errorPayload("HTTP " + status + "（无响应体）");
         }
@@ -260,7 +263,23 @@ public class HttpBridge {
             return errorPayload("响应封装失败：" + e.getMessage());
         } finally {
             closeQuietly(is);
-            closeQuietly(conn);
+            /**
+             * ⚠️ 这里**绝不能**再对 conn 调 disconnect()。
+             *
+             * HttpURLConnection.disconnect() 的语义是「关掉这条连接」，底层 socket
+             * 会被直接销毁 —— 于是下一次请求走不到连接池，得把 DNS + TCP 三次握手
+             * + TLS 握手整套重做一遍。实测同一台自建服务器：
+             *
+             *     冷连接（含握手） 418 ms    /    复用连接 20 ms
+             *
+             * 差了 20 倍。而 App 冷启动在渲染首页之前要连发好几个 /api（setupStatus、
+             * me、sources …），每个都重握手就是**上千毫秒的纯等待**；浏览器那边因为
+             * HTTP/2 多路复用 + 连接复用，这笔钱几乎不用花 —— 这就是「同一个前端，
+             * 网页快、App 慢」的主要原因。
+             *
+             * 正确做法：读完响应后只关输入流，连接会自动归还池里（池有上限、
+             * 空闲超时自己会清，不会泄漏）。重定向那处需要换地址，另有显式处理。
+             */
         }
     }
 

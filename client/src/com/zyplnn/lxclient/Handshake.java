@@ -210,14 +210,15 @@ public final class Handshake {
             r.ms = System.currentTimeMillis() - t0;
             r.error = describe(t);
             return r;
-        } finally {
-            if (conn != null) {
-                try {
-                    conn.disconnect();
-                } catch (Throwable ignore) {
-                }
-            }
         }
+        /**
+         * 这里**故意不 disconnect()**。
+         *
+         * disconnect() 的语义是「把这条连接掐掉」，于是紧随其后的第一个 /api
+         * （跨端层的 setupStatus / me）就得把 TCP + TLS 握手重做一遍。
+         * readStream 已经把流关掉了，连接会正常归还给连接池；空闲超时或池满时
+         * 系统自己回收，不会泄漏。详见 HttpBridge 里同一条注释（那里有实测数字）。
+         */
     }
 
     /**
@@ -243,14 +244,8 @@ public final class Handshake {
             return o.optBoolean("needsSetup", false);
         } catch (Throwable t) {
             return false;
-        } finally {
-            if (conn != null) {
-                try {
-                    conn.disconnect();
-                } catch (Throwable ignore) {
-                }
-            }
         }
+        // 同上：不 disconnect()，把这条连接留给跨端层真正的 /api 请求复用。
     }
 
     /** 把异常翻译成用户能看懂的一句话。原始的 "Connection refused" 对普通用户等于没说 */

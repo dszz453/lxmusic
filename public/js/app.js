@@ -3120,8 +3120,27 @@
     // 本函数不 await（见它的说明），所以放这儿不会拖慢首屏。
     bindBrand()
 
-    let status = { needsSetup: false }
-    try { status = await API.setupStatus() } catch { /* ignore */ }
+    const token = API.getToken()
+
+    /**
+     * 「这台服务器初始化了没」与「我这个令牌对应谁」互不依赖，**并行发**。
+     *
+     * 这两个问题原本是一前一后串行的：首屏要多等一个完整来回才轮到渲染。
+     * 在浏览器里这点开销看不出来（HTTP/2 多路复用 + 连接复用），但在安卓客户端里
+     * 每个 /api 都要过一遍原生桥（见 ClientActivity 的 HttpBridge），贵得多 ——
+     * 「网页快、App 慢」有相当一部分就是这里攒出来的。
+     *
+     * 两边的失败语义与原来逐字对齐：
+     *   · setupStatus 挂了 → 当成「已初始化」，继续走登录判断（原来就是 try/catch 吞掉）；
+     *   · me 挂了 → 由下面的分支清令牌跳登录页。**注意 catch 里不清令牌** ——
+     *     服务器 requiresSetup 时 me 必然失败，但那是「要初始化」而不是「令牌坏了」。
+     */
+    const [status, meRes] = await Promise.all([
+      API.setupStatus().catch(() => ({ needsSetup: false })),
+      token
+        ? API.me().then((r) => ({ user: r && r.user })).catch((e) => ({ error: e }))
+        : Promise.resolve({ noToken: true }),
+    ])
 
     if (status.needsSetup) {
       App.user = null
@@ -3130,29 +3149,30 @@
       return
     }
 
-    if (!API.getToken()) {
+    if (!token) {
       App.user = null
       location.hash = '#/login'
       await route()
       return
     }
 
-    try {
-      const me = await API.me()
-      App.user = me.user
-    } catch {
+    if (meRes.error || !meRes.user) {
       API.setToken('')
       App.user = null
       location.hash = '#/login'
       await route()
       return
     }
+    App.user = meRes.user
 
     App.ready = true
-    try {
-      const s = await API.sources()
-      App.sources = s.platforms || []
-    } catch { /* ignore */ }
+    /**
+     * 平台清单**不挡首屏**了。没有任何视图在第一帧读 App.sources：
+     * 首页的内容全部来自 /api/home，平台清单只在设置/筛选类界面用到，那时早已到位。
+     * 早先在这里 await，等于为了一个首屏用不上的东西白等一个来回。
+     * 失败静默 —— 与原来 try/catch 吞掉的行为一致。
+     */
+    API.sources().then((s) => { App.sources = (s && s.platforms) || [] }).catch(() => {})
     Player.loadFavorites().catch(() => {})
     // 远程模式下音源插件在服务器那一侧跑，本机不加载插件池 ——
     // 少一批 Worker 的启动开销，也免得本机那套空池子被误当成「候选源」
