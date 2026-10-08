@@ -384,8 +384,37 @@
   /** 超过这个岁数的缓存直接丢掉：十天前的「每日推荐」没有展示价值，只剩误导 */
   const HOME_CACHE_MAX_AGE = 10 * 24 * 3600 * 1000
 
-  /** 当前账号名 —— 缓存身份的一半（另一半是服务器） */
-  function currentUser() { return (App.user && App.user.username) || '' }
+  /**
+   * 「上一次登录成功的用户名」的存放点。见 currentUser() 的说明。
+   */
+  const LAST_USER_KEY = 'lx.lastUser'
+
+  function lastUserName() {
+    try { return U.store.get(LAST_USER_KEY, '') || '' } catch { return '' }
+  }
+
+  function rememberUser(name) {
+    try { U.store.set(LAST_USER_KEY, String(name || '')) } catch { /* 存不下不影响使用 */ }
+  }
+
+  /**
+   * 当前账号名 —— 缓存身份的一半（另一半是服务器）。
+   *
+   * 身份未知（`/api/me` 还没回来）时回落到**上一次登录的用户名**，这是有意为之：
+   *
+   *   `lx.homeCache` 按「服务器 + 账号」隔离，而确认账号必须走一趟 `/api/me`。
+   *   首帧如果非等这趟网络不可，磁盘里那份明明还在的首页就一点也帮不上忙 ——
+   *   上游一慢，用户看到的就是「打开一片空白，点一下底栏才出来」（点底栏走的是
+   *   hashchange，绕开了启动流程，所以这个现象一直像个玄学）。
+   *
+   * 用上次的名字先当身份读一次缓存，首帧就有内容；真实身份一回来，pageHome 会按
+   * 真身份再核对一遍（见那里 `App.homeOwner !== who` 的判断），不是本人就丢掉重取。
+   * 退出登录时会把这个名字清掉，所以不会出现「A 退出、B 登录、先闪出 A 的推荐」。
+   */
+  function currentUser() {
+    if (App.user && App.user.username) return App.user.username
+    return lastUserName()
+  }
 
   /**
    * 缓存身份 = 服务器 + 账号。
@@ -413,6 +442,15 @@
   function writeHomeCache(data, who) {
     try {
       if (!data || !data.ok) return
+      /**
+       * 身份未知（`who` 为空）时**不写**。
+       *
+       * 这种时刻只出现在「首帧抢跑、`/api/me` 还没回来」那一小段窗口里。
+       * 那时按匿名身份记一份，等于给所有人共用一条缓存记录，
+       * 换个人登录就会先看到上一个人的推荐。宁可这次不写（下次仍旧走接口），
+       * 也不要污染按账号隔离的缓存。
+       */
+      if (!who) return
       const rec = { id: homeCacheIdentity(who), ts: Date.now(), data }
       U.store.set(HOME_CACHE_KEY, rec)
       /**
@@ -2227,6 +2265,7 @@
         const res = await API.login(username, password)
         API.setToken(res.token)
         App.user = res.user
+        rememberUser(res.user && res.user.username)
         toast('欢迎回来，' + res.user.username)
         location.hash = '#/'
         await boot()
@@ -2259,6 +2298,7 @@
         const res = await API.setup(username, password)
         API.setToken(res.token)
         App.user = res.user
+        rememberUser(res.user && res.user.username)
         toast('初始化完成')
         location.hash = '#/'
         await boot()
@@ -2883,6 +2923,9 @@
         if (!await askConfirm({ title: '退出登录', message: '退出后需要重新输入密码。', okText: '退出', danger: true })) return
         API.setToken('')
         App.user = null
+        // 临时身份（lx.lastUser）一并清掉：它只服务于「本人冷启动读自己的缓存」，
+        // 留着会让下一个人登录时先闪出上一个人的推荐。
+        rememberUser('')
         // 内存里那份必须清掉（不然同一个页面实例里换人登录会闪出上一个人的推荐）；
         // 磁盘缓存**故意留着** —— 它按「服务器+账号」隔离，只有本人回来才读得到，
         // 而「退出之后再登录」恰恰是最希望首页秒开的那条路径。
@@ -3136,6 +3179,25 @@
     const token = API.getToken()
 
     /**
+     * **首帧不等网络** —— 有令牌就先把当前路由画出来，再回头去确认身份。
+     *
+     * 为什么这条必须存在（2026-10-08 用户报「打开客户端一片空白，点一下发现才出来」）：
+     *
+     *   原来 boot() 的第一件事是 `await Promise.all([setupStatus, me])`，渲染排在这之后。
+     *   在浏览器里这一趟很便宜，看不出问题；但在安卓客户端里它要过原生桥、要付冷 TLS，
+     *   服务端或者上游一慢，**首帧就是一片空白**。而用户唯一的自救是点一下底栏 ——
+     *   那会派 hashchange，直接走 route()，把整个启动流程绕过去，于是「点一下才出来」。
+     *   这个现象被当成玄学很久，根因只是「把渲染串在了一趟网络后面」。
+     *
+     * 这里只画一版**临时**的：`App.user` 还没定，pageHome 会用上一次登录的用户名
+     * （见 currentUser）去读磁盘缓存，所以内容多半是现成的、根本不闪骨架。
+     * 等下面身份确认完，`await route()` 会再跑一遍并按真身份核对（不是本人就重取）。
+     *
+     * 没有令牌时不抢跑：那种情况该出现的是登录页，先画首页再跳登录会闪一下。
+     */
+    if (token) route().catch(() => {})
+
+    /**
      * 「这台服务器初始化了没」与「我这个令牌对应谁」互不依赖，**并行发**。
      *
      * 这两个问题原本是一前一后串行的：首屏要多等一个完整来回才轮到渲染。
@@ -3172,11 +3234,15 @@
     if (meRes.error || !meRes.user) {
       API.setToken('')
       App.user = null
+      // 令牌作废 = 换人了，临时身份也要跟着清（否则首帧会读到上一个人的缓存）
+      rememberUser('')
       location.hash = '#/login'
       await route()
       return
     }
     App.user = meRes.user
+    // 记下身份：下一次冷启动的首帧要靠它读磁盘缓存（见 currentUser 的说明）
+    rememberUser(App.user && App.user.username)
 
     App.ready = true
     /**
@@ -3195,16 +3261,33 @@
   }
 
   function init() {
-    Player.init()
-    bindGlobalEvents()
-    bindDialogMask()
-    watchBrandForLogin()
-    // 安卓壳里不注册 Service Worker：页面资源整包都在 APK 内（由原生按需提供），
-    // 离线本来就成立；再叠一层 SW 缓存只会带来「改了包但页面还是旧的」这类时序问题。
-    if ('serviceWorker' in navigator && !window.LX_NATIVE) {
-      window.addEventListener('load', () => {
-        navigator.serviceWorker.register('/sw.js').catch(() => {})
-      })
+    /**
+     * 装配阶段（boot 之前）的异常**绝不能**把 boot 一起带走。
+     *
+     * 为什么这条兜底必须和下面 boot 那个 catch **成对**存在：下面这些都跑在
+     * `boot()` 之前，任何一个抛出来，`boot()` 就永远不会被执行；而 `route()` 只有
+     * 两条触发路径（boot 走到最后一步、以及 hashchange），于是 `#view` 一直是空的 ——
+     * 顶栏底栏都在、内容区空白。用户唯一的自救方式是**点一下底栏**（那会派
+     * hashchange 直接重新路由，把整个启动流程绕过去），现象被掩盖成「点一下才加载」。
+     * 只包 boot 等于只堵了这条路的一半。
+     *
+     * 下面每一步都只是**增强**：少了动画、少了手势、少了品牌纠正，界面照样能用。
+     * 用「增强失效」换「界面一定出得来」，这个取舍在客户端上是对的。
+     */
+    try {
+      Player.init()
+      bindGlobalEvents()
+      bindDialogMask()
+      watchBrandForLogin()
+      // 安卓壳里不注册 Service Worker：页面资源整包都在 APK 内（由原生按需提供），
+      // 离线本来就成立；再叠一层 SW 缓存只会带来「改了包但页面还是旧的」这类时序问题。
+      if ('serviceWorker' in navigator && !window.LX_NATIVE) {
+        window.addEventListener('load', () => {
+          navigator.serviceWorker.register('/sw.js').catch(() => {})
+        })
+      }
+    } catch (e) {
+      try { console.warn('[lx] 初始化装配异常，仍继续启动：', e) } catch { /* ignore */ }
     }
     /**
      * boot 里的任何**未预期**异常都不许把页面停在空白上。

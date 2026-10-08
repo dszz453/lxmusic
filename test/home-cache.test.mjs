@@ -187,7 +187,13 @@ console.log('\n== 4b. /home 兜底分支：整份结果进缓存，不再每次�
     const b = SRV.indexOf('\n}', a)
     return (a >= 0 && b > a) ? SRV.slice(a, b) : ''
   })()
+  const fbHelper = (() => {
+    const a = SRV.indexOf('function homeFallbackFromCache(')
+    const b = SRV.indexOf('\n}', a)
+    return (a >= 0 && b > a) ? SRV.slice(a, b) : ''
+  })()
   ok('cachedHomeFallback 存在且切得出来（否则下面是空断言）', fb.length > 400, 'len=' + fb.length)
+  ok('homeFallbackFromCache 切得出来（否则下面几条是空断言）', fbHelper.length > 100, 'len=' + fbHelper.length)
   ok('兜底分支改走它，不再内联现场搜索',
     /const fb = await cachedHomeFallback\(env, db\)/.test(SRV))
   ok('关键词轮换只在这一处算（散成两份迟早对不上）',
@@ -201,12 +207,60 @@ console.log('\n== 4b. /home 兜底分支：整份结果进缓存，不再每次�
     /const ttl = charts\.length \? HOME_FALLBACK_TTL_MS : HOME_FALLBACK_SHORT_TTL_MS/.test(fb))
   ok('TTL 存在记录里、按时间戳自己算（壳里 edgeCache 退化成 Map 时寿命只能靠它）',
     /const ttl = \(rec && rec\.ttl\) \|\| HOME_FALLBACK_TTL_MS/.test(fb) &&
-    /Date\.now\(\) - rec\.ts < ttl/.test(fb))
+    /const age = Date\.now\(\) - rec\.ts/.test(fb) &&
+    /if \(age < ttl\) return homeFallbackFromCache\(rec, keyword, false\)/.test(fb))
   ok('命中缓存时连榜单都不回源',
-    /Array\.isArray\(rec\.hot\) && rec\.hot\.length/.test(fb) && /fromCache: true/.test(fb))
+    /Array\.isArray\(rec\.hot\) && rec\.hot\.length/.test(fb) && /fromCache: true/.test(fbHelper))
+  /**
+   * 这一组是 2026-10-08「首页又要转好几秒」的根因护栏。
+   * TTL 一到就得完整重算（抓榜单 + 跨 6 源搜 24 首 = 好几秒），而用户隔一阵
+   * 打开一次、几乎每次都正好撞在冷的那一侧。兜底内容全站同一份、当天更是一模一样，
+   * 没有任何理由为了刷新时间戳让用户等 —— 先给旧的、后台补新的。
+   */
+  ok('过期后仍有宽限期，且宽限期内**不**回源（否则 TTL 一到用户就得再等几秒）',
+    /HOME_FALLBACK_STALE_MS = 12 \* 60 \* 60 \* 1000/.test(SRV) &&
+    /if \(age < HOME_FALLBACK_STALE_MS\) stale = rec/.test(fb))
+  ok('宽限期内先交旧的、重算甩到后台（waitUntil），且**不**用 Promise.race 甩副作用',
+    /const work = compute\(\)/.test(fb) && /env\.waitUntil\(work\)/.test(fb) &&
+    !/withDeadline\(compute/.test(fb))
+  ok('交出去的那份被标记成 stale（debug 里能看出来走的是哪条路）',
+    /homeFallbackFromCache\(stale, keyword, true\)/.test(fb) && /stale: !!stale/.test(fbHelper))
   ok('带 ?debug=1 时吐出两段的真实耗时（下次再慢，有数可看）',
     /url\.searchParams\.get\('debug'\) === '1'/.test(SRV) &&
     /fromCache: fb\.fromCache, hot: fb\.hot\.length/.test(SRV))
+}
+
+/* ══════════════ 4c. 客户端：首帧也要能用上磁盘缓存 ══════════════ */
+
+console.log('\n== 4c. 首帧不等网络：身份还没确认时也读得到自己的缓存 ==')
+{
+  const idBody = (() => {
+    const a = APPJS.indexOf('const LAST_USER_KEY')
+    const b = APPJS.indexOf('function homeCacheIdentity', a)
+    return (a >= 0 && b > a) ? APPJS.slice(a, b) : ''
+  })()
+  ok('身份回落那段切得出来（否则下面是空断言）', idBody.length > 200, 'len=' + idBody.length)
+  /**
+   * 这一组是 2026-10-08「打开客户端一片空白，点一下发现才出来」的另一半根因。
+   *
+   * 缓存身份 = 服务器 + 账号，而账号要等 `/api/me`。首帧若非等它不可，
+   * 磁盘里那份明明还在的首页就一点也帮不上忙 —— 上游一慢就是「打开空白、
+   * 点一下才出来」；而点完之后那份内容跟上次**一模一样**（用户原话），
+   * 也就是说这趟等待从头到尾都是白等的。
+   */
+  ok('身份未知时回落到上一次登录的用户名（首帧才读得到自己的缓存）',
+    /function currentUser\([\s\S]{0,400}lastUserName\(\)/.test(idBody))
+  ok('真实身份优先于回落值（有 App.user 就不该用旧的）',
+    /if \(App\.user && App\.user\.username\) return App\.user\.username/.test(idBody))
+  ok('身份未知时**不**写缓存（否则会记成匿名，换个人登录先看到上一个人的推荐）',
+    /if \(!who\) return/.test(writeBody))
+  ok('登录成功就记下身份（别只依赖 /api/me 那一趟）',
+    (APPJS.match(/rememberUser\(res\.user && res\.user\.username\)/g) || []).length >= 2)
+  ok('退出登录清掉临时身份', /case 'logout'[\s\S]{0,500}rememberUser\(''\)/.test(APPJS))
+  ok('令牌失效也清掉（那是换人了，不是断网）',
+    /meRes\.error[\s\S]{0,300}rememberUser\(''\)/.test(APPJS))
+  ok('身份确认后写入临时身份（下一次冷启动的首帧靠它）',
+    /App\.user = meRes\.user[\s\S]{0,200}rememberUser\(App\.user/.test(APPJS))
 }
 
 /* ══════════════ 5. 服务端版本只在设置页 ══════════════ */

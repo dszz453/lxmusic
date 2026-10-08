@@ -203,6 +203,31 @@ ok('seedPlugins 改到空闲时才跑（requestIdleCallback，老 WebView 回退
   /requestIdleCallback/.test(njBoot) && /setTimeout\s*\(\s*run\s*,/.test(njBoot))
 ok('种子插件导入本身还在（别连同「延后」一起删掉）', /seedPlugins\s*\(\s*\)/.test(NJ))
 
+/**
+ * 这一组是 2026-10-08「打开客户端一片空白，点一下发现才出来」的根因护栏。
+ *
+ * 根因：首帧被串在「确认身份」那趟网络后面（客户端里还要过原生桥 + 冷 TLS，
+ * 上游一慢就是好几秒），而点底栏走的是 hashchange，直接绕开整个启动流程 ——
+ * 所以这个现象一直看着像玄学。修法是**首帧不等网络**：有令牌就先把当前路由
+ * 画出来（用上一次登录的用户名读磁盘缓存），身份确认完再按真身份路由一次。
+ */
+ok('boot() 首帧不等网络：有令牌就先渲染一次当前路由',
+  /if\s*\(\s*token\s*\)\s*route\s*\(\s*\)\s*\.\s*catch/.test(boot))
+{
+  const iRoute = boot.indexOf('if (token) route()')
+  const iAll = boot.indexOf('Promise.all')
+  ok('抢跑那一次在 await Promise.all **之前**（排在它后面就等于没修）',
+    iRoute > 0 && iAll > iRoute, 'route@' + iRoute + ' Promise.all@' + iAll)
+}
+ok('没有令牌时不抢跑（那时该出的是登录页，先画首页会闪一下）',
+  !/^\s*route\s*\(\s*\)\s*\.\s*catch/m.test(boot))
+ok('身份确认完之后仍按真身份再路由一次（抢跑那次只是临时的）',
+  /rememberUser\([\s\S]{0,300}await\s+route\s*\(\s*\)/.test(boot))
+ok('init() 里 boot 之前的装配步骤包在 try/catch 里（那几步抛了 boot 就永不执行）',
+  /try\s*\{[\s\S]{0,700}watchBrandForLogin\s*\(\s*\)[\s\S]{0,500}\}\s*catch/.test(initFn))
+ok('装配 try/catch 在 init() 内部（不是在 init 调用处糊一层 —— 那样 boot 照样不执行）',
+  initFn.indexOf('watchBrandForLogin') > 0 && initFn.indexOf('try') < initFn.indexOf('watchBrandForLogin'))
+
 console.log('\n' + '='.repeat(62))
 if (fails.length === 0) {
   console.log(`✅ 首屏启动速度护栏：${pass} 项全部通过`)

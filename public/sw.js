@@ -12,7 +12,7 @@
  *      「客户端期望的服务端版本」而不是客户端自己的版本号（客户端已有独立版本线）。
  *      两者都是运行时才生效的判定，不抬 VERSION 的话老缓存会一直赢。
  */
-const VERSION = 'v33'
+const VERSION = 'v34'
 const STATIC_CACHE = 'lxmusic-static-' + VERSION
 const SHELL_CACHE = 'lxmusic-shell-' + VERSION
 

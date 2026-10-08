@@ -56,7 +56,7 @@ SERVICE_VER="$(node -e "import('./client/version.mjs').then(m=>console.log(m.SER
 BUILD_ID="${LX_BUILD_ID:-$(git -C "$ROOT" rev-parse --short=12 HEAD 2>/dev/null || echo dev)}"
 VERSION_CODE="${VERSION_CODE:-100}"
 VERSION_NAME="${VERSION_NAME:-1.0}"
-SERVICE_VER="${SERVICE_VER:-V1.7}"
+SERVICE_VER="${SERVICE_VER:-V1.8}"
 echo "   客户端版本：$VERSION_NAME (code $VERSION_CODE) ← client/version.mjs"
 echo "   服务端版本：客户端按 $SERVICE_VER 对接 ← src/version.js（由测试钉住一致性）"
 echo "   构建标识：$BUILD_ID"

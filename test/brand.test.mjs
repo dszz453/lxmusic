@@ -220,7 +220,13 @@ console.log('\n== 5. manifest 按宿主合成 ==')
   // 登录页大标题的竞态：首屏渲染时品牌可能还是猜的，确认后要纠正
   ok('登录页 h1 带 id（确认后可被纠正）', /<h1 id="loginBrand">/.test(APP))
   ok('app.js 监听 lx-brand 事件纠正登录页标题', /watchBrandForLogin/.test(APP) && /addEventListener\('lx-brand'/.test(APP))
-  ok('init() 里注册了品牌监听', /init\(\)\s*\{[\s\S]{0,200}watchBrandForLogin\(\)/.test(APP))
+  /**
+   * 窗口给到 1500 是有意的：init() 里的装配步骤被包进了一个 try/catch
+   * （理由见 app.js 那段注释 —— 那几步抛异常会让 boot() 永不执行、整屏空白），
+   * 中间隔着几百字的说明。断言要钉的是「init 里确实注册了品牌监听」，
+   * 不是「它紧挨着函数开头」。
+   */
+  ok('init() 里注册了品牌监听', /init\(\)\s*\{[\s\S]{0,1500}watchBrandForLogin\(\)/.test(APP))
 }
 
 console.log('\n== 6. APK 构建清单跟得上 ==')

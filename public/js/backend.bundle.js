@@ -1,5 +1,5 @@
 /* 由 tools/build-app.mjs 自动生成，请勿手动修改。
- * 源摘要: 5cbe428434970518
+ * 源摘要: 6043e2fad07f89d9
  * 模块数: 24
  *
  * 这是给安卓壳用的后端展平版：把 src/ 的 ESM 后端打成单个 IIFE，
@@ -464,6 +464,30 @@ async function cachedToplists() {
 const HOME_FALLBACK_TTL_MS = 20 * 60 * 1000
 const HOME_FALLBACK_SHORT_TTL_MS = 2 * 60 * 1000
 
+/**
+ * 过期之后的**宽限期**：这中间的记录仍然可以直接交出去，同时在后台重算。
+ *
+ * 为什么需要它（2026-10-08 用户报「首页又要转好几秒」）：TTL 一到，下一次请求
+ * 就得完整地走一遍「抓榜单 + 跨 6 源搜 24 首」，自建实例上那是好几秒。
+ * 而兜底内容是**全站同一份**，当天更是一模一样 —— 没有任何理由为了让时间戳
+ * 变新，让用户干等这几秒。先给旧的、后台补新的（SWR），用户那边永远是秒回。
+ *
+ * 上限不需要很大：缓存键里带着天序号，跨天本来就是重新算。
+ */
+const HOME_FALLBACK_STALE_MS = 12 * 60 * 60 * 1000
+
+/** 把一条缓存记录整成 /home 要的形状 */
+function homeFallbackFromCache(rec, keyword, stale) {
+  return {
+    keyword: typeof rec.keyword === 'string' ? rec.keyword : keyword,
+    charts: Array.isArray(rec.charts) ? rec.charts : [],
+    hot: rec.hot,
+    errors: [],
+    fromCache: true,
+    stale: !!stale,
+  }
+}
+
 async function cachedHomeFallback(env, db) {
   const dayIndex = Math.floor(Date.now() / 86400000)
   const keyword = HOME_KEYWORDS[dayIndex % HOME_KEYWORDS.length]
@@ -472,51 +496,67 @@ async function cachedHomeFallback(env, db) {
     'https://lx.cache.internal/home-fallback/' + dayIndex + '/' + sources.join('-'),
     { method: 'GET' })
 
+  let stale = null
   try {
     const hit = await edgeCache.match(key)
     if (hit) {
       const rec = await hit.json()
       const ttl = (rec && rec.ttl) || HOME_FALLBACK_TTL_MS
-      if (rec && typeof rec.ts === 'number' && Date.now() - rec.ts < ttl
+      if (rec && typeof rec.ts === 'number'
         && Array.isArray(rec.hot) && rec.hot.length) {
-        return {
-          keyword: typeof rec.keyword === 'string' ? rec.keyword : keyword,
-          charts: Array.isArray(rec.charts) ? rec.charts : [],
-          hot: rec.hot,
-          errors: [],
-          fromCache: true,
-        }
+        const age = Date.now() - rec.ts
+        if (age < ttl) return homeFallbackFromCache(rec, keyword, false)
+        // 过期但还在宽限期内 → 走下面「先返回、后台重算」
+        if (age < HOME_FALLBACK_STALE_MS) stale = rec
       }
     }
   } catch { /* 坏缓存当没命中，继续回源 */ }
 
-  const errors = []
-  const [charts, parsed] = await Promise.all([
-    cachedToplists(),
-    Promise.resolve(parseQuery(keyword, sources)),
-  ])
+  const compute = async () => {
+    const errors = []
+    const [charts, parsed] = await Promise.all([
+      cachedToplists(),
+      Promise.resolve(parseQuery(keyword, sources)),
+    ])
 
-  let hot = []
-  try {
-    const res = await searchOnline(parsed.keyword, {
-      sources: parsed.sources, limit: 24, pluginPool: env.PLUGIN_POOL,
-    })
-    hot = res.list || []
-    errors.push(...(res.errors || []))
-  } catch (e) {
-    errors.push(String((e && e.message) || e))
-  }
-
-  if (hot.length) {
-    const ttl = charts.length ? HOME_FALLBACK_TTL_MS : HOME_FALLBACK_SHORT_TTL_MS
+    let hot = []
     try {
-      await edgeCache.put(key, new Response(JSON.stringify({ ts: Date.now(), ttl, keyword, charts, hot }), {
-        headers: { 'Content-Type': 'application/json' },
-      }))
-    } catch { /* 缓存写失败不影响本次返回 */ }
+      const res = await searchOnline(parsed.keyword, {
+        sources: parsed.sources, limit: 24, pluginPool: env.PLUGIN_POOL,
+      })
+      hot = res.list || []
+      errors.push(...(res.errors || []))
+    } catch (e) {
+      errors.push(String((e && e.message) || e))
+    }
+
+    if (hot.length) {
+      const ttl = charts.length ? HOME_FALLBACK_TTL_MS : HOME_FALLBACK_SHORT_TTL_MS
+      try {
+        await edgeCache.put(key, new Response(JSON.stringify({ ts: Date.now(), ttl, keyword, charts, hot }), {
+          headers: { 'Content-Type': 'application/json' },
+        }))
+      } catch { /* 缓存写失败不影响本次返回 */ }
+    }
+
+    return { keyword, charts, hot, errors, fromCache: false, stale: false }
   }
 
-  return { keyword, charts, hot, errors, fromCache: false }
+  if (stale) {
+    /**
+     * 先把过期的那份交出去，重算甩到后台。
+     *
+     * ⚠️ 这里**不能**用 `withDeadline` 那种 Promise.race：`compute()` 带副作用
+     * （要写缓存），被「不等了」甩下的那次仍会跑，但调用方已经返回 —— 那不是这里
+     * 想要的语义。这里要的是「让它完整跑完，只是不等它」，所以用 waitUntil；
+     * 没有 waitUntil 的环境（部分替身）就让它自由跑完。
+     */
+    const work = compute().catch(() => { /* 后台重算失败：旧内容继续顶着 */ })
+    try { if (env && env.waitUntil) env.waitUntil(work) } catch { /* 自由跑完即可 */ }
+    return homeFallbackFromCache(stale, keyword, true)
+  }
+
+  return compute()
 }
 
 /**
@@ -704,7 +744,7 @@ async function handleApi(request, env, url) {
         hot: fb.hot.map(songForWeb),
         platforms: ALL_SOURCES.map(k => ({ key: k, name: SOURCE_META[k].name, short: SOURCE_META[k].short })),
         errors,
-        ...(dbg ? { debug: { daily: tDaily - t0, data: tData - tDaily, total: tData - t0, fromCache: fb.fromCache, hot: fb.hot.length, charts: fb.charts.length } } : {}),
+        ...(dbg ? { debug: { daily: tDaily - t0, data: tData - tDaily, total: tData - t0, fromCache: fb.fromCache, hot: fb.hot.length, charts: fb.charts.length, stale: !!fb.stale } } : {}),
       })
     }
 
@@ -7814,7 +7854,7 @@ __modules["src/version.js"] = function (__exports, __require) {
  * 所以统一读这里，谁也别再各写各的。
  *
  * ── 两条版本线，别混 ──────────────────────────────────────────
- *   APP_VERSION      产品版本，人看的。改功能才动它。当前 V1.7
+ *   APP_VERSION      产品版本，人看的。改功能才动它。当前 V1.8
  *   APP_VERSION_CODE 整数构建号，Android 靠它判断「能不能覆盖安装」。
  *                    每次要发新版就 +1，**不能倒退、不能重复**，
  *                    否则手机上会报「应用未安装」（签名相同也装不上）。
@@ -7840,10 +7880,10 @@ __modules["src/version.js"] = function (__exports, __require) {
  */
 
 /** 产品版本（对外展示用）。每发一版升 0.1。 */
-const APP_VERSION = 'V1.7'
+const APP_VERSION = 'V1.8'
 
 /** Android versionCode：整数、单调递增、跨次发布不可重复。每发一版 +1。 */
-const APP_VERSION_CODE = 107
+const APP_VERSION_CODE = 108
 
 /** 人类可读的完整标识，日志/关于页用。 */
 const APP_ID = 'lxmusic'
