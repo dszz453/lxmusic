@@ -24,6 +24,11 @@ android/assets/www/
 # 它和 public/ 逐字节同源，提交进来只会造成「改了一处、另一处是旧的」的经典事故。
 # 想构建 APK 就先跑 build-apk.sh（它自己会拷）。
 
+# client/assets/ 同理：client/build-client.sh 会把 public/ 拷进去，
+# 再补一个跨端层产物 js/client-layer.js。client/build/ 与 client/rn/build/
+# 由上面的 `build/` 规则覆盖（那条是无路径限定的目录名匹配）。
+client/assets/
+
 # ⚠ android/keystore/ **绝不能排除**，也绝不能进仓库 —— 两难。
 # 密钥泄露 = 别人能给你用户推假更新；密钥丢失 = 只能让用户卸载重装（数据全丢）。
 # 折中：目录留在工作区、被 ignore 挡在仓库外，由部署者自己备份（见 docs/self-host.md）。

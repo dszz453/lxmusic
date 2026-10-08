@@ -1,0 +1,21 @@
+<?xml version="1.0" encoding="utf-8"?>
+<!--
+  客户端主题。与 music-edge 壳（android/res/values/styles.xml）相比多了 ClientPageTheme：
+  壳是单 Activity + WebView，没有原生页面；客户端有四个原生页面，
+  它们底色是灰的（内容区白卡片压在灰底上，和跨端页面同一套观感），
+  所以单独一个主题，免得把 WebView 那边的白底也一起改了。
+-->
+<resources>
+    <style name="AppTheme" parent="@android:style/Theme.Material.Light.NoActionBar">
+        <item name="android:windowBackground">#FFFFFFFF</item>
+        <item name="android:statusBarColor">#FFFFFFFF</item>
+        <item name="android:navigationBarColor">#FFFFFFFF</item>
+        <item name="android:colorPrimary">#FFEC4141</item>
+        <item name="android:colorAccent">#FFEC4141</item>
+    </style>
+
+    <!-- 原生页面：灰底 + 无 ActionBar（标题栏由 Ui.titleBar 自己画） -->
+    <style name="ClientPageTheme" parent="@style/AppTheme">
+        <item name="android:windowBackground">#FFF5F5F6</item>
+    </style>
+</resources>

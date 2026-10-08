@@ -199,11 +199,21 @@ console.log('\n== 5. manifest 按宿主合成 ==')
    * 原因（实测踩到）：浏览器上同步判据猜不出 Docker 与 CF（两者 LX_REMOTE 都是假），
    * 猜的结果在 CF 上是 docker → 同步应用等于把静态的 music-edge 覆盖成 LX-MUSIC，
    * 接口回来再纠正 —— 线上出现「music-edge → LX-MUSIC → music-edge」两次切换，
-   * 中间还是个**错名字**。所以立即生效段必须只在壳内（LX_NATIVE，判据可靠）执行。
+   * 中间还是个**错名字**。所以立即生效段只能被「判据可靠」的两类宿主放行：
+   *   · 老的 music-edge 壳（LX_NATIVE）
+   *   · 通用客户端（LX_CLIENT_HOST_HINT —— 客户端握手时就知道自己连的哪条线）
+   * 两者在浏览器里都不存在，所以浏览器模式的守卫效果不变。
    */
   const tail = BRAND.slice(BRAND.indexOf('立即生效'))
   ok('立即生效段被 LX_NATIVE 守卫（浏览器模式不动静态落点，防闪错名）',
-    /if \(global\.LX_NATIVE\)/.test(tail))
+    /if \(global\.LX_NATIVE/.test(tail))
+  ok('立即生效段额外放行通用客户端的同步判据（否则 Docker 线会装成 music-edge 身份）',
+    /if \(global\.LX_NATIVE \|\| global\.LX_CLIENT_HOST_HINT\)/.test(tail))
+  ok('guessHost 优先采信客户端的同步判据 LX_CLIENT_HOST_HINT',
+    /function guessHost\(\)\s*\{[\s\S]{0,220}LX_CLIENT_HOST_HINT/.test(BRAND))
+  ok('浏览器模式（无 hint）仍不会走到立即生效段',
+    /if \(global\.LX_NATIVE \|\| global\.LX_CLIENT_HOST_HINT\)/.test(tail)
+    && !/LX_CLIENT_HOST_HINT\s*\|\|\s*true/.test(tail))
   ok('浏览器模式的 manifest 合成延后到服务端确认（applyHost 里做）',
     /manifestDone\s*=\s*true[\s\S]{0,120}installManifest/.test(BRAND.slice(BRAND.indexOf('applyHost ='))))
 

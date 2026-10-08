@@ -153,6 +153,36 @@ GH_TOKEN=ghp_xxx node tools/publish-github.mjs --dry    # 只看清单
 
 ---
 
+## 安卓客户端（`client/`）—— LX-MUSIC 通用客户端
+
+除了上面那个「离线自包含壳」（`android/`），仓库里还有第二个安卓工程：
+**通用客户端**。区别一句话说清：
+
+| | `android/`（music-edge 壳） | `client/`（LX-MUSIC 客户端） |
+|---|---|---|
+| 后端 | 永远在设备内 | 跟着「服务器档案」走：**CF / Docker / 自建 / 内置**四选一 |
+| 名字 | 固定 `music-edge` | 由所连服务端自报（`music-edge` 或 `LX-MUSIC`） |
+| 版本 | 与服务端同号 V1.3 | **客户端独立版本线 V1.0**（服务端仍是 V1.3） |
+| 包名 | `com.zyplnn.musicedge` | `com.zyplnn.lxclient`（可同时安装） |
+| 产物 | `dist/music-edge-1.3.apk` | `dist/lx-music-client-1.0.apk` |
+
+首启会问你连哪条线，之后随时可以从**顶栏的连接状态条**或设置里换。
+连上后品牌与版本按服务端自报显示 —— 连 CF 显示 `music-edge`，连 Docker 显示 `LX-MUSIC`。
+
+架构照搬网易云那套 **原生宿主 + 跨端页面** 混合的分层
+（原生 Java 宿主与原生页面 / 跨端桥接层 / 跨端业务层 JS / 底层能力层），
+只是渲染载体换成系统 WebView（本工程免 Gradle，没有 RN 与 NDK 工具链）。
+**逐层对照、取舍理由、排障表**见 [`docs/client-android.md`](docs/client-android.md)。
+
+```bash
+bash client/build-client.sh              # 构建（自动打包跨端层 + 重建离线后端）
+bash client/build-client.sh --skip-backend
+node test/client-wiring.test.mjs         # 78 项静态接线审计（秒级）
+node test/client-layer.mjs               # 25 项跨端层行为（自带 DOM 替身，秒级）
+```
+
+---
+
 ## 〇、本轮（2026-10-01）改了什么
 
 一句话：**让系统自己给插件源打分，并把打出来的分摆到界面上，由人来定是先信它还是自己排。**

@@ -1,0 +1,26 @@
+<!--
+  原生底栏图标 —— 与 public/index.html 里 tabbar 的四个 SVG **同一份路径数据**。
+  为什么照抄而不是重画：原生底栏与跨端页面会同时出现在屏幕上（底栏是原生的、
+  内容是跨端层画的），两个图标体系只要有一点差别就会被一眼看出来。
+  改网页那边的路径时，这里要跟着改 —— test/client-wiring.test.mjs 会把两边的
+  path 数据钉在一起（抠出来逐个比对），漏改会报红。
+  颜色不写死：运行时用 setTint 上色（选中品牌红 / 未选中灰）。
+-->
+<vector xmlns:android="http://schemas.android.com/apk/res/android"
+    android:width="24dp"
+    android:height="24dp"
+    android:viewportWidth="24"
+    android:viewportHeight="24">
+    <path
+        android:pathData="M3 10.5L12 3l9 7.5"
+        android:strokeColor="#FF000000"
+        android:strokeWidth="1.8"
+        android:strokeLineCap="round"
+        android:strokeLineJoin="round" />
+    <path
+        android:pathData="M5.5 9.5V20h13V9.5"
+        android:strokeColor="#FF000000"
+        android:strokeWidth="1.8"
+        android:strokeLineCap="round"
+        android:strokeLineJoin="round" />
+</vector>

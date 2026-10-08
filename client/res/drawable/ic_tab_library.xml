@@ -1,0 +1,31 @@
+<!--
+  原生底栏图标 —— 形状与 public/index.html 里 tabbar 的四个 SVG 对齐：
+  同一个 24x24 视框、同样的描边粗细（1.8）与圆角端点。
+  为什么不直接照抄 path 字符串：网页那边「我的歌单」用的是 <rect rx=3>，
+  在 vector 里没有等价元素，只能转成路径（下面用二次曲线画圆角）。
+  所以两边**形状一致、写法不同** —— 改网页那边的几何时，这里要跟着改。
+  颜色不写死：运行时用 setTint 上色（选中品牌红 / 未选中灰）。
+-->
+<vector xmlns:android="http://schemas.android.com/apk/res/android"
+    android:width="24dp"
+    android:height="24dp"
+    android:viewportWidth="24"
+    android:viewportHeight="24">
+    <!-- 等价于网页的 <rect x=4 y=4 width=16 height=16 rx=3> -->
+    <path
+        android:pathData="M7 4h10q3 0 3 3v10q0 3 -3 3H7q-3 0 -3 -3V7q0 -3 3 -3z"
+        android:strokeColor="#FF000000"
+        android:strokeWidth="1.8"
+        android:strokeLineCap="round"
+        android:strokeLineJoin="round" />
+    <path
+        android:pathData="M9 4v16"
+        android:strokeColor="#FF000000"
+        android:strokeWidth="1.8"
+        android:strokeLineCap="round" />
+    <path
+        android:pathData="M4 10h16"
+        android:strokeColor="#FF000000"
+        android:strokeWidth="1.8"
+        android:strokeLineCap="round" />
+</vector>

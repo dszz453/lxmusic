@@ -1,0 +1,8 @@
+<!-- 顶栏左侧：打开网页端的菜单抽屉（原生顶栏接管了网页顶栏，这个按钮是它的替身） -->
+<vector xmlns:android="http://schemas.android.com/apk/res/android"
+    android:width="24dp" android:height="24dp"
+    android:viewportWidth="24" android:viewportHeight="24">
+    <path android:pathData="M3 6h18M3 12h18M3 18h18"
+        android:strokeColor="#FF000000" android:strokeWidth="1.8"
+        android:strokeLineCap="round" />
+</vector>

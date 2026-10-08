@@ -1,5 +1,5 @@
 /* 由 tools/build-app.mjs 自动生成，请勿手动修改。
- * 源摘要: 39a1a9c610aad60a
+ * 源摘要: 10c9d4f98b725b64
  * 模块数: 24
  *
  * 这是给安卓壳用的后端展平版：把 src/ 的 ESM 后端打成单个 IIFE，
@@ -727,7 +727,14 @@ async function handleApi(request, env, url) {
 
     if (path === '/history') {
       if (method === 'DELETE') {
-        await db.clearSearchHistory(env.DB, user.id)
+        const keyword = url.searchParams.get('keyword')
+        if (keyword) {
+          // 删单条（按关键词，只删当前用户的）
+          await db.deleteSearchHistoryByKeyword(env.DB, user.id, keyword)
+        } else {
+          // 无 keyword 参数：清空当前用户全部搜索历史
+          await db.clearSearchHistory(env.DB, user.id)
+        }
         return json({ ok: true })
       }
       return json({ ok: true, list: await db.listSearchHistory(env.DB, user.id) })
@@ -6916,6 +6923,10 @@ async function clearSearchHistory(db, userId) {
   await db.prepare('DELETE FROM search_history WHERE user_id = ?').bind(userId).run()
 }
 
+async function deleteSearchHistoryByKeyword(db, userId, keyword) {
+  await db.prepare('DELETE FROM search_history WHERE user_id = ? AND keyword = ?').bind(userId, keyword).run()
+}
+
 /* ---------------- 播放进度 / 播放历史 ---------------- */
 
 /**
@@ -7048,6 +7059,7 @@ async function listAllPlayHistory(db, limit = 200) {
   __exports.addSearchHistory = addSearchHistory;
   __exports.listSearchHistory = listSearchHistory;
   __exports.clearSearchHistory = clearSearchHistory;
+  __exports.deleteSearchHistoryByKeyword = deleteSearchHistoryByKeyword;
   __exports.upsertPlayProgress = upsertPlayProgress;
   __exports.getPlayProgress = getPlayProgress;
   __exports.listPlayHistory = listPlayHistory;

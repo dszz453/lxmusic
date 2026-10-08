@@ -75,10 +75,20 @@
 
   /**
    * 当前品牌键。先按同步判据定一个，接口回来再纠正。
-   * 同步判据里**壳一定是 cf**（桥在 native.js 里就会置 LX_NATIVE）；
-   * 网页端先用 LX_REMOTE 粗判（壳配了服务器地址时它才为真，而壳就是 cf 线）。
+   *
+   * 判据优先级（越高越可信）：
+   *   0. **LX_CLIENT_HOST_HINT** —— 通用客户端（client/ 那个 APK）在页面加载前注入，
+   *      值是它握手时从服务端问来的 host（或用户选的档位）。这是**唯一一个
+   *      「同步就知道、而且是准确答案」**的判据：客户端连的哪条线是它自己配的，
+   *      不用猜。有了它，通用客户端里名与 manifest 都能一次到位，不闪名、也不会
+   *      把 Docker 那条线装成 music-edge 的 PWA 身份（见 applyHost 里 manifestDone 那段）。
+   *   1. 壳（LX_NATIVE，即老的 music-edge APK）—— 它是基于 CF 那条线的客户端，
+   *      桥在 native.js 里就会置位，判据可靠但不区分 Docker。
+   *   2. 网页端先用 LX_REMOTE 粗判（壳配了服务器地址时它才为真，而壳就是 cf 线）。
    */
   function guessHost() {
+    var hint = global.LX_CLIENT_HOST_HINT
+    if (hint === 'docker' || hint === 'cf') return hint
     if (global.LX_NATIVE) return 'cf'
     return global.LX_REMOTE ? 'cf' : 'docker'
   }
@@ -213,9 +223,14 @@
    *     manifest 等服务端确认后再合成（applyHost 里做）。
    *     代价是 Docker 网页首屏短暂显示静态的 music-edge、确认后切到 LX-MUSIC ——
    *     一次切换、且切换前显示的不是「错误的 Docker 名」，比 CF 闪错名好得多。
+   *
+   *   · 通用客户端（LX_CLIENT_HOST_HINT）—— 判据同样**准确**（客户端自己配的），
+   *     所以和壳一样立即应用。这一条很关键：不立即应用的话，manifest 会在
+   *     applyHost 之前被 installManifest 用**猜的**键合成一次，而 manifestDone
+   *     一旦置位就不再重做 —— Docker 那条线会被装成 music-edge 的 PWA 身份。
    */
   try {
-    if (global.LX_NATIVE) {
+    if (global.LX_NATIVE || global.LX_CLIENT_HOST_HINT) {
       titleApplied = true
       brand.applyDocumentTitle('')
       manifestDone = true

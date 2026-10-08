@@ -1,0 +1,30 @@
+<?xml version="1.0" encoding="utf-8"?>
+<!--
+  颜色口径**直接抄 public/css/app.css 的 :root 变量**，一处一值。
+  为什么不在 Java 里再定义一套：原生页面与跨端页面会并排出现（顶上原生底栏、
+  中间跨端内容），色差一眼就能看出来。抄同一组值是最省事的对齐办法。
+  改网页主题色时，这里要跟着改 —— test/client-wiring.test.mjs 会把两边钉在一起。
+-->
+<resources>
+    <color name="brand">#FFEC4141</color>
+    <color name="brand_dark">#FFD73535</color>
+    <color name="brand_soft">#FFFFECEB</color>
+
+    <color name="bg">#FFF5F5F6</color>
+    <color name="surface">#FFFFFFFF</color>
+    <color name="surface_2">#FFFAFAFA</color>
+    <color name="line">#FFF0F0F1</color>
+    <color name="line_strong">#FFE6E6E7</color>
+
+    <color name="text">#FF2B2B2B</color>
+    <color name="text_2">#FF6B6B6B</color>
+    <color name="text_3">#FFA3A3A6</color>
+
+    <color name="ok">#FF1A9C53</color>
+    <color name="warn">#FFE08A00</color>
+    <color name="danger">#FFF56C6C</color>
+
+    <!-- 底栏图标选中 / 未选中 -->
+    <color name="nav_on">#FFEC4141</color>
+    <color name="nav_off">#FFA3A3A6</color>
+</resources>

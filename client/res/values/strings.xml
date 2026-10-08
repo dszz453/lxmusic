@@ -1,0 +1,33 @@
+<?xml version="1.0" encoding="utf-8"?>
+<resources>
+    <!-- App 自身的名字。注意这**不是**品牌名：
+         品牌（music-edge / LX-MUSIC）由所连的服务端决定，运行时显示在顶栏；
+         这里只是「这个 App 叫什么」，装到桌面上用。 -->
+    <string name="app_name">LX-MUSIC</string>
+
+    <!-- 品牌名：客户端产品名 + 服务端两条线的名字（与 public/js/brand.js 的 NAMES 对齐） -->
+    <string name="brand_client">LX-MUSIC</string>
+    <string name="brand_cf">music-edge</string>
+    <string name="brand_docker">LX-MUSIC</string>
+
+    <string name="notif_channel">播放</string>
+    <!-- 占位通知：为了守住 startForeground 的 5 秒期限而先露个面，几毫秒后就被真实曲目顶掉 -->
+    <string name="notif_preparing">正在准备播放…</string>
+
+    <!-- 媒体通知上的三个按键。Android 13 会把它们渲染进系统媒体卡片，
+         所以这几个名字会直接出现在锁屏 / 控制中心里 -->
+    <string name="act_prev">上一首</string>
+    <string name="act_play">播放</string>
+    <string name="act_pause">暂停</string>
+    <string name="act_next">下一首</string>
+
+    <string name="notif_denied">没有通知权限，锁屏与通知栏看不到播放控制。可在系统设置里为 LX-MUSIC 打开通知。</string>
+    <string name="notif_ok">通知权限已开启</string>
+
+    <!-- 原生底栏四项。与网页端 tabbar 的 data-tab 一一对应（home/library/favorite/mine），
+         跨端层靠这层对应关系做双向同步 —— 改名字时两边要一起看。 -->
+    <string name="tab_home">发现</string>
+    <string name="tab_library">我的歌单</string>
+    <string name="tab_favorite">收藏</string>
+    <string name="tab_mine">我的</string>
+</resources>

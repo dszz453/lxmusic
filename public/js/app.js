@@ -2012,8 +2012,18 @@
       // 浏览器模式的 LX_VERSION 是 'web' 占位（真实版本只存在于壳里），
       // 网页客户端与服务端出自同一次部署、天然同步 —— 拿占位去比必然「不一致」，
       // 之前每个浏览器用户都会看到假的「⚠ 与服务端版本不一致」，这里只在壳里才比。
+      //
+      // 「比什么」分两种客户端，这一点很容易搞错：
+      //   · 老壳（music-edge）：客户端与服务端**共用一条版本线**，直接比字符串即可。
+      //   · 通用客户端（注入 LX_CLIENT_SERVICE）：客户端有自己的版本线（V1.0 起算），
+      //     与服务端版本**本来就不是一个号**（客户端 V1.0 / 服务端 V1.3）。
+      //     这里要比的是「客户端期望对接哪一版服务端」，而不是客户端自己的版本号 ——
+      //     拿 1.0 去比 V1.3 必然不等，那就成了一条永远亮着的**假警告**，
+      //     比没有警告更糟（用户会学会忽略它）。
       const clientVer = String(window.LX_VERSION || '')
-      const same = !v.version || clientVer === 'web' || v.version === clientVer
+      const expect = String(window.LX_CLIENT_SERVICE || '')
+      const same = !v.version || clientVer === 'web'
+        || (expect ? v.version === expect : v.version === clientVer)
       host.innerHTML = '服务端 ' + esc(v.full || v.version || '?')
         + (same ? '' : '<span style="color:var(--warn,#e6a23c)"> ⚠ 与服务端版本不一致</span>')
       window.LX_VERSION_LINE = (window.LX_VERSION_LINE || '') + ' · 服务端 ' + (v.version || '?')

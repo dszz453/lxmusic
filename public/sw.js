@@ -6,8 +6,13 @@
  *  - **管理后台：完全不接管**（下面 ADMIN_PATHS，原因写在那里）
  *
  * 每次发版记得把 VERSION 往上抬一格，否则用户手机上会一直吃旧缓存。
+ *
+ * v28：通用客户端（client/）接入所需的两处前端改动 —— brand.js 支持客户端注入的
+ *      同步品牌判据（LX_CLIENT_HOST_HINT），app.js 的版本一致性比较改为比
+ *      「客户端期望的服务端版本」而不是客户端自己的版本号（客户端已有独立版本线）。
+ *      两者都是运行时才生效的判定，不抬 VERSION 的话老缓存会一直赢。
  */
-const VERSION = 'v27'
+const VERSION = 'v28'
 const STATIC_CACHE = 'lxmusic-static-' + VERSION
 const SHELL_CACHE = 'lxmusic-shell-' + VERSION
 

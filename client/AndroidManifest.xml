@@ -1,0 +1,123 @@
+<?xml version="1.0" encoding="utf-8"?>
+<!--
+  LX-MUSIC 通用客户端（安卓）
+
+  ── 与隔壁 music-edge 壳（android/）是什么关系 ──────────────────
+  同一份 public/ 前端资源、同一套桥接思路，但产品定位不同：
+    · android/（包名 com.zyplnn.musicedge）—— CF 那条线上的**离线自包含壳**：
+      后端整个跑在设备内，不连任何服务器。
+    · client/（包名 com.zyplnn.lxclient，本工程）—— **通用客户端**：
+      首启让你选连哪条线（内置离线 / Cloudflare / Docker 自托管 / 任意自建地址），
+      连通后服务端自报是什么，界面就显示什么品牌。
+  两者包名不同 → 可以同时装在一台机器上互不覆盖，方便对照。
+
+  ── 分层（对应网易云客户端的 原生 + RN 混合架构）────────────────
+    · 原生宿主层（Java）：ClientActivity 顶栏 / 原生底部导航 / 原生页面
+      （服务器连接、设置、本地音乐、关于）+ PlaybackService 媒体会话。
+    · 跨端桥接层（Java）：BridgeHub 统一 JSBridge，把 http / db / 媒体会话 /
+      原生 UI 能力暴露给跨端层。
+    · 跨端业务层（JS，见 rn/）：页面流转、底栏与路由同步、品牌与版本展示。
+      对应网易云那边的 React Native —— 同样是「原生宿主 + JS 承载业务 UI」，
+      只是渲染载体换成系统 WebView（本项目不引 Gradle/RN 工具链，详见 docs/client-android.md）。
+    · 底层能力层（Java + JNI 预留）：core/AudioEngine 本地音频扫描与解码接口。
+
+  ── 权限为什么是这几个 ────────────────────────────────────────
+    INTERNET / ACCESS_NETWORK_STATE：搜索与取流。
+    WAKE_LOCK：息屏不断流。
+    FOREGROUND_SERVICE(+MEDIA_PLAYBACK)：播放期前台服务，Android 14 起必须声明类型。
+    POST_NOTIFICATIONS：Android 13 起不申请就一条通知都不显示。
+    READ_MEDIA_AUDIO / READ_EXTERNAL_STORAGE：只给「本地音乐」页扫描设备音频用，
+      用 maxSdkVersion 卡住范围，新系统上不白要旧权限。
+-->
+<manifest xmlns:android="http://schemas.android.com/apk/res/android"
+    package="com.zyplnn.lxclient"
+    android:versionCode="100"
+    android:versionName="1.0">
+    <!--
+      versionCode / versionName 是 aapt2 link 时用 version-code / version-name 参数覆盖的
+      （见 build-client.sh，值来自 client/version.js —— 客户端自己的版本线）。
+      这里写的是兜底值，直接用 Android Studio 打开这个工程时也不至于没有版本号。
+      改版本请改 client/version.js，不要改这里。
+
+      注意：XML 注释里不能出现连续两个连字符（会报 not well-formed）。
+    -->
+
+    <uses-sdk android:minSdkVersion="21" android:targetSdkVersion="34" />
+
+    <uses-permission android:name="android.permission.INTERNET" />
+    <uses-permission android:name="android.permission.ACCESS_NETWORK_STATE" />
+    <uses-permission android:name="android.permission.WAKE_LOCK" />
+    <uses-permission android:name="android.permission.FOREGROUND_SERVICE" />
+    <uses-permission android:name="android.permission.FOREGROUND_SERVICE_MEDIA_PLAYBACK" />
+    <uses-permission android:name="android.permission.POST_NOTIFICATIONS" />
+    <!-- 本地音乐页扫描设备音频。Android 13 起用细粒度的 READ_MEDIA_AUDIO，
+         旧系统仍是 READ_EXTERNAL_STORAGE —— 两个都声明，各自用 maxSdkVersion 划界，
+         免得在新系统上被要求一个已经不生效的权限（用户看到会犹豫）。 -->
+    <uses-permission android:name="android.permission.READ_MEDIA_AUDIO" />
+    <uses-permission android:name="android.permission.READ_EXTERNAL_STORAGE"
+        android:maxSdkVersion="32" />
+    <!-- 「下载到本地」在 Android 9 及以下要写公共下载目录；10 起走 MediaStore 不需要 -->
+    <uses-permission android:name="android.permission.WRITE_EXTERNAL_STORAGE"
+        android:maxSdkVersion="28" />
+
+    <application
+        android:allowBackup="false"
+        android:hardwareAccelerated="true"
+        android:icon="@mipmap/ic_launcher"
+        android:label="@string/app_name"
+        android:supportsRtl="true"
+        android:theme="@style/AppTheme"
+        android:usesCleartextTraffic="true">
+
+        <!-- 主界面：原生顶栏 + 原生底部导航 + 跨端内容区 -->
+        <activity
+            android:name=".ClientActivity"
+            android:configChanges="orientation|screenSize|smallestScreenSize|keyboardHidden|uiMode|screenLayout"
+            android:exported="true"
+            android:launchMode="singleTask"
+            android:windowSoftInputMode="adjustResize">
+            <intent-filter>
+                <action android:name="android.intent.action.MAIN" />
+                <category android:name="android.intent.category.LAUNCHER" />
+            </intent-filter>
+        </activity>
+
+        <!-- 以下四个是**纯原生页面**（对应网易云那边的「设置 / 本地播放 / 权限」类页面）：
+             不经过 WebView，全部由系统控件绘制，打开快、不依赖网络。
+             服务器连接页尤其要这样 —— 服务器地址填错时跨端层自己都起不来，
+             它必须是一块完全独立的原生地面。 -->
+
+        <!-- 服务器连接（首启向导 + 设置页入口） -->
+        <activity
+            android:name=".ServerActivity"
+            android:exported="false"
+            android:theme="@style/ClientPageTheme" />
+
+        <!-- 设置 -->
+        <activity
+            android:name=".SettingsActivity"
+            android:exported="false"
+            android:theme="@style/ClientPageTheme" />
+
+        <!-- 本地音乐（底层能力层的入口） -->
+        <activity
+            android:name=".LocalMusicActivity"
+            android:exported="false"
+            android:theme="@style/ClientPageTheme" />
+
+        <!-- 关于（客户端版本 / 服务端版本 / 品牌 / 构建标识） -->
+        <activity
+            android:name=".AboutActivity"
+            android:exported="false"
+            android:theme="@style/ClientPageTheme" />
+
+        <!-- 播放期前台服务 = 媒体会话宿主。
+             mediaPlayback 这个类型有两个作用：Android 14 起前台服务必须声明类型；
+             声明之后系统也不会因为「用户从最近任务划掉了 App」而顺手把它收掉。 -->
+        <service
+            android:name=".PlaybackService"
+            android:exported="false"
+            android:foregroundServiceType="mediaPlayback"
+            android:stopWithTask="false" />
+    </application>
+</manifest>
