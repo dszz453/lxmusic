@@ -27,6 +27,7 @@
     user: '<svg viewBox="0 0 24 24"><circle cx="12" cy="8" r="4"/><path d="M4 21c0-4.4 3.6-8 8-8s8 3.6 8 8"/></svg>',
     play: '<svg viewBox="0 0 24 24"><path d="M8 5v14l11-7z"/></svg>',
     ai: '<svg viewBox="0 0 24 24"><path d="M12 3l1.9 5.1L19 10l-5.1 1.9L12 17l-1.9-5.1L5 10l5.1-1.9z"/></svg>',
+    link: '<svg viewBox="0 0 24 24"><path d="M9.5 14.5l5-5"/><path d="M11 7l1.6-1.6a3.5 3.5 0 0 1 5 5L16 12"/><path d="M13 17l-1.6 1.6a3.5 3.5 0 0 1-5-5L8 12"/></svg>',
   }
 
   const TABS = [
@@ -35,6 +36,7 @@
     { key: 'users', name: '用户管理', icon: 'user', render: renderUsers },
     { key: 'plays', name: '播放记录', icon: 'play', render: renderPlays },
     { key: 'ai', name: 'AI 歌单接口', icon: 'ai', render: renderAi },
+    { key: 'connect', name: '客户端接入', icon: 'link', render: renderConnect },
   ]
 
   const state = { user: null, tab: '', loading: false }
@@ -1307,6 +1309,83 @@
         toast('AI 配置已保存')
         renderAi()
       } catch (e) { toast((e && e.message) || '保存失败') }
+    })
+  }
+
+  /* ================= 客户端接入（Subsonic） ================= */
+
+  /**
+   * 「拿别的播放器连我这台服务器」该怎么填。
+   *
+   * 这块内容原来在**用户端**的「我的 → Subsonic 客户端接入」（#/about）。
+   * 挪过来的理由和管理端其它东西一致：它讲的是「这台服务器还能被谁用」，
+   * 属于服务器级别的信息，只有管理员会关心；摆在普通用户的「我的」里，
+   * 既占位置，又容易被当成播放设置（用户端从此不再有这个入口）。
+   *
+   * 服务器地址取 `location.origin` 是对的：/admin 本来就是由这台服务器自己
+   * 提供的，所以用户浏览器看到的管理端地址，就是外部客户端该填的地址。
+   */
+  async function renderConnect() {
+    const pane = shell('客户端接入')
+    const origin = location.origin
+    const https = location.protocol === 'https:'
+
+    const rows = [
+      ['服务器地址', origin, true],
+      ['端口', https ? '443（HTTPS）' : String(location.port || 80), false],
+      ['路径', '留空。客户端强制要求填路径时填 /rest', false],
+      ['用户名', state.user.username + '（本后台账号，也可以用任意其它账号）', false],
+      ['密码', '该账号的登录密码', false],
+      ['认证方式', 'Token —— 客户端里勾选「使用 Token 认证」，或按它的要求填 salt', false],
+    ]
+
+    const clients = ['音流（Android / iOS）', 'Feishin（桌面）', 'DSub（Android）',
+      'substreamer（iOS / Android）', 'Sonixd（Windows / macOS / Linux）']
+    const apis = ['ping', 'getLicense', 'search3', 'stream', 'download', 'getCoverArt',
+      'getLyricsBySongId', 'getPlaylists', 'getPlaylist', 'createPlaylist', 'updatePlaylist',
+      'deletePlaylist', 'star / unstar', 'getStarred2', 'getAlbumList2', 'getArtists',
+      'getArtist', 'getAlbum', 'scrobble', 'getScanStatus']
+
+    pane.innerHTML =
+      '<div class="admin-card">'
+      + '<div class="note" style="margin-bottom:10px">在第三方 Subsonic 客户端里按下面填，'
+      + '就能直接浏览、播放这台服务器上的歌曲（歌单与收藏也共用一份）。</div>'
+      + '<div class="admin-scroll"><table class="admin-table"><tbody>'
+      + rows.map(r => '<tr><th style="width:96px">' + esc(r[0]) + '</th>'
+        + '<td style="word-break:break-all">' + esc(r[1])
+        + (r[2] ? ' <button class="btn btn--sm btn--ghost" data-copy="' + esc(r[1]) + '" style="margin-left:6px">复制</button>' : '')
+        + '</td></tr>').join('')
+      + '</tbody></table></div>'
+      + '</div>'
+
+      + '<div class="admin-card">'
+      + '<div class="field__label" style="font-size:12px;margin-bottom:8px">已验证可用的客户端</div>'
+      + '<div class="note">' + clients.map(esc).join('　·　') + '</div>'
+      + '</div>'
+
+      + '<div class="admin-card">'
+      + '<div class="field__label" style="font-size:12px;margin-bottom:8px">已实现的 Subsonic 1.16.1 接口（' + apis.length + '）</div>'
+      + '<div class="note" style="line-height:1.9">' + apis.map(esc).join(' · ') + '</div>'
+      + '</div>'
+
+      + '<div class="admin-card">'
+      + '<div class="field__label" style="font-size:12px;margin-bottom:8px">注意</div>'
+      + '<div class="note">客户端填的地址必须是<b>它自己能访问到</b>的地址。'
+      + '在手机浏览器里打开本页时，地址栏里这个域名一般可以直接用；'
+      + '如果你是从局域网访问（192.168.x.x），那要在同一个局域网里的客户端才连得上。</div>'
+      + '</div>'
+
+    pane.querySelectorAll('[data-copy]').forEach((btn) => {
+      btn.addEventListener('click', async () => {
+        const text = btn.dataset.copy
+        try {
+          await navigator.clipboard.writeText(text)
+          toast('已复制')
+        } catch {
+          // 非 HTTPS / 无剪贴板权限时退回到选中文本，用户自己复制
+          toast(text, 8000)
+        }
+      })
     })
   }
 })(window)

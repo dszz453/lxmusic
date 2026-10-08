@@ -15,6 +15,9 @@
   const queueSheet = $('#queueSheet')
   const queueList = $('#queueList')
   const queueCount = $('#queueCount')
+  const dialog = $('#dialog')
+  const dialogTitle = $('#dialogTitle')
+  const dialogBody = $('#dialogBody')
 
   /* ================= 全局状态 ================= */
 
@@ -330,16 +333,23 @@
 
   /* ================= 首页（对齐网易云首页） ================= */
 
+  /**
+   * 金刚区。
+   *
+   * ⚠️ 项数必须是 5 的整数倍：CSS 里每项占 20%，5 项正好铺满一行。
+   * 原来是 7 项 —— 后两项被推到可视区外，既没有「可以横向滑」的提示，
+   * 边缘还露出小半截图标，看着像渲染坏了（用户的原话是「比例不够协调」）。
+   *
+   * 收敛掉的两项都是**已在别处有一模一样入口**的：
+   *   · 我的收藏  → 底部标签栏第三个 tab 就是它（同一个 #/favorite）；
+   *   · 播放历史  → 「我的」页第一项。
+   */
   const QUICKS = [
     { key: 'daily', label: '每日推荐', cls: 'c-red', icon: 'calendar' },
     { key: 'charts', label: '排行榜', cls: 'c-orange', icon: 'chart' },
     { key: 'album', label: '搜专辑', cls: 'c-green', icon: 'album' },
     { key: 'ai', label: 'AI 歌单', cls: 'c-teal', icon: 'sparkle' },
     { key: 'import', label: '歌单导入', cls: 'c-blue', icon: 'link' },
-    { key: 'favorite', label: '我的收藏', cls: 'c-pink', icon: 'heart' },
-    // 原来这里是「音源插件」—— 服务端插件已经收进管理端 /admin，
-    // 金刚区留给用户自己会反复用的功能：看看听到哪儿了。
-    { key: 'history', label: '播放历史', cls: 'c-purple', icon: 'history' },
   ]
 
   async function pageHome() {
@@ -919,10 +929,10 @@
             + '<div class="song__act">' + ICON.chevron + '</div>'
             + '</a>').join('') + '</div>'
           : emptyState('还没有歌单', '新建一个自己往里加歌，也可以导入别人的歌单，或用 AI 生成',
-            '<div style="display:flex;gap:10px;justify-content:center;margin-top:16px;flex-wrap:wrap">'
-            + '<button class="btn btn--sm" data-act="new-playlist">' + ICON.plus + '新建歌单</button>'
-            + '<a class="btn btn--sm" href="#/ai">✨ AI 生成</a>'
-            + '<a class="btn btn--sm btn--ghost" href="#/import">导入歌单</a></div>'))
+            // 只留标题栏里**没有**的那个入口：
+            // 「新建」「导入」在 pageHeader 右侧常驻着（见 libraryHead），
+            // 空状态里再放一遍，同一屏会出现两个一模一样功能的按钮。
+            '<div style="margin-top:16px"><a class="btn btn--sm" href="#/ai">' + ICON.sparkle + 'AI 生成歌单</a></div>'))
     } catch (e) {
       view.innerHTML = emptyState('加载失败', esc((e && e.message) || ''))
     }
@@ -1323,8 +1333,15 @@
     return '<div class="field__label" style="margin-bottom:8px">本地插件（' + online.length + ' 个）· 只在本机生效</div>'
       + list
       + '<button class="btn btn--block" data-act="open-import-plugin" style="margin-top:12px">导入插件（URL / 粘贴脚本）</button>'
-      + '<div class="field__label" style="margin:16px 0 8px">常用音源一键导入</div>'
+      // 常用音源默认**收起**：二十多条「名字 + 仓库路径」直铺开是一屏多的列表墙，
+      // 把上面「本地插件」和「修改密码」全挤到看不见的地方 —— 而绝大多数用户
+      // 一辈子只会用那一个已经在跑的源。想加新源的人点一下展开就行。
+      + '<button class="btn btn--block btn--ghost btn-toggle" data-act="toggle-presets" style="margin-top:10px" '
+      + 'aria-expanded="false" id="presetToggle">常用音源一键导入（' + LXP.PRESETS.length + '）' + ICON.chevron + '</button>'
+      + '<div id="presetBox" hidden>'
+      + '<div class="field__label" style="margin:14px 0 8px">选一个直接导入到本机</div>'
       + presets
+      + '</div>'
       + '<div class="note" style="margin-top:10px">插件脚本经服务端代理下载、在浏览器 Web Worker 沙箱里执行，'
       + '只用于解析播放链接，不会上传任何账号信息。存在本机 IndexedDB，清掉 App 数据就没了。</div>'
   }
@@ -1350,98 +1367,30 @@
   /**
    * 远程模式下的「音源插件」区块。
    *
-   * ⚠️ 这块以前只写一句「插件由服务器统一管理与调度，需要增删插件请到管理端」，
-   * 而**管理端当时根本没有导入功能**（只有列表 / 评分 / 启停），服务端也没有导入接口
-   * —— 等于把人指到一个不存在的地方。用户反馈的原话就是
-   * 「插件没有办法手动导入新的插件」。
+   * 只留一句说明，外加一个去管理后台的入口（且**只在网页端**、且只有管理员看得到）。
    *
-   * 现在服务端补齐了导入 / 删除（见 src/server/plugin-import.mjs），这里也直接给
-   * 一个导入入口：手机上调出浏览器去开管理端本来就别扭，能在 App 里点完最好。
-   * 非管理员只看到说明 —— 服务端的插件池是全局的，改它会影响所有人。
+   * 这里原来是一整套「从 URL 导入 / 粘贴脚本导入 / 列出服务器上的插件 / 删除」的
+   * 界面 —— 那实质上是管理后台「音源与插件」标签页的完整副本。当初这么写有它的
+   * 道理（当时管理端只有列表/评分/启停，没有导入，用户端只留一句「请到管理端」
+   * 等于把人指到一个不存在的地方）。但现在管理端补齐了导入与删除
+   * （见 public/js/admin.js 的 renderSources），同一件事两处各做一遍就只剩坏处：
+   * 改一处必忘另一处，而服务端的插件池是**全局的**，本来就该归管理端。
+   *
+   * 客户端里连按钮都不给：它会跳出原生外壳去系统浏览器（见 inAndroidApp）。
    */
   function remotePluginNoteHtml() {
     const base = (window.LXApp && window.LXApp.serverBase) || ''
     const adminUrl = base + '/admin'
     const isAdmin = !!(App.user && App.user.isAdmin)
     const head = '<div class="field__label" style="margin-bottom:8px">音源插件</div>'
-      + '<div class="note">当前是自建服务器模式，插件在服务器上统一加载与调度，本机不再单独加载。</div>'
-    if (!isAdmin) {
-      return head
-        + '<a class="btn btn--block btn--ghost" style="margin-top:12px" href="' + esc(adminUrl)
-        + '" target="_blank" rel="noopener">打开管理端</a>'
-        + '<div class="note" style="margin-top:8px">' + esc(adminUrl) + '</div>'
-        + '<div class="note" style="margin-top:8px">音源插件由服务器统一管理，只有管理员账号能增删。</div>'
-    }
+      + '<div class="note">当前是自建服务器模式，插件在服务器上统一加载与调度，本机不再单独加载。'
+      + (isAdmin ? '' : '增删插件只有管理员账号能做。') + '</div>'
+    // 非管理员没什么可给他看的；安卓客户端里不给网页入口
+    if (!isAdmin || inAndroidApp()) return head
     return head
-      + '<div class="field" style="margin-top:12px"><div class="field__label">插件脚本 URL</div>'
-      + '<input class="input" id="srvPluginUrl" placeholder="https://.../latest.js" autocomplete="off"></div>'
-      + '<button class="btn btn--block" data-act="srv-import-url">从 URL 导入到服务器</button>'
-      + '<button class="btn btn--block btn--ghost" style="margin-top:8px" data-act="srv-import-open">粘贴脚本导入</button>'
-      + '<div id="srvImportBox" hidden style="margin-top:10px">'
-      + '<textarea class="textarea" id="srvPluginText" placeholder="/* @name ... */&#10;(function(){ ... })()"></textarea>'
-      + '<button class="btn btn--block" data-act="srv-import-text" style="margin-top:8px">解析并导入</button>'
-      + '</div>'
-      + '<div class="note" id="srvPluginState" style="margin-top:10px"></div>'
-      + '<div class="field__label" style="margin:16px 0 8px">服务器上的插件</div>'
-      + '<div id="srvPluginList"><div class="note">加载中…</div></div>'
       + '<a class="btn btn--block btn--ghost" style="margin-top:12px" href="' + esc(adminUrl)
-      + '" target="_blank" rel="noopener">打开管理端（完整设置）</a>'
-  }
-
-  /** 拉取服务器上的插件清单并画出来（仅远程模式 + 管理员） */
-  async function refreshServerPlugins() {
-    const host = $('#srvPluginList')
-    if (!host) return
-    try {
-      const r = await API.plugins()
-      const list = (r && r.list) || []
-      if (!list.length) { host.innerHTML = '<div class="note">服务器上还没有插件。</div>'; return }
-      host.innerHTML = list.map(p => {
-        const badges = '<span class="pill ' + (p.ok ? 'pill--ok' : 'pill--bad') + '">'
-          + (p.ok ? '运行中' : '加载失败') + '</span>'
-          + (p.bytes ? '<span class="pill">' + Math.round(p.bytes / 1024) + 'KB</span>' : '')
-          + (p.origin === 'user' ? '<span class="pill">手动导入</span>' : '')
-        return '<div class="card-block"><div class="card-block__head">'
-          + '<span class="card-block__name">' + esc(p.name || p.id) + '</span>' + badges
-          + '</div><div class="card-block__desc">'
-          + ((p.sources || []).map(x => '<span class="pill">' + esc(App.platformShort[x] || x) + '</span>').join('') || '—')
-          + '</div>'
-          + (!p.ok && p.error ? '<div class="note" style="color:#d73535;margin-top:4px">' + esc(p.error) + '</div>' : '')
-          + (p.origin === 'user'
-            ? '<div style="margin-top:10px"><button class="btn btn--sm btn--ghost" data-act="srv-del-plugin" data-id="'
-              + esc(p.id) + '">删除</button></div>'
-            : '')
-          + '</div>'
-      }).join('')
-    } catch (e) {
-      host.innerHTML = '<div class="note" style="color:#d73535">读取失败：' + esc((e && e.message) || '') + '</div>'
-    }
-  }
-
-  /**
-   * 把插件导入到**服务器**。
-   *
-   * 失败原因（URL 不通 / 内容不像插件脚本 / 脚本自身加载失败）留在页面上而不只是
-   * 弹 toast —— 两秒后 toast 就没了，而这三类原因的处置办法完全不同。
-   */
-  async function importPluginToServer(payload, node) {
-    const st = $('#srvPluginState')
-    const old = node ? node.textContent : ''
-    if (node) { node.disabled = true; node.textContent = '导入中…' }
-    if (st) { st.style.color = ''; st.textContent = '正在下载并加载插件…（大脚本可能要十几秒）' }
-    try {
-      const r = await API.importPlugin(payload)
-      const name = (r.plugin && r.plugin.name) || '插件'
-      toast((r.replaced ? '已更新：' : '已导入：') + name + (r.from ? '（经 ' + r.from + '）' : ''))
-      if (st) st.textContent = '已导入：' + name
-      await refreshServerPlugins()
-    } catch (e) {
-      const msg = (e && e.message) || '导入失败'
-      if (st) { st.textContent = msg; st.style.color = '#d73535' }
-      toast(msg, 6000)
-    } finally {
-      if (node) { node.disabled = false; node.textContent = old }
-    }
+      + '" target="_blank" rel="noopener">打开管理后台</a>'
+      + '<div class="note" style="margin-top:8px">导入 / 排序 / 评分 / 启停都在「音源与插件」里。</div>'
   }
 
   /**
@@ -1585,7 +1534,7 @@
     toast(r.ok ? '连接正常（' + r.ms + 'ms）' : '连不上：' + r.error)
   }
 
-  function applyServerFrom(input, user) {
+  async function applyServerFrom(input, user) {
     if (!window.LXApp || typeof window.LXApp.applyServer !== 'function') { toast('仅本机版可用'); return }
     const base = window.LXApp.normalizeServer(input)
     const cur = window.LXApp.serverBase || ''
@@ -1595,8 +1544,14 @@
     const what = base
       ? ('切换到服务器 ' + base + (nextUser && nextUser !== curUser ? '（用户名 ' + nextUser + '）' : ''))
       : '恢复本机模式'
-    if (!confirm(what + '？\n\nApp 会重启一次。'
-      + (base ? '服务器上的账号和播放记录才是之后看到的。' : '之后看到的是这台手机上的数据。'))) return
+    const ok = await askConfirm({
+      title: what,
+      html: 'App 会重启一次。<br>' + (base
+        ? '服务器上的账号和播放记录才是之后看到的。'
+        : '之后看到的是这台手机上的数据。'),
+      okText: '切换',
+    })
+    if (!ok) return
     toast('正在切换…', 2000)
     window.LXApp.applyServer(base, nextUser)
   }
@@ -1647,24 +1602,49 @@
 
   /* ================= 我的 ================= */
 
+  /**
+   * 当前是不是跑在**安卓客户端里**（无论哪个壳）。
+   *
+   * 判据两条，缺一不可：
+   *   · `window.LX_NATIVE` —— 老壳 music-edge 与通用客户端都会为真
+   *     （native.js 见到 AndroidHost 就置位）；
+   *   · `window.LXNative`  —— 通用客户端专属的桥对象，作为交叉验证。
+   *
+   * 用途：管理后台是**另一个页面**（/admin），它有自己的登录、会加载一整张表格，
+   * 是给电脑浏览器用的。在手机客户端里点开它体验很差，而且会跳出原生外壳
+   * （用系统浏览器打开一个新标签），用户会以为 App 崩了。所以客户端里干脆不显示入口。
+   */
+  function inAndroidApp() {
+    return !!(global.LX_NATIVE || global.LXNative)
+  }
+
   async function pageMine() {
     const u = App.user || {}
+    /**
+     * 这一页只放**别处进不去**的入口。
+     *
+     * 判据两条，之前都没守：
+     *   ① 底部标签栏已经有一模一样的目标 → 不再重复列一遍
+     *      （「我的歌单」= tab 我的歌单，「我喜欢的音乐」= tab 收藏，
+     *        三个字对三个字、链接也同一个，纯粹是让这一页变长）；
+     *   ② 只影响某个平台/别的页面的事 → 归到那边
+     *      （「Subsonic 客户端接入」是按服务器接客户端用的，已搬进管理后台；
+     *        管理后台入口在安卓客户端里也不显示，见 inAndroidApp）。
+     */
     const items = [
-      // 播放历史排在第一位：它是「上次听到哪」的入口，比「我的歌单」更常用
       { act: 'nav', href: '#/history', icon: 'history', text: '播放历史' },
-      { act: 'nav', href: '#/library', icon: 'list', text: '我的歌单' },
       { act: 'nav', href: '#/ai', icon: 'sparkle', text: 'AI 生成歌单' },
-      { act: 'nav', href: '#/favorite', icon: 'heart', text: '我喜欢的音乐' },
       { act: 'nav', href: '#/import', icon: 'link', text: '导入歌单' },
       { act: 'nav', href: '#/settings', icon: 'settings', text: '播放与账号设置' },
-      { act: 'nav', href: '#/about', icon: 'info', text: 'Subsonic 客户端接入' },
+      { act: 'nav', href: '#/about', icon: 'info', text: '关于' },
     ]
     // 管理后台是**另一个页面**（/admin），不是本站的 hash 路由：
     // 它自带登录、不加载播放器，用户端这边只留一个跳板。
     // 用新标签页打开，免得在同一个标签里来回切换把播放中的队列丢掉。
     // 远程模式下管理端在服务器那一侧，必须带上服务器基址 —— 否则点开的是本机页面
     // （页面 origin 是壳里那个「假域名」），什么都不会有。
-    if (u.isAdmin) {
+    // 客户端里不给这个入口：它会跳出原生外壳去系统浏览器，用户会以为 App 崩了。
+    if (u.isAdmin && !inAndroidApp()) {
       const adminHref = (window.LX_REMOTE && window.LXApp ? window.LXApp.serverBase : '') + '/admin'
       items.push({ act: 'link', href: adminHref, icon: 'key', text: '管理后台（音源 / 用户 / 记录）' })
     }
@@ -1783,8 +1763,10 @@
       + '<div class="block" id="localPluginBlock">' + (window.LX_REMOTE ? remotePluginNoteHtml() : localPluginBlockHtml()) + '</div>'
       + (window.LX_NATIVE ? '<div class="block" id="serverBlock">' + serverBlockHtml() + '</div>' : '')
       + (window.LX_NATIVE ? '<div class="block" id="mediaBlock">' + mediaBlockHtml() + '</div>' : '')
-      + '<div class="block"><div class="field__label">当前账号</div><div class="note">' + esc(u.username || '-') + (u.isAdmin ? '（管理员）' : '') + '</div>'
-      + '<button class="btn btn--block btn--ghost" style="margin-top:10px" data-act="logout">退出登录</button></div>'
+      // 「退出登录」只在「我的」页留一个：两处都能退，用户改完密码在设置页点一下、
+      // 在「我的」页又看到一次，会怀疑是不是两个不同的动作。
+      + '<div class="block"><div class="field__label">当前账号</div>'
+      + '<div class="note">' + esc(u.username || '-') + (u.isAdmin ? '（管理员）' : '') + '　·　退出登录在「我的」页。</div></div>'
       + '<div class="block"><div class="field__label">版本</div><div class="note" id="verLine">' + esc(window.LX_VERSION_LINE || '读取中…') + '</div>'
       + '<div class="note" style="margin-top:6px" id="verHost">读取服务端版本…</div></div>'
       + '<div style="height:20px"></div>'
@@ -1793,8 +1775,6 @@
     fillVersionBlock()
     // 缓存占用要遍历 Cache Storage 量字节，同步算会卡住整个设置页
     fillCacheBlock()
-    // 服务器模式下的插件清单也异步补（同样不占首屏）
-    if (window.LX_REMOTE) refreshServerPlugins().catch(() => {})
   }
 
   /* ---------------- 播放缓存 / 下载 ---------------- */
@@ -2035,35 +2015,44 @@
     }
   }
 
-  /* ================= Subsonic 接入信息 ================= */
+  /* ================= 关于 ================= */
 
+  /** 开源仓库。只在这里写一次，页面与说明都从它取 */
+  const REPO_URL = 'https://github.com/dszz453/lxmusic'
+
+  /**
+   * 关于页。
+   *
+   * 原来这一页叫「Subsonic 客户端接入」（#/about），主体是一张「服务器地址/端口/
+   * 用户名/认证方式」的说明表 —— 那是**按服务器接第三方客户端**用的运维信息，
+   * 不是普通用户会看的东西，已经整体搬进管理后台（/admin 的「客户端接入」标签页）。
+   * 这一页只留下「这是个什么应用、怎么联系作者、在哪拿源码」。
+   */
   function pageAbout() {
-    const origin = location.origin
-    const u = App.user || {}
     const rows = [
-      { k: '服务器地址', v: origin },
-      { k: '端口', v: location.protocol === 'https:' ? '443（HTTPS）' : '80' },
-      { k: '用户名', v: u.username || '-' },
-      { k: '密码', v: '你自己的登录密码' },
-      { k: '认证方式', v: 'Token（客户端里勾选 "使用 Token 认证" 或填 salt）' },
+      { k: '应用', v: brandName() },
+      { k: '版本', v: (window.LX_VERSION_LINE || '') },
+      { k: '宿主', v: window.LX_NATIVE ? '安卓客户端（设备内运行）' : '网页 / PWA' },
+      { k: '开源仓库', v: REPO_URL, copy: true },
     ]
-    view.innerHTML = pageHeader('Subsonic 客户端接入')
+    view.innerHTML = pageHeader('关于')
       + '<div class="block">'
-      + rows.map(r => '<div style="display:flex;gap:10px;padding:8px 0;border-bottom:1px solid var(--line)">'
-        + '<div class="note" style="flex:0 0 84px">' + r.k + '</div>'
-        + '<div style="flex:1;word-break:break-all;font-size:13.5px">' + esc(r.v) + '</div></div>').join('')
-      + '<div class="note" style="margin-top:14px">在 <b>音流 / Feishin / DSub / substreamer</b> 等客户端里，服务器地址填 <b>' + esc(origin) + '</b>，'
-      + '用户名密码填本应用的登录账号即可。若客户端要求填路径，加 <b>/rest</b>。</div>'
+      + rows.map(r => '<div style="display:flex;gap:10px;padding:9px 0;border-bottom:1px solid var(--line);align-items:center">'
+        + '<div class="note" style="flex:0 0 76px">' + r.k + '</div>'
+        + '<div style="flex:1;min-width:0;word-break:break-all;font-size:13.5px">' + esc(r.v || '-') + '</div>'
+        + (r.copy ? '<button class="btn btn--sm btn--ghost" data-act="copy-repo" style="flex:0 0 auto">复制</button>' : '')
+        + '</div>').join('')
       + '</div>'
-      + '<div class="block"><div class="field__label" style="margin-bottom:8px">支持的接口</div>'
-      + '<div class="note">ping · getLicense · search3 · stream · download · getCoverArt · getLyricsBySongId · '
-      + 'getPlaylists · getPlaylist · createPlaylist · updatePlaylist · deletePlaylist · star / unstar · '
-      + 'getStarred2 · getAlbumList2 · getArtists · getArtist · getAlbum · scrobble · getScanStatus 等 Subsonic 1.16.1 接口。</div></div>'
-      + '<div class="block"><div class="field__label" style="margin-bottom:8px">关于</div>'
-      + '<div class="note" id="aboutVer">' + esc(window.LX_VERSION_LINE || '') + '</div>'
-      + '<div class="note" style="margin-top:6px">本应用兼容落雪（LX Music）自定义音源插件，'
-      + '搜索聚合酷狗 / 网易云 / 酷我 / QQ音乐等平台，播放地址由插件解析后输出。'
-      + '可跑在 Cloudflare Workers、安卓壳内或你自己的 Docker 服务器上。</div></div>'
+      + '<div class="block"><div class="field__label" style="margin-bottom:8px">这是什么</div>'
+      + '<div class="note">一个音乐搜索与播放聚合应用：兼容落雪（LX Music）自定义音源插件，'
+      + '把酷狗 / 网易云 / 酷我 / QQ音乐等平台的搜索聚合到一起，播放地址由插件解析后输出。</div>'
+      + '<div class="note" style="margin-top:6px">可以跑在 Cloudflare Workers、你自己的 Docker 服务器，'
+      + '或者作为安卓客户端装在手机上 —— 同一份代码，两个名字（' + esc(brandName()) + '）。</div></div>'
+      + '<div class="block"><div class="field__label" style="margin-bottom:8px">服务端能力</div>'
+      + '<div class="note">除了网页与客户端，服务端还实现了 Subsonic 1.16.1 接口'
+      + '（search3 · stream · getCoverArt · getLyricsBySongId · getPlaylists · star / unstar · scrobble 等），'
+      + '可以用音流 / Feishin / DSub / substreamer 这类客户端直接连。'
+      + '接入参数见管理后台的「客户端接入」。</div></div>'
       + '<div style="height:20px"></div>'
   }
 
@@ -2159,6 +2148,127 @@
     if (typeof onMount === 'function') onMount()
   }
 
+  /* ---------------- 通用对话框：取代系统的 prompt / confirm ---------------- */
+
+  /**
+   * 为什么不用 prompt / confirm（在安卓客户端里这是硬需求）：
+   *
+   * 1) **WebView 会在弹窗标题里打印页面地址**。用户看到的是
+   *    「https://music.zyplnn.dpdns.org 说：新歌单名称」—— 在一个原生外壳里
+   *    冒出一个网址，既出戏又会让人怀疑「我是不是被带到什么网页上去了」。
+   *    这个网址由 WebView 自己画，改不了，唯一办法就是不用系统弹窗。
+   * 2) 系统弹窗的样式完全不归我们管：不能换行、不能给危险操作标红、
+   *    深色模式下也不跟主题。
+   *
+   * 语义上是「打断当前操作、要一个答复」，所以用居中模态而不是底部抽屉。
+   * 两个函数都返回 Promise，调用点仍然是一行 await，和原来的写法一样顺。
+   */
+
+  /** 当前挂起中的对话框的 「取消」 回调 —— 同一时刻只允许存在一个对话框 */
+  let dialogSettle = null
+
+  function settleDialog(value) {
+    const fn = dialogSettle
+    dialogSettle = null
+    closeSheet(dialog)
+    if (fn) fn(value)
+  }
+
+  /**
+   * @param {object} o
+   *   title       标题
+   *   bodyHtml    正文（html 片段，调用方自己负责转义）
+   *   pick(root)  点「确定」时从 DOM 里取值，返回值即 resolve 出去的结果
+   *   danger      危险操作：确定按钮标红
+   *   cancelValue 「取消」时 resolve 出去的值
+   */
+  function openDialog(o, pick, cancelValue) {
+    // 上一个还开着就当作被取消：否则它的 await 会永远悬着（调用方的按钮卡在禁用态）
+    if (dialogSettle) { const prev = dialogSettle; dialogSettle = null; prev(cancelValue) }
+
+    if (dialogTitle) dialogTitle.textContent = o.title || ''
+    if (dialogBody) {
+      // 内容包一层 #dlgRoot 再挂监听：dialogBody 本身是常驻节点，
+      // 直接往它上面 addEventListener 会**每次开对话框叠一个**（开关五次之后
+      // 一次回车触发五个回调，其中四个拿着过期的闭包）。挂在每次都重建的
+      // 子节点上，监听随 DOM 一起消失，天然不会累积。
+      dialogBody.innerHTML = '<div id="dlgRoot">' + o.bodyHtml
+        + '<div class="dialog__acts">'
+        + '<button class="btn btn--ghost" data-dialog="cancel">' + esc(o.cancelText || '取消') + '</button>'
+        + '<button class="btn' + (o.danger ? ' btn--danger' : '') + '" data-dialog="ok">' + esc(o.okText || '确定') + '</button>'
+        + '</div></div>'
+    }
+    openSheet(dialog)
+
+    return new Promise((resolve) => {
+      dialogSettle = resolve
+      const root = dialogBody && dialogBody.querySelector('#dlgRoot')
+      if (!root) { settleDialog(cancelValue); return }
+      const done = (ok) => {
+        if (!dialogSettle) return          // 已经 settle 过（重复点击 / 遮罩已关）
+        settleDialog(ok ? pick(root) : cancelValue)
+      }
+      root.querySelectorAll('[data-dialog]').forEach((btn) => {
+        btn.addEventListener('click', () => done(btn.dataset.dialog === 'ok'))
+      })
+      // 回车 = 确定，Esc = 取消（桌面浏览器上也顺手）
+      root.addEventListener('keydown', (e) => {
+        if (e.key === 'Enter' && !e.shiftKey) { e.preventDefault(); done(true) }
+        else if (e.key === 'Escape') { e.preventDefault(); done(false) }
+      })
+      const input = root.querySelector('input')
+      if (input) {
+        // 移动端自动聚焦会立刻弹键盘、把对话框顶上去；交给用户主动点更稳，
+        // 桌面端（精确指针）自动聚焦能省一次点击 —— 按指针类型判断。
+        try {
+          if (!matchMedia('(pointer: coarse)').matches) { input.focus(); input.select() }
+        } catch { /* 老内核没有 matchMedia，不聚焦就行 */ }
+      }
+    })
+  }
+
+  /** 取消：走遮罩点击 */
+  function bindDialogMask() {
+    if (!dialog) return
+    dialog.addEventListener('click', (e) => {
+      if (e.target.closest('[data-close]')) settleDialog(null)
+    })
+    // 兜底：路由一变就把挂起的对话框结掉（安卓上「返回」不会产生 click）
+    global.addEventListener('hashchange', () => { if (dialogSettle) settleDialog(null) })
+  }
+
+  /**
+   * 问一个字符串。取消 → null，确定 → 去掉首尾空格后的值（可能是空串，
+   * 调用方照旧用 `if (!name) return` 挡住 —— 与 prompt 的语义一致）。
+   */
+  function askText(o) {
+    const value = String(o.value == null ? '' : o.value)
+    return openDialog(
+      Object.assign({
+        bodyHtml: '<div class="field" style="margin:0">'
+          + '<input class="input" id="dlgInput" autocomplete="off" '
+          + 'placeholder="' + esc(o.placeholder || '') + '" value="' + esc(value) + '" '
+          + (o.maxlength ? 'maxlength="' + o.maxlength + '"' : '') + '></div>',
+      }, o),
+      (root) => {
+        const el = root.querySelector('#dlgInput')
+        return el ? String(el.value || '').trim() : ''
+      },
+      null,
+    )
+  }
+
+  /** 问一个是非。取消 / 关闭 → false，确定 → true。 */
+  function askConfirm(o) {
+    return openDialog(
+      Object.assign({
+        bodyHtml: '<div class="dialog__msg">' + (o.html || esc(o.message || '')) + '</div>',
+      }, o),
+      () => true,
+      false,
+    )
+  }
+
   function openQueue() {
     renderQueue()
     openSheet(queueSheet)
@@ -2232,9 +2342,14 @@
       toast('这个音源不支持音效（没有跨域许可），换一首或换音质再试')
       return
     }
-    if (!usable && !confirm('当前音源不支持音效（服务器没给跨域许可）。\n\n'
-      + '改用服务端中转播放可以开启音效，声音正常，但音频会多走一跳服务器。是否切换？')) {
-      return
+    if (!usable) {
+      const ok = await askConfirm({
+        title: '这个音源不支持音效',
+        html: '服务器没给跨域许可，Web Audio 处理这条流会输出静音。<br><br>'
+          + '改用服务端中转播放可以开启音效，声音正常，但音频会多走一跳服务器。是否切换？',
+        okText: '切换',
+      })
+      if (!ok) return
     }
     if (!Tone.setPreset(key)) { toast('音效不可用'); return }
     const running = await Tone.resume()
@@ -2336,15 +2451,17 @@
 
     /* --- 顶部栏 --- */
     $('#btnMenu').addEventListener('click', () => {
+      // 这张抽屉是「快捷跳转」，只列底部标签栏**没有**的目的地：
+      // 四个 tab 已经在手边了，再列一遍等于把抽屉撑长、让人在里面找已经看得见的东西。
+      // 「Subsonic 接入」已搬进管理后台（按服务器接客户端用的，不属于用户端）。
       openDrawer('菜单',
         '<div class="menu-item" data-act="nav" data-href="#/"><span class="quick__icon c-red">' + ICON.sound + '</span><div class="menu-item__text">发现音乐</div></div>'
         + '<div class="menu-item" data-act="nav" data-href="#/charts"><span class="quick__icon c-orange">' + ICON.chart + '</span><div class="menu-item__text">排行榜</div></div>'
-        + '<div class="menu-item" data-act="nav" data-href="#/library"><span class="quick__icon c-blue">' + ICON.list + '</span><div class="menu-item__text">我的歌单</div></div>'
-        + '<div class="menu-item" data-act="nav" data-href="#/favorite"><span class="quick__icon c-pink">' + ICON.heart + '</span><div class="menu-item__text">我喜欢的音乐</div></div>'
+        + '<div class="menu-item" data-act="nav" data-href="#/search?type=album"><span class="quick__icon c-green">' + ICON.album + '</span><div class="menu-item__text">搜专辑</div></div>'
+        + '<div class="menu-item" data-act="nav" data-href="#/ai"><span class="quick__icon c-teal">' + ICON.sparkle + '</span><div class="menu-item__text">AI 歌单</div></div>'
         + '<div class="menu-item" data-act="nav" data-href="#/history"><span class="quick__icon c-purple">' + ICON.history + '</span><div class="menu-item__text">播放历史</div></div>'
-        + '<div class="menu-item" data-act="nav" data-href="#/import"><span class="quick__icon c-teal">' + ICON.link + '</span><div class="menu-item__text">导入歌单</div></div>'
-        + '<div class="menu-item" data-act="nav" data-href="#/settings"><span class="quick__icon c-gray">' + ICON.settings + '</span><div class="menu-item__text">设置</div></div>'
-        + '<div class="menu-item" data-act="nav" data-href="#/about"><span class="quick__icon c-gray">' + ICON.info + '</span><div class="menu-item__text">Subsonic 接入</div></div>')
+        + '<div class="menu-item" data-act="nav" data-href="#/import"><span class="quick__icon c-blue">' + ICON.link + '</span><div class="menu-item__text">导入歌单</div></div>'
+        + '<div class="menu-item" data-act="nav" data-href="#/settings"><span class="quick__icon c-gray">' + ICON.settings + '</span><div class="menu-item__text">设置</div></div>')
     })
     $('#btnAccount').addEventListener('click', () => go('#/mine'))
 
@@ -2447,7 +2564,7 @@
         break
       /* --- 播放历史（注意和上面「搜索历史」不是一回事） --- */
       case 'clear-play-history': {
-        if (!confirm('清空全部播放历史？')) return
+        if (!await askConfirm({ title: '清空播放历史', message: '清空后无法恢复。', okText: '清空', danger: true })) return
         try {
           await API.clearPlayHistory()
           toast('已清空播放历史')
@@ -2482,7 +2599,7 @@
         break
       }
       case 'new-playlist': {
-        const name = prompt('新歌单名称', '我的歌单')
+        const name = await askText({ title: '新建歌单', value: '我的歌单', placeholder: '歌单名称', okText: '创建' })
         if (!name) return
         try {
           const res = await API.createPlaylist(name.trim(), [])
@@ -2492,7 +2609,7 @@
         break
       }
       case 'del-playlist': {
-        if (!confirm('确定删除这个歌单吗？')) return
+        if (!await askConfirm({ title: '删除歌单', message: '歌单里的歌不会被删除，只是这张歌单没了。', okText: '删除', danger: true })) return
         try {
           await API.deletePlaylist(node.dataset.id)
           toast('已删除')
@@ -2512,7 +2629,7 @@
       }
       case 'rename-playlist': {
         if (!plCtx) return
-        const name = prompt('歌单名称', plCtx.name || '')
+        const name = await askText({ title: '重命名歌单', value: plCtx.name || '', placeholder: '歌单名称', okText: '保存' })
         if (!name || !name.trim()) return
         try {
           await API.renamePlaylist(node.dataset.id || plCtx.id, name.trim())
@@ -2527,7 +2644,7 @@
         const song = (lists[node.dataset.list] || [])[i]
         closeSheet(drawer)
         if (!song) return
-        if (!confirm('把「' + song.name + '」从这个歌单里移除？')) return
+        if (!await askConfirm({ title: '移出歌单', message: '把「' + song.name + '」从这张歌单里移除？', okText: '移除', danger: true })) return
         try {
           await API.removePlaylistSong(plCtx.id, i)
           toast('已移除')
@@ -2620,7 +2737,7 @@
         break
       }
       case 'logout': {
-        if (!confirm('确定退出登录吗？')) return
+        if (!await askConfirm({ title: '退出登录', message: '退出后需要重新输入密码。', okText: '退出', danger: true })) return
         API.setToken('')
         App.user = null
         closeSheet(drawer)
@@ -2629,37 +2746,8 @@
       }
       /* --- 插件相关 --- */
       case 'open-import-plugin': closeSheet(drawer); openPluginImport(); break
-      /* --- 服务器模式的插件导入（见 remotePluginNoteHtml） --- */
-      case 'srv-import-url': {
-        const url = (($('#srvPluginUrl') || {}).value || '').trim()
-        if (!url) { toast('请先填插件 URL'); return }
-        await importPluginToServer({ url }, node)
-        break
-      }
-      case 'srv-import-open': {
-        const box = $('#srvImportBox')
-        if (box) box.hidden = !box.hidden
-        break
-      }
-      case 'srv-import-text': {
-        const text = (($('#srvPluginText') || {}).value || '').trim()
-        if (text.length < 50) { toast('脚本体太短了'); return }
-        await importPluginToServer({ script: text }, node)
-        break
-      }
-      case 'srv-del-plugin': {
-        if (!confirm('从服务器删除这个插件？删掉后取流就不会再用它了。')) return
-        node.disabled = true
-        try {
-          await API.deletePlugin(node.dataset.id)
-          toast('已删除')
-          await refreshServerPlugins()
-        } catch (e) {
-          node.disabled = false
-          toast((e && e.message) || '删除失败')
-        }
-        break
-      }
+      // 服务端插件的导入 / 删除已经统一收进管理后台（见 remotePluginNoteHtml），
+      // 这里不再保留重复入口。
       case 'import-preset': {
         const preset = LXP.PRESETS[Number(node.dataset.i)]
         if (!preset) return
@@ -2675,7 +2763,7 @@
         break
       }
       case 'del-plugin': {
-        if (!confirm('删除该插件？')) return
+        if (!await askConfirm({ title: '删除插件', message: '这台设备将不再加载它。', okText: '删除', danger: true })) return
         await LXP.remove(node.dataset.id)
         await reloadLocalPlugins()
         toast('已删除')
@@ -2733,8 +2821,19 @@
       case 'open-cache-list':
         go('#/cache')
         break
+      case 'copy-repo':
+        copyText(REPO_URL)
+        break
+      case 'toggle-presets': {
+        const box = $('#presetBox')
+        if (!box) break
+        box.hidden = !box.hidden
+        node.setAttribute('aria-expanded', box.hidden ? 'false' : 'true')
+        node.classList.toggle('is-open', !box.hidden)
+        break
+      }
       case 'clear-cache': {
-        if (!confirm('清空全部播放缓存？已下载到本机的文件不受影响。')) return
+        if (!await askConfirm({ title: '清空播放缓存', message: '已下载到本机的文件不受影响。', okText: '清空', danger: true })) return
         const ok = window.LXAudioCache && await window.LXAudioCache.clear()
         toast(ok ? '缓存已清空' : '清空失败')
         fillCacheBlock()
@@ -2785,7 +2884,12 @@
       /* --- 歌单选择器 --- */
       case 'pick-new-playlist': {
         const ids = (drawerBody.dataset.pendingIds || '').split(',').filter(Boolean)
-        const name = prompt('新歌单名称', drawerBody.dataset.pendingName || '新建歌单')
+        const name = await askText({
+          title: '新建歌单并加入',
+          value: drawerBody.dataset.pendingName || '新建歌单',
+          placeholder: '歌单名称',
+          okText: '创建',
+        })
         if (!name) return
         try {
           const res = await API.createPlaylist(name.trim(), ids.map(id => ({ id })))
@@ -2925,6 +3029,7 @@
   function init() {
     Player.init()
     bindGlobalEvents()
+    bindDialogMask()
     watchBrandForLogin()
     // 安卓壳里不注册 Service Worker：页面资源整包都在 APK 内（由原生按需提供），
     // 离线本来就成立；再叠一层 SW 缓存只会带来「改了包但页面还是旧的」这类时序问题。

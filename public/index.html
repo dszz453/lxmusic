@@ -186,6 +186,25 @@
     </div>
   </section>
 
+  <!--
+    ===== 通用对话框（输入 / 确认）=====
+
+    为什么不直接用系统的 prompt / confirm：在安卓 WebView 里，这两个弹窗会在标题处
+    打印**当前页面的地址**（用户看到的就是「https://music.zyplnn.dpdns.org 说：…」），
+    在一个原生外壳里冒出个网址非常突兀；而且 WebView 的对话框样式完全不受我们控制
+    （不可换行、不能标危险色、在深色模式里也不跟主题）。所以自己画一个。
+
+    位置居中的模态而不是底部抽屉：输入/确认是「打断当前操作、要一个答复」的语义，
+    和「选一个东西」的抽屉不同 —— 居中弹窗更符合这个语义，也不会被软键盘顶到屏幕外。
+  -->
+  <section class="sheet sheet--dialog" id="dialog" hidden>
+    <div class="sheet__mask" data-close></div>
+    <div class="sheet__panel">
+      <div class="sheet__head"><span id="dialogTitle"></span></div>
+      <div class="sheet__body" id="dialogBody"></div>
+    </div>
+  </section>
+
   <div class="toast" id="toast" hidden></div>
   <!-- 不加 crossorigin：第三方 CDN 多数不带 CORS 头，加了反而放不了 -->
   <audio id="audio" preload="metadata"></audio>

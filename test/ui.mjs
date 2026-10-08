@@ -660,7 +660,9 @@ try {
     // 播放历史：有记录时是列表，没有时是空状态 —— 两种都算「有内容」。
     // （旧用例在这里测的是 #/sources「音源与插件」，那个页已经整体搬去 /admin 了）
     ['#/history', '播放历史', '#view .block, #view .empty'],
-    ['#/about', 'Subsonic 接入', '#view .block'],
+    // #/about 原来是「Subsonic 客户端接入」，那份接入参数已搬去 /admin 的「客户端接入」，
+    // 这一页现在只讲「这是什么应用」。
+    ['#/about', '关于', '#view .block'],
     ['#/favorite', '收藏', '#view .block'],
     ['#/import', '歌单导入', '#btnImport'],
   ]) {
