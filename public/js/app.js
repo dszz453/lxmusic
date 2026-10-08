@@ -413,7 +413,20 @@
   function writeHomeCache(data, who) {
     try {
       if (!data || !data.ok) return
-      U.store.set(HOME_CACHE_KEY, { id: homeCacheIdentity(who), ts: Date.now(), data })
+      const rec = { id: homeCacheIdentity(who), ts: Date.now(), data }
+      U.store.set(HOME_CACHE_KEY, rec)
+      /**
+       * 写完回读一次，对得上才算数。
+       *
+       * 为什么要这个自检：`U.store.set` 内部是 try/catch 吞异常的（见 util.js）——
+       * 配额满、隐私模式、内核禁用 DOM Storage 都表现为**静默写不进去**。
+       * 那时首页缓存会「每次都写、每次都没写成」，界面表现就是「缓存像是不存在」，
+       * 而代码看一百遍都是对的。回读一次把这种情况暴露到控制台，好过无声无息。
+       */
+      const back = U.store.get(HOME_CACHE_KEY, null)
+      if (!back || back.ts !== rec.ts) {
+        console.warn('[lx] 首页缓存没能落到本地存储（localStorage 写入失败），下次打开仍需等接口')
+      }
     } catch { /* 配额满 / 隐私模式禁用：丢就丢了，首页照样能用 */ }
   }
 

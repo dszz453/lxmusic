@@ -59,6 +59,13 @@ const homeBody = (() => {
   return (a >= 0 && b > a) ? APPJS.slice(a, b) : ''
 })()
 
+/* writeHomeCache 的函数体。边界取下一个函数 homeSignature —— 同上，别数大括号。 */
+const writeBody = (() => {
+  const a = APPJS.indexOf('function writeHomeCache(data, who)')
+  const b = APPJS.indexOf('function homeSignature(', a)
+  return (a >= 0 && b > a) ? APPJS.slice(a, b) : ''
+})()
+
 /* ══════════════ 1. 主路径：先出旧内容，再后台刷新 ══════════════ */
 
 console.log('\n== 1. 首页主路径：冷启动先画旧内容，再后台补一次 ==')
@@ -102,7 +109,11 @@ console.log('\n== 2. 边界：缓存身份、超期、坏数据、不打断用�
     /if \(!rec \|\| !rec\.data \|\| !rec\.data\.ok\) return null/.test(APPJS) &&
     /if \(!data \|\| !data\.ok\) return/.test(APPJS))
   ok('写缓存整段吞异常（配额满 / 无痕模式不能把首页搞崩）',
-    /function writeHomeCache\(data, who\)[\s\S]{0,200}catch \{/.test(APPJS))
+    writeBody.length > 100 && /try \{/.test(writeBody) && /catch \{/.test(writeBody),
+    'len=' + writeBody.length)
+  ok('写完回读一次自检：U.store.set 是静默吞错的，不查就永远查不出「写了没写成」',
+    /const back = U\.store\.get\(HOME_CACHE_KEY, null\)/.test(writeBody) &&
+    /console\.warn\('\[lx\] 首页缓存没能落到本地存储/.test(writeBody))
 
   ok('后台刷新不 await（不能挡住首屏）',
     !/async function refreshHomeInBackground/.test(APPJS) &&
@@ -138,7 +149,7 @@ console.log('\n== 3. 失效与回写：换账号、换一批、显式重载 ==')
     '出现 ' + (APPJS.match(/App\.home = null/g) || []).length + ' 次')
 }
 
-/* ══════════════ 4. 服务端：榜单回源缓存 ══════════════ */
+/* ══════════════ 4. 服务端：榜单回源缓存 + 硬上限 ══════════════ */
 
 console.log('\n== 4. 服务端榜单缓存（/home 里最贵的一步）==')
 {
@@ -147,12 +158,55 @@ console.log('\n== 4. 服务端榜单缓存（/home 里最贵的一步）==')
   ok('TTL 自己按时间戳算，不交给 Cache-Control',
     /typeof rec\.ts === 'number' && Date\.now\(\) - rec\.ts < TOPLISTS_TTL_MS/.test(SRV))
   ok('上游失败 / 空列表**不**写缓存（一次抖动不能钉住 15 分钟）',
-    /const list = await fetchToplists\(\)\s*\n\s*if \(Array\.isArray\(list\) && list\.length\)/.test(SRV))
-  ok('/home 的两条出口都走缓存（AI 命中分支 + 关键词兜底分支）',
+    /const list = await withDeadline\(fetchToplists\(\), TOPLISTS_DEADLINE_MS, \[\]\)\s*\n\s*if \(Array\.isArray\(list\) && list\.length\)/.test(SRV))
+  /**
+   * 这条是本次的根因护栏。
+   * `wy.getToplists()` 内部不是一次请求：先打 music.163.com（retry 1 = 两遍），
+   * 失败再退 eapi，每一步都自带超时 —— 上游「连得上但回得慢」时能吃掉十几秒，
+   * 而它是 /api/home 的第一段。裸 await 一旦被加回来，首页就又变成看运气。
+   */
+  ok('榜单回源带硬上限（不许裸 await fetchToplists）',
+    /const list = await withDeadline\(fetchToplists\(\)/.test(SRV) &&
+    !/await fetchToplists\(\)/.test(SRV),
+    '裸 await 出现 ' + (SRV.match(/await fetchToplists\(\)/g) || []).length + ' 次')
+  const dl = /const TOPLISTS_DEADLINE_MS = (\d+)/.exec(SRV)
+  ok('上限是有限值且不大于 3 秒', !!dl && Number(dl[1]) <= 3000, dl ? dl[1] + ' ms' : '取不到')
+  ok('/home 的两条出口都走缓存（AI 命中分支 + 榜单）',
     (SRV.match(/cachedToplists\(\)/g) || []).length >= 3,
     '出现 ' + (SRV.match(/cachedToplists\(\)/g) || []).length + ' 次')
   ok('榜单缓存键不含用户 / token（含了就等于每人一份，白缓存）',
     /new Request\('https:\/\/lx\.cache\.internal\/toplists\/wy'/.test(SRV))
+}
+
+/* ══════════════ 4b. 服务端：首页兜底内容整份进缓存 ══════════════ */
+
+console.log('\n== 4b. /home 兜底分支：整份结果进缓存，不再每次回源 ==')
+{
+  const fb = (() => {
+    const a = SRV.indexOf('async function cachedHomeFallback(')
+    const b = SRV.indexOf('\n}', a)
+    return (a >= 0 && b > a) ? SRV.slice(a, b) : ''
+  })()
+  ok('cachedHomeFallback 存在且切得出来（否则下面是空断言）', fb.length > 400, 'len=' + fb.length)
+  ok('兜底分支改走它，不再内联现场搜索',
+    /const fb = await cachedHomeFallback\(env, db\)/.test(SRV))
+  ok('关键词轮换只在这一处算（散成两份迟早对不上）',
+    (SRV.match(/HOME_KEYWORDS\[/g) || []).length === 1,
+    '出现 ' + (SRV.match(/HOME_KEYWORDS\[/g) || []).length + ' 次')
+  ok('缓存键按「天 + 音源清单」，不按用户（这份内容本来就跟用户无关）',
+    /'https:\/\/lx\.cache\.internal\/home-fallback\/' \+ dayIndex \+ '\/' \+ sources\.join\('-'\)/.test(fb))
+  ok('只在拿到非空 hot 时才写（空结果多半是上游抖动，钉住它首页就空 20 分钟）',
+    /if \(hot\.length\) \{/.test(fb))
+  ok('榜单没拿到时给短 TTL，恢复后能很快补上',
+    /const ttl = charts\.length \? HOME_FALLBACK_TTL_MS : HOME_FALLBACK_SHORT_TTL_MS/.test(fb))
+  ok('TTL 存在记录里、按时间戳自己算（壳里 edgeCache 退化成 Map 时寿命只能靠它）',
+    /const ttl = \(rec && rec\.ttl\) \|\| HOME_FALLBACK_TTL_MS/.test(fb) &&
+    /Date\.now\(\) - rec\.ts < ttl/.test(fb))
+  ok('命中缓存时连榜单都不回源',
+    /Array\.isArray\(rec\.hot\) && rec\.hot\.length/.test(fb) && /fromCache: true/.test(fb))
+  ok('带 ?debug=1 时吐出两段的真实耗时（下次再慢，有数可看）',
+    /url\.searchParams\.get\('debug'\) === '1'/.test(SRV) &&
+    /fromCache: fb\.fromCache, hot: fb\.hot\.length/.test(SRV))
 }
 
 /* ══════════════ 5. 服务端版本只在设置页 ══════════════ */

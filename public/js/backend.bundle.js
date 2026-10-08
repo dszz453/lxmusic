@@ -1,5 +1,5 @@
 /* 由 tools/build-app.mjs 自动生成，请勿手动修改。
- * 源摘要: 6a5166f8d48e29b4
+ * 源摘要: 5cbe428434970518
  * 模块数: 24
  *
  * 这是给安卓壳用的后端展平版：把 src/ 的 ESM 后端打成单个 IIFE，
@@ -397,6 +397,28 @@ const edgeCache = {
  */
 const TOPLISTS_TTL_MS = 15 * 60 * 1000
 
+/**
+ * 给一段回源加**硬上限**。
+ *
+ * 为什么必须有：`wy.getToplists()` 内部不是一次请求 —— 它先打
+ * music.163.com（retry: 1，即两遍），失败再退到 eapi，每一步都带自己的超时。
+ * 上游「连得上但回得慢」时，光这一步就能吃掉十几秒；而它是 /api/home 的第一段，
+ * 用户正等着看首页。超时**不算错误**：拿到什么算什么，页面先出来。
+ *
+ * 注意 Promise.race 只是让调用方不再等，被甩下的那次请求仍会跑完 —— 所以这里
+ * 只用在「回源」上，不要用在有副作用的写操作上。
+ */
+function withDeadline(promise, ms, fallback) {
+  let timer = null
+  return Promise.race([
+    Promise.resolve(promise).catch(() => fallback),
+    new Promise((resolve) => { timer = setTimeout(() => resolve(fallback), ms) }),
+  ]).finally(() => { if (timer) clearTimeout(timer) })
+}
+
+/** 榜单回源的上限。榜单没出来首页照样能开，不值得为它等十几秒 */
+const TOPLISTS_DEADLINE_MS = 2500
+
 async function cachedToplists() {
   const key = new Request('https://lx.cache.internal/toplists/wy', { method: 'GET' })
   try {
@@ -410,7 +432,7 @@ async function cachedToplists() {
     }
   } catch { /* 坏缓存当没命中，继续回源 */ }
 
-  const list = await fetchToplists()
+  const list = await withDeadline(fetchToplists(), TOPLISTS_DEADLINE_MS, [])
   if (Array.isArray(list) && list.length) {
     try {
       await edgeCache.put(key, new Response(JSON.stringify({ ts: Date.now(), list }), {
@@ -419,6 +441,82 @@ async function cachedToplists() {
     } catch { /* 缓存写失败不影响本次返回 */ }
   }
   return list
+}
+
+/**
+ * 首页兜底内容（关键词轮换那一版）的缓存。
+ *
+ * 这一版内容是**全站同一份**：关键词按天轮换、榜单与热歌都跟「哪个用户」无关。
+ * 而它恰好是 /api/home 里最贵的两段回源 —— 抓榜单，再跨 6 个音源搜 24 首。
+ * 早先只有 charts 那半截进了缓存，hot 那半截**每次打开都重算**，于是没有
+ * AI 每日推荐的实例（自建 Docker 上很常见）每次进首页都要等好几秒。
+ *
+ * 三条边界：
+ *   · 只在拿到**非空 hot** 时才写：空结果多半是上游抖动，钉住它会让首页空 20 分钟；
+ *   · 榜单没拿到（charts 为空）时给**短 TTL**：榜单恢复后能很快补上，
+ *     不为了「省一次回源」把半个空首页钉住；
+ *   · TTL 按时间戳自己算、存在记录里，不交给 Cache-Control —— 安卓壳里 edgeCache
+ *     会退化成进程内 Map，那时寿命只能由这里决定，两套宿主行为才一致。
+ *
+ * 缓存键里带上音源清单：清单取自**全站设置**（不是每个用户各一份），今天一样，
+ * 但万一以后变成按用户配置，带上它就绝不会串台。
+ */
+const HOME_FALLBACK_TTL_MS = 20 * 60 * 1000
+const HOME_FALLBACK_SHORT_TTL_MS = 2 * 60 * 1000
+
+async function cachedHomeFallback(env, db) {
+  const dayIndex = Math.floor(Date.now() / 86400000)
+  const keyword = HOME_KEYWORDS[dayIndex % HOME_KEYWORDS.length]
+  const sources = await searchSources(env, db)
+  const key = new Request(
+    'https://lx.cache.internal/home-fallback/' + dayIndex + '/' + sources.join('-'),
+    { method: 'GET' })
+
+  try {
+    const hit = await edgeCache.match(key)
+    if (hit) {
+      const rec = await hit.json()
+      const ttl = (rec && rec.ttl) || HOME_FALLBACK_TTL_MS
+      if (rec && typeof rec.ts === 'number' && Date.now() - rec.ts < ttl
+        && Array.isArray(rec.hot) && rec.hot.length) {
+        return {
+          keyword: typeof rec.keyword === 'string' ? rec.keyword : keyword,
+          charts: Array.isArray(rec.charts) ? rec.charts : [],
+          hot: rec.hot,
+          errors: [],
+          fromCache: true,
+        }
+      }
+    }
+  } catch { /* 坏缓存当没命中，继续回源 */ }
+
+  const errors = []
+  const [charts, parsed] = await Promise.all([
+    cachedToplists(),
+    Promise.resolve(parseQuery(keyword, sources)),
+  ])
+
+  let hot = []
+  try {
+    const res = await searchOnline(parsed.keyword, {
+      sources: parsed.sources, limit: 24, pluginPool: env.PLUGIN_POOL,
+    })
+    hot = res.list || []
+    errors.push(...(res.errors || []))
+  } catch (e) {
+    errors.push(String((e && e.message) || e))
+  }
+
+  if (hot.length) {
+    const ttl = charts.length ? HOME_FALLBACK_TTL_MS : HOME_FALLBACK_SHORT_TTL_MS
+    try {
+      await edgeCache.put(key, new Response(JSON.stringify({ ts: Date.now(), ttl, keyword, charts, hot }), {
+        headers: { 'Content-Type': 'application/json' },
+      }))
+    } catch { /* 缓存写失败不影响本次返回 */ }
+  }
+
+  return { keyword, charts, hot, errors, fromCache: false }
 }
 
 /**
@@ -562,8 +660,11 @@ async function handleApi(request, env, url) {
      */
     if (path === '/home') {
       const errors = []
+      const dbg = url.searchParams.get('debug') === '1' ? {} : null
+      const t0 = Date.now()
       let daily = null
       try { daily = await getDaily(env.DB) } catch { /* 表还没建等情况，走兜底 */ }
+      const tDaily = Date.now()
 
       if (daily && daily.songs.length) {
         // 当天已有 AI 推荐：直接用，首页秒开
@@ -576,24 +677,21 @@ async function handleApi(request, env, url) {
           platforms: ALL_SOURCES.map(k => ({ key: k, name: SOURCE_META[k].name, short: SOURCE_META[k].short })),
           errors,
           daily: { generator: daily.generator, generatedAt: daily.generatedAt, date: daily.date },
+          ...(dbg ? { debug: { daily: tDaily - t0, data: Date.now() - tDaily, fromCache: null, generator: daily.generator } } : {}),
         })
       }
 
-      // 当天还没有记录：先按旧逻辑给一版兜底结果（不等 AI，AI 生成要 30s+），
-      // 同时后台触发生成 —— waitUntil 由 index.js 挂到 env 上，cron 没跑/没配也兜得住。
-      const keyword = HOME_KEYWORDS[Math.floor(Date.now() / 86400000) % HOME_KEYWORDS.length]
-      const [charts, parsed] = await Promise.all([
-        cachedToplists(),
-        Promise.resolve(parseQuery(keyword, await searchSources(env, db))),
-      ])
-      let hot = []
-      try {
-        const res = await searchOnline(parsed.keyword, { sources: parsed.sources, limit: 24, pluginPool: env.PLUGIN_POOL })
-        hot = res.list
-        errors.push(...res.errors)
-      } catch (e) {
-        errors.push(String((e && e.message) || e))
-      }
+      /**
+       * 当天还没有记录：给一版兜底结果（不等 AI，AI 生成要 30s+），
+       * 同时后台触发生成 —— waitUntil 由 index.js 挂到 env 上，cron 没跑/没配也兜得住。
+       *
+       * 兜底内容整份走缓存（见 cachedHomeFallback）：抓榜单 + 跨源搜 24 首是
+       * /api/home 里最贵的两段，而且跟「哪个用户」无关 —— 命中就一个字都不用回源。
+       */
+      const fb = await cachedHomeFallback(env, db)
+      errors.push(...fb.errors)
+      const tData = Date.now()
+
       if (env.waitUntil) {
         try {
           env.waitUntil(generateDaily(env, env.DB, { userId: user.id, toWeb: songForWeb }).catch(() => { /* 后台失败静默，下次再试 */ }))
@@ -601,11 +699,12 @@ async function handleApi(request, env, url) {
       }
       return json({
         ok: true,
-        keyword,
-        charts: pickCharts(charts, 6),
-        hot: hot.map(songForWeb),
+        keyword: fb.keyword,
+        charts: pickCharts(fb.charts, 6),
+        hot: fb.hot.map(songForWeb),
         platforms: ALL_SOURCES.map(k => ({ key: k, name: SOURCE_META[k].name, short: SOURCE_META[k].short })),
         errors,
+        ...(dbg ? { debug: { daily: tDaily - t0, data: tData - tDaily, total: tData - t0, fromCache: fb.fromCache, hot: fb.hot.length, charts: fb.charts.length } } : {}),
       })
     }
 
@@ -7715,7 +7814,7 @@ __modules["src/version.js"] = function (__exports, __require) {
  * 所以统一读这里，谁也别再各写各的。
  *
  * ── 两条版本线，别混 ──────────────────────────────────────────
- *   APP_VERSION      产品版本，人看的。改功能才动它。当前 V1.6
+ *   APP_VERSION      产品版本，人看的。改功能才动它。当前 V1.7
  *   APP_VERSION_CODE 整数构建号，Android 靠它判断「能不能覆盖安装」。
  *                    每次要发新版就 +1，**不能倒退、不能重复**，
  *                    否则手机上会报「应用未安装」（签名相同也装不上）。
@@ -7741,10 +7840,10 @@ __modules["src/version.js"] = function (__exports, __require) {
  */
 
 /** 产品版本（对外展示用）。每发一版升 0.1。 */
-const APP_VERSION = 'V1.6'
+const APP_VERSION = 'V1.7'
 
 /** Android versionCode：整数、单调递增、跨次发布不可重复。每发一版 +1。 */
-const APP_VERSION_CODE = 106
+const APP_VERSION_CODE = 107
 
 /** 人类可读的完整标识，日志/关于页用。 */
 const APP_ID = 'lxmusic'
