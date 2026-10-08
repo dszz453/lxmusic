@@ -179,7 +179,25 @@ bash client/build-client.sh              # 构建（自动打包跨端层 + 重�
 bash client/build-client.sh --skip-backend
 node test/client-wiring.test.mjs         # 78 项静态接线审计（秒级）
 node test/client-layer.mjs               # 25 项跨端层行为（自带 DOM 替身，秒级）
+LX_PASS='密码' node test/ui-dialogs.mjs   # 31 项真浏览器：对话框 / 菜单去重（需本地服务）
 ```
+
+### 界面约定（2026-10-08 第二轮）
+
+**用户端一律不用系统 `prompt/confirm`。** 安卓 WebView 会把**页面地址**印在弹窗标题上
+（`https://music.zyplnn.dpdns.org` 就是这么露出来的），样式也不受控，还可能被拦掉导致回调不回来。
+统一走站内对话框：`openDialog()` / `askText()` / `askConfirm()`，三个都返回 Promise。
+
+> 管理后台（`/admin`）里那几处 `confirm` **是有意保留的** —— 它是桌面网页控制台，
+> 原生弹窗本来就是它的语言。别当成漏网的。
+
+| 约定 | 理由 |
+|---|---|
+| 金刚区项数必须是 **5 的整数倍** | 每项 `flex: 0 0 20%`；7 项会滑出可视区并露出半截图标 |
+| 管理后台入口**只在网页端显示** | 判据 `inAndroidApp()`（`LX_NATIVE` / `LXNative` 存在即为安卓）；`/admin` 用 `target="_blank"` 另开 |
+| Subsonic 接入参数放**管理后台 →「客户端接入」** | 地址/端口/账号/认证方式/接口清单是「给别人接进来」用的信息，不是用户内容 |
+| 「关于」页只放**用户相关**信息 | 版本 / 宿主 / 开源仓库（带复制按钮） |
+| 顶部与底部**不重复** | 底部 4 tab 已有的入口，页面里不再列一遍 |
 
 ---
 
