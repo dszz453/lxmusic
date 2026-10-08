@@ -272,11 +272,11 @@ console.log('\n== C. 有桥时的完整行为 ==')
   const state = { route: null, chrome: null }
   const native = {
     info: () => JSON.stringify({
-      client: 'LX-MUSIC', version: '1.0', versionLine: 'V1.0',
-      build: 'dev', serviceExpect: 'V1.3',
+      client: 'LX-MUSIC', version: '1.1', versionLine: 'V1.1',
+      build: 'dev', serviceExpect: 'V1.4',
       profileId: 'cf', profileName: 'Cloudflare 部署', kind: 'cf',
       base: 'https://music.example.com', user: '', builtin: false,
-      brandKey: 'cf', brandName: 'music-edge', serverVersion: 'V1.3',
+      brandKey: 'cf', brandName: 'music-edge', serverVersion: 'V1.4',
       serverBuild: 'abc', connected: true, onboarded: true,
     }),
     profiles: () => '[]',
@@ -341,11 +341,14 @@ console.log('\n== C. 有桥时的完整行为 ==')
   ok('歌单详情页（#/playlist/abc）→ 归属「我的歌单」',
     state.route === '#/library', String(state.route))
 
-  // 设置页的补充信息（双版本号）
+  // 设置页的版本行 —— 只补**客户端自己**的版本 + 真实构建号。
+  // 服务端版本**不许**再挂在这条尾巴上：它有自己的专用行（网页端 #verHost），
+  // 挂两处就是同一页里同一件事写两遍（老板 2026-10-08 定的规矩）。
+  // 所以这里连**负向**一起断言 —— 少了后半条，日后有人「顺手补上」也测不出来。
   env.setHash('#/settings')
   const mark = verLine.querySelector('.lx-client-ver')
-  ok('进设置页 → 版本行补出「客户端 / 服务端」两半',
-    !!mark && /客户端 1\.0/.test(mark.textContent) && /服务端 V1\.3/.test(mark.textContent),
+  ok('进设置页 → 版本行补出客户端版本，且尾巴上不带服务端版本',
+    !!mark && /客户端 1\.1/.test(mark.textContent) && !/服务端/.test(mark.textContent),
     mark ? mark.textContent : '(没补上)')
 
   // 网页设置页里的服务端卡片要被压掉（改由原生页管理）

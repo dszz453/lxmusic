@@ -13,8 +13,13 @@
  *
  * 2) **版本显示不全**
  *    共用前端只知道自己那一版（window.LX_VERSION，在客户端里就是客户端版本）。
- *    但客户端是通用的，用户必须同时看到「客户端 V1.0」和「服务端 V1.3」——
- *    报问题时少一个就得来回猜。所以这里在设置页的版本行上补出服务端那一半。
+ *    原生桥里有更准的客户端构建号（包里 client-build.txt 那个 commit 前 12 位），
+ *    而 index.html 组合出来的是 `客户端 1.0 (dev)` —— dev 在真机上报不了任何信息。
+ *    所以这里在设置页的版本行上补出**客户端自己的**版本 + 真实构建号。
+ *
+ *    ⚠ 不要在这里补服务端版本（老板 2026-10-08：「服务端版本的显示，仅保留设置项里面，
+ *    其他页面去掉」）。这一页下面那个 #verHost 已经在显示服务端版本了，
+ *    再往版本行尾巴上挂一个「· 服务端 V1.4」就是同一页里同一件事写两遍。
  */
 
 ;(function (global) {
@@ -50,7 +55,7 @@
   }
 
   /**
-   * 在设置页的版本行上补出「客户端 / 服务端」两半。
+   * 在设置页的版本行上补出**客户端自己的**版本 + 真实构建号。
    *
    * 时机问题：那一行是 app.js 异步渲染的（要等 /api/version 回来），
    * 而且可能被重新渲染（用户切来切去）。所以不抢在某一刻写，
@@ -62,7 +67,6 @@
     if (!host) return
     var suffix = '客户端 ' + (info.version || '?')
       + (info.build && info.build !== 'dev' ? ' (' + info.build + ')' : '')
-      + ' · 服务端 ' + (info.serverVersion || (info.builtin ? '内置' : '未握手'))
     var mark = host.querySelector('.lx-client-ver')
     if (mark) {
       if (mark.textContent !== suffix) mark.textContent = suffix

@@ -33,11 +33,11 @@
  * 注意分工：改客户端**不动** SERVICE_VERSION（那是「本 App 按哪版服务端设计」
  * 的声明）—— 只有服务端抬了 APP_VERSION，这里才跟着抬。 */
 
-/** 客户端产品版本。当前起点 V1.0 */
-export const CLIENT_VERSION = 'V1.0'
+/** 客户端产品版本。从 V1.0 起算，每出一个新包升 0.1 */
+export const CLIENT_VERSION = 'V1.1'
 
 /** 安卓 versionCode：整数、单调递增、跨次发布不可重复 */
-export const CLIENT_VERSION_CODE = 100
+export const CLIENT_VERSION_CODE = 101
 
 /** 客户端包名（与既有 music-edge 壳 com.zyplnn.musicedge 并存，互不覆盖） */
 export const CLIENT_PACKAGE = 'com.zyplnn.lxclient'
@@ -46,7 +46,7 @@ export const CLIENT_PACKAGE = 'com.zyplnn.lxclient'
 export const CLIENT_APP_NAME = 'LX-MUSIC'
 
 /** 该客户端按哪一版服务端设计（对接 src/version.js 的 APP_VERSION） */
-export const SERVICE_VERSION = 'V1.3'
+export const SERVICE_VERSION = 'V1.4'
 
 /**
  * 构建标识：Dockerfile / CI 传 commit sha，本地直接构建就是 'dev'。

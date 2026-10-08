@@ -136,13 +136,15 @@ public class ServerActivity extends Activity {
         listHost.addView(addCard);
     }
 
-    /** 一条档案：名称 + 副标题（类型 / 地址 / 连上的版本）+ 右侧状态 + 选中标记 */
+    /** 一条档案：名称 + 副标题（类型 / 地址 / 品牌）+ 右侧状态 + 选中标记 */
     private View profileRow(final ServerStore.Profile p, boolean active) {
         boolean builtin = ServerStore.KIND_BUILTIN.equals(p.kind);
+        // 右侧只说「通没通过信」，不报版本号 —— 这一页是挑服务器用的，
+        // 版本号只该出现在设置页（老板 2026-10-08）。
         String right;
         if (builtin) right = active ? "使用中" : "";
         else if (!p.usable()) right = "未配置";
-        else if (p.checkedAt > 0) right = p.version.isEmpty() ? "已连接" : "V" + p.version.replaceFirst("^[Vv]", "");
+        else if (p.checkedAt > 0) right = "已连接";
         else right = "未握手";
 
         String subtitle;
@@ -153,10 +155,6 @@ public class ServerActivity extends Activity {
         } else {
             subtitle = kindLabel(p.kind) + " · " + p.base
                     + (p.checkedAt > 0 ? " · " + p.brandName() : "");
-        }
-        if (active && !builtin && p.checkedAt > 0 && p.build != null && !p.build.isEmpty()
-                && !"dev".equals(p.build)) {
-            subtitle = subtitle + " · " + p.build;
         }
 
         final String label = p.name;
@@ -347,19 +345,23 @@ public class ServerActivity extends Activity {
         return row;
     }
 
-    /** 「已连接」那一行说明 */
+    /**
+     * 「已连接」那一行说明。
+     *
+     * ⚠ 不显示服务端版本与构建号（老板 2026-10-08：「服务端版本的显示，仅保留设置项里面，
+     * 其他页面去掉」）。这一页是**挑服务器**用的，要回答的是「哪台、什么时候通过信」。
+     * 唯一的例外是下面那条「版本对不上」的提示 —— 它不是一个给人看的数字，
+     * 而是一条可执行的建议，且本身不含任何版本值。
+     */
     private String statusLine(ServerStore.Profile p) {
         StringBuilder sb = new StringBuilder();
         sb.append("上次握手：").append(p.brandName());
-        if (!p.version.isEmpty()) sb.append(" · 服务端 ").append(p.version);
-        if (!p.build.isEmpty()) sb.append(" · ").append(p.build);
         if (p.checkedAt > 0) {
             long min = (System.currentTimeMillis() - p.checkedAt) / 60000;
             sb.append(min < 1 ? " · 刚刚" : (min < 60 ? " · " + min + " 分钟前" : " · " + (min / 60) + " 小时前"));
         }
         if (!p.version.isEmpty() && ClientBrand.compareVersion(p.version, ClientBrand.SERVICE_EXPECT) != 0) {
-            sb.append("\n⚠ 版本与客户端期望的 ").append(ClientBrand.SERVICE_EXPECT)
-                    .append(" 不同。通常仍然可用（接口是向后兼容的），"
+            sb.append("\n⚠ 版本与客户端期望的不同。通常仍然可用（接口是向后兼容的），"
                             + "但如果遇到奇怪的问题，先把两边都升到同一版再试。");
         }
         return sb.toString();
@@ -413,12 +415,9 @@ public class ServerActivity extends Activity {
                         StringBuilder sb = new StringBuilder();
                         sb.append("连接成功（").append(r.ms).append("ms）→ ")
                                 .append(r.brandName(ServerStore.KIND_DOCKER.equals(p.kind) ? "docker" : "cf"));
-                        if (!r.version.isEmpty()) sb.append(" · 服务端 ").append(r.version);
-                        if (!r.build.isEmpty() && !"dev".equals(r.build)) sb.append(" · ").append(r.build);
                         if (r.needsSetup) sb.append("\n这台服务器还没建管理员，连接后会引导你创建。");
                         if (r.versionMismatch) {
-                            sb.append("\n⚠ 服务端版本与客户端期望的 ").append(ClientBrand.SERVICE_EXPECT)
-                                    .append(" 不同，通常仍可用。");
+                            sb.append("\n⚠ 服务端版本与客户端期望的不同，通常仍可用。");
                         }
                         hint.setText(sb.toString());
                         Ui.toast(ServerActivity.this, "连接成功：" + r.brandName("cf"));

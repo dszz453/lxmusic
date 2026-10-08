@@ -285,6 +285,29 @@ console.log('\n== 6. 注入契约：宿主给的变量，前端真的在读 ═�
     /indexOf\("<head>"\)/.test(CLIENT_ACT) && /<style id=\\"lxClientChrome\\">/.test(CLIENT_ACT))
 }
 
+/* ── 服务端版本只留在设置页（老板 2026-10-08）──
+ * 这条规矩的破坏方式极其自然：某个新页面想显示版本，顺手读一下手边的字段就行。
+ * 所以两头都要钉：设置页**保留**着它，别处**不再**出现。
+ * 唯一的例外是「版本对不上」的警告 —— 那是一条可执行的建议，且本身不含版本值。 */
+{
+  const ABOUT = read('client/src/com/zyplnn/lxclient/AboutActivity.java')
+  const SERVERPAGE = read('client/src/com/zyplnn/lxclient/ServerActivity.java')
+  const SETTINGS = read('client/src/com/zyplnn/lxclient/SettingsActivity.java')
+
+  ok('顶栏状态条不再拼服务端版本（只留品牌 / 连接态 / 地址）',
+    !/append\(" · 服务端 "\)/.test(CLIENT_ACT), '还在拼 ` · 服务端 `')
+  ok('状态条也不再挂服务端构建号',
+    !/p\.build/.test(CLIENT_ACT))
+  ok('原生「关于」页不再有「服务端版本 / 服务端构建」两行',
+    !/infoRow\("服务端版本"/.test(ABOUT) && !/infoRow\("服务端构建"/.test(ABOUT))
+  ok('「服务器连接」页不再报版本号与构建号',
+    !/append\(" · 服务端 "\)/.test(SERVERPAGE) && !/\.build\b/.test(SERVERPAGE))
+  ok('但「版本对不上」的警告保留（可执行的建议，不是给人看的数字）',
+    /versionMismatch/.test(SERVERPAGE) && /compareVersion\(p\.version/.test(SERVERPAGE))
+  ok('设置页**保留**服务端版本（收敛不等于全删）',
+    /" · 服务端 " \+ p\.version/.test(SETTINGS))
+}
+
 /* ══════════════ 7. 桥（AndroidHost）向后兼容 ══════════════ */
 
 console.log('\n== 7. AndroidHost 与共用前端的老协议完全兼容 ══════════════')

@@ -364,6 +364,45 @@ const edgeCache = {
 }
 
 /**
+ * 榜单列表的边缘缓存。
+ *
+ * `fetchToplists()` 每次都要回源上游（网易云的榜单接口），实测是 /api/home 里
+ * 最贵的那一步 —— 而榜单是**全站同一份**（跟哪个用户无关），没道理每个请求都去问一次。
+ * 缓存 15 分钟：榜单本来就不到分钟级变化。
+ *
+ * TTL 自己按时间戳算，不交给 Cache-Control：安卓壳里没有 Cache API，
+ * edgeCache 会退化成进程内 Map，那时寿命完全由这里决定 ——
+ * 两套宿主的行为才一致（否则「Worker 上 15 分钟、壳里永久」这种差异极难查）。
+ *
+ * 上游失败或返回空数组时**不写缓存**：否则一次抖动会把「没有榜单」钉住 15 分钟。
+ */
+const TOPLISTS_TTL_MS = 15 * 60 * 1000
+
+async function cachedToplists() {
+  const key = new Request('https://lx.cache.internal/toplists/wy', { method: 'GET' })
+  try {
+    const hit = await edgeCache.match(key)
+    if (hit) {
+      const rec = await hit.json()
+      if (rec && Array.isArray(rec.list) && rec.list.length
+        && typeof rec.ts === 'number' && Date.now() - rec.ts < TOPLISTS_TTL_MS) {
+        return rec.list
+      }
+    }
+  } catch { /* 坏缓存当没命中，继续回源 */ }
+
+  const list = await fetchToplists()
+  if (Array.isArray(list) && list.length) {
+    try {
+      await edgeCache.put(key, new Response(JSON.stringify({ ts: Date.now(), list }), {
+        headers: { 'Content-Type': 'application/json' },
+      }))
+    } catch { /* 缓存写失败不影响本次返回 */ }
+  }
+  return list
+}
+
+/**
  * 从歌曲列表里挑第一张可用封面。
  *
  * 歌单封面为什么要单独挑：新建歌单 / AI 歌单这条路径原本不写 cover，
@@ -509,7 +548,7 @@ export async function handleApi(request, env, url) {
 
       if (daily && daily.songs.length) {
         // 当天已有 AI 推荐：直接用，首页秒开
-        const [charts] = await Promise.all([fetchToplists()])
+        const [charts] = await Promise.all([cachedToplists()])
         return json({
           ok: true,
           keyword: daily.title || '每日推荐',
@@ -525,7 +564,7 @@ export async function handleApi(request, env, url) {
       // 同时后台触发生成 —— waitUntil 由 index.js 挂到 env 上，cron 没跑/没配也兜得住。
       const keyword = HOME_KEYWORDS[Math.floor(Date.now() / 86400000) % HOME_KEYWORDS.length]
       const [charts, parsed] = await Promise.all([
-        fetchToplists(),
+        cachedToplists(),
         Promise.resolve(parseQuery(keyword, await searchSources(env, db))),
       ])
       let hot = []
@@ -589,7 +628,7 @@ export async function handleApi(request, env, url) {
 
     /* ---- 全部榜单列表 ---- */
     if (path === '/charts') {
-      const charts = await fetchToplists()
+      const charts = await cachedToplists()
       return json({ ok: true, list: charts.filter(c => c.cover) })
     }
 

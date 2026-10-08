@@ -145,7 +145,7 @@ public class ClientActivity extends Activity {
 
     private WebView web;
     private ProgressBar bar;
-    /** 顶栏下方那条细状态条：显示当前连的是哪条线、服务端版本、构建号 */
+    /** 顶栏下方那条细状态条：显示当前连的是哪条线、通没通过信、地址（不含版本号） */
     private TextView statusText;
     private View statusDot;
     /** 原生底栏整块（含上边框），跨端层在整屏状态（登录页）时要把它收起来 */
@@ -340,11 +340,15 @@ public class ClientActivity extends Activity {
     /* ══════════════════ 连接状态条 ══════════════════ */
 
     /**
-     * 顶栏下面那条 24dp 的细条：`● music-edge · 服务端 V1.3 · 3a41e22a1b2c`。
+     * 顶栏下面那条 24dp 的细条：`● music-edge · 已连接 · music.zyplnn.dpdns.org`。
      *
      * 为什么值得占这 24dp：这个客户端是**通用**的，同一个 APK 可能连着家里的 Docker、
      * 公司内网的一台、或者外面那台 CF —— 用户最容易搞混的就是「我现在看的这份数据是谁的」。
      * 把它常驻在顶部、点一下就能换，比藏在设置页里翻要靠谱得多。
+     *
+     * ⚠ 这里**不显示服务端版本与构建号**（老板 2026-10-08：「服务端版本的显示，
+     * 仅保留设置项里面，其他页面去掉」）。这条细条要回答的是「数据是谁的」，
+     * 版本号回答不了这个问题，却会挤掉真正有用的地址；要看版本去设置页。
      */
     private View buildStatusStrip() {
         LinearLayout strip = new LinearLayout(this);
@@ -378,7 +382,7 @@ public class ClientActivity extends Activity {
         return strip;
     }
 
-    /** 刷新状态条上的品牌 / 版本 / 连接态。握手结果变了、切换了档案都要调 */
+    /** 刷新状态条上的品牌 / 连接态 / 地址。握手结果变了、切换了档案都要调 */
     private void refreshStatus() {
         if (statusText == null) return;
         ServerStore st = ServerStore.get(this);
@@ -391,8 +395,9 @@ public class ClientActivity extends Activity {
         if (builtin) {
             sb.append(" · 内置离线：数据都在这台手机上");
         } else {
-            sb.append(" · 服务端 ").append(p.version.isEmpty() ? "未握手" : p.version);
-            if (!p.build.isEmpty() && !"dev".equals(p.build)) sb.append(" · ").append(p.build);
+            // 连接状态用文字说一次，左边那个圆点的颜色也在说同一件事 ——
+            // 只靠颜色传达状态对色觉障碍用户不友好，两处都留。
+            sb.append(p.checkedAt > 0 ? " · 已连接" : " · 未连接");
             if (!p.base.isEmpty()) sb.append(" · ").append(stripScheme(p.base));
         }
 

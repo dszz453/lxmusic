@@ -9,19 +9,17 @@ import android.widget.LinearLayout;
 import android.widget.TextView;
 
 /**
- * 关于页 —— 两条版本线在这里并排出现，这是本页存在的主要理由。
+ * 关于页 —— 「这个 App 是谁、装在哪儿、当前连的是哪条线」。
  *
- * ══════════════ 为什么「客户端版本」与「服务端版本」要分开显示 ══════════════
- * 这个客户端是**通用**的：同一个 APK 可以连内置后端、CF、Docker、局域网的任意一台。
- * 于是「版本」天然有两个：
+ * ══════════════ 为什么这一页**不**显示服务端版本 ══════════════
+ * 早先这一页把「客户端 V1.0 / 服务端 V1.3」并排摆着，理由是报障时两个数字都得有。
+ * 老板 2026-10-08 定了新规矩：**服务端版本只在设置页显示，其他页面去掉**。
+ * 这个理由站得住 —— 设置页的版本区块（网页端 #verHost 那一行）已经把
+ * 「服务端版本 + 构建号 + 与客户端期望值是否一致」讲全了；
+ * 别处再露一次不但冗余，两处还可能显示不同时刻的握手结果而互相打架。
  *
- *   客户端 V1.0  —— 你手机里装的这个东西
- *   服务端 V1.3  —— 你连的那台服务器
- *
- * 它们**本来就不是一个号**，而且不该强求一致：服务端升到 V1.4 时客户端通常不用重装
- * （接口向后兼容）；客户端修个原生层的 bug 时服务器一行都不用动。
- * 用户报问题时，这两个数字加上构建标识才是完整信息 —— 少一个就得来回猜
- * （本项目踩过：只给「V1.3」时，分不清是 App 旧还是服务端旧）。
+ * 所以本页只讲**客户端自己**：名称 / 版本 / 构建标识 / 包名 / 解码引擎，
+ * 外加「当前连的是哪个档案」—— 品牌与地址，不含版本。
  *
  * 顺带把「你这个 App 是谁」说清楚：连 CF 时界面显示 music-edge、连 Docker 时显示
  * LX-MUSIC —— 名字由**服务端自报**（/api/version 的 host 字段）决定，不是本地配置猜的。
@@ -56,10 +54,10 @@ public class AboutActivity extends Activity {
         c1.addView(infoRow("解码引擎", com.zyplnn.lxclient.core.AudioEngine.engineInfo()));
         col.addView(c1);
         col.addView(Ui.note(this,
-                "客户端与服务端是两条独立的版本线：客户端从 V1.0 起算，"
-                        + "服务端当前 V1.3。两者不必同号 —— 服务端升版时，只要接口兼容，"
-                        + "这个 App 不用重装。客户端里那个「期望服务端 "
-                        + ClientBrand.SERVICE_EXPECT + "」就是用来做握手比对的。"));
+                "客户端与服务端是两条独立的版本线，各有各的号，不必相同 —— "
+                        + "服务端升版时，只要接口兼容，这个 App 不用重装。"
+                        + "握手时客户端会核对一次服务端版本，对不上只提示、不拦着用。"
+                        + "两边具体是什么版本，到「设置」页看。"));
 
         /* ---------------- 服务端 ---------------- */
         col.addView(Ui.section(this, "当前连接的服务端"));
@@ -70,11 +68,6 @@ public class AboutActivity extends Activity {
         c2.addView(infoRow("地址", builtin ? "内置离线：不连任何服务器" : p.base));
         c2.addView(Ui.divider(this, false));
         c2.addView(infoRow("品牌", p.brandName()));
-        c2.addView(Ui.divider(this, false));
-        c2.addView(infoRow("服务端版本", builtin ? "（随安装包内置）"
-                : (p.version.isEmpty() ? "还没握手" : p.version)));
-        c2.addView(Ui.divider(this, false));
-        c2.addView(infoRow("服务端构建", builtin ? "—" : (p.build.isEmpty() ? "—" : p.build)));
         col.addView(c2);
         col.addView(Ui.note(this,
                 "品牌名由服务端自报：判据是 /api/version 里的 host 字段 —— "

@@ -51,7 +51,7 @@
     run()
   }
 
-  /** 设置页要补的东西：双版本号 + 一条看得见的服务器入口 */
+  /** 设置页要补的东西：版本行上的真实构建号 + 一条看得见的服务器入口 */
   function decorateSettingsPage(info) {
     var hash = String(global.location.hash || '')
     // #/settings 与 #/mine 都可能带版本信息（app.js 把设置入口放在「我的」里）
@@ -81,7 +81,7 @@
       decorateSettingsPage(cur)
     })
 
-    // 品牌被服务端纠正（/api/version 回来）时，顺手把双版本号也刷一遍
+    // 品牌被服务端纠正（/api/version 回来）时，顺手把版本行也刷一遍
     try {
       global.addEventListener('lx-brand', function () {
         var cur = api.info() || info

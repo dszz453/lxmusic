@@ -42,6 +42,8 @@
   const App = {
     user: null,
     home: null,
+    /** home 这份数据属于哪个账号 —— 换人登录时靠它判断该不该作废（见 pageHome） */
+    homeOwner: '',
     sources: [],
     platformNames,
     platformShort,
@@ -352,13 +354,133 @@
     { key: 'import', label: '歌单导入', cls: 'c-blue', icon: 'link' },
   ]
 
+  /* ---------------- 首页缓存：先把上次的内容画出来，再后台刷新 ---------------- */
+
+  /**
+   * 首页的持久缓存（stale-while-revalidate）。
+   *
+   * 为什么值得做：/api/home 是要现算的（榜单得回源上游、每日推荐得读库），
+   * 而登录那条路径上它排在 /me 与 /sources 后面 —— 用户看到的是好几秒骨架屏。
+   * 可首页内容在几分钟内几乎不变，拿上次的顶一下，观感就是「秒开」。
+   *
+   * 四条必须守住的边界：
+   *
+   * 1. **只在内存没东西时才读磁盘**。本次会话已经拉过（App.home 有值）就直接用，
+   *    不必再读一次盘；显式失效过（加歌进歌单等把 App.home 置空）也走真请求。
+   *
+   * 2. **缓存按「服务器 + 账号」隔离**。同一台手机可能连着家里的 Docker 和外面的 CF，
+   *    同一个页面实例还可能退出登录换个人 —— 张冠李戴地把别人的每日推荐画出来是事故。
+   *    做法是把身份**写在记录里**，读到不匹配就当没有。比拼 key 更抗改错：
+   *    哪天 key 的构造改了（目录分隔符、端口归一化），也不会串号。
+   *
+   * 3. **只在拿到真数据之后才回写**，绝不「读一次写一次」——
+   *    否则一份坏数据会被自己不断续命，永远刷不掉。
+   *
+   * 4. **缓存是锦上添花**。localStorage 满了、被禁用了，都只是退回到
+   *    「没有缓存」的老行为，不能因此让首页报错 —— 所以整条链路吞异常。
+   */
+  const HOME_CACHE_KEY = 'lx.homeCache'
+
+  /** 超过这个岁数的缓存直接丢掉：十天前的「每日推荐」没有展示价值，只剩误导 */
+  const HOME_CACHE_MAX_AGE = 10 * 24 * 3600 * 1000
+
+  /** 当前账号名 —— 缓存身份的一半（另一半是服务器） */
+  function currentUser() { return (App.user && App.user.username) || '' }
+
+  /**
+   * 缓存身份 = 服务器 + 账号。
+   *
+   * 服务器那一半取「客户端配置的远端地址」（换档案就是换地址）或网页自身的 origin。
+   * 不用服务端自报的品牌/版本当判据：那两个值要先握手才知道，
+   * 而读缓存恰恰发生在握手之前 —— 用不上。
+   */
+  function homeCacheIdentity(who) {
+    const server = String(window.LX_REMOTE_BASE || '').replace(/\/+$/, '')
+      || String((window.location && window.location.origin) || '')
+    return server + '|' + who
+  }
+
+  function readHomeCache(who) {
+    try {
+      const rec = U.store.get(HOME_CACHE_KEY, null)
+      if (!rec || !rec.data || !rec.data.ok) return null
+      if (rec.id !== homeCacheIdentity(who)) return null          // 换了服务器或换了人
+      if (!rec.ts || Date.now() - rec.ts > HOME_CACHE_MAX_AGE) return null
+      return rec
+    } catch { return null }
+  }
+
+  function writeHomeCache(data, who) {
+    try {
+      if (!data || !data.ok) return
+      U.store.set(HOME_CACHE_KEY, { id: homeCacheIdentity(who), ts: Date.now(), data })
+    } catch { /* 配额满 / 隐私模式禁用：丢就丢了，首页照样能用 */ }
+  }
+
+  /**
+   * 首页内容的「指纹」，用来判断后台刷新回来的东西到底变没变。
+   *
+   * 为什么不能直接比 JSON：封面地址、播放量这类字段经常毫无意义地抖动一下，
+   * 那样每次刷新都会重绘一次首页 —— 闪一下、封面重解码，用户只会觉得更卡。
+   * 只比**真正看得见的内容**：标题、榜单 id、歌名与歌手。
+   */
+  function homeSignature(data) {
+    if (!data) return ''
+    const charts = (data.charts || []).map(c => (c && (c.source + '|' + c.id + '|' + c.name)) || '').join(',')
+    const hot = (data.hot || []).map(s => (s && (s.name + '|' + s.singer)) || '').join(',')
+    return (data.keyword || '') + '#' + charts + '#' + hot
+  }
+
+  /**
+   * 后台补一次首页。**不 await、不挡界面**，四种情况各有各的处理：
+   *   · 请求失败   → 什么都不做。旧内容还在，弹一个错误反而更糟。
+   *   · 页面切走   → 只把数据收进内存与磁盘，不碰别人的界面。
+   *   · 用户往下翻了 → 只收数据。把人家正在看的内容整块换掉，是最困惑的一种「刷新」。
+   *   · 内容没变   → 不重绘。
+   */
+  function refreshHomeInBackground(who) {
+    const before = App.home
+    API.home().then((data) => {
+      if (!data || !data.ok) return
+      App.home = data
+      App.homeOwner = who
+      writeHomeCache(data, who)
+      if (parseHash().path !== '/') return
+      if (view.scrollTop > 60) return
+      if (homeSignature(before) === homeSignature(data)) return
+      renderHome(data)
+    }).catch(() => { /* 后台失败静默 —— 旧内容还在，比弹错误好 */ })
+  }
+
   async function pageHome() {
-    const cached = App.home
+    const who = currentUser()
+
+    // 内存里那份若不是当前账号的，先丢掉。退出登录再换个人登录走的是**同一个页面实例**
+    // （不整页重载），不清的话新用户会先看到上一个人的每日推荐。
+    if (App.home && App.homeOwner !== who) App.home = null
+
+    let cached = App.home
+    let fromDisk = false
+    if (!cached) {
+      const rec = readHomeCache(who)
+      if (rec) { cached = rec.data; fromDisk = true }
+    }
+
     renderHome(cached)
-    if (cached) return
+    if (cached) {
+      App.home = cached
+      App.homeOwner = who
+      // 只有「从磁盘捞出来的旧内容」才需要补一次；内存命中说明本次会话刚拉过，
+      // 再拉一次纯属白耗流量。
+      if (fromDisk) refreshHomeInBackground(who)
+      return
+    }
+
     try {
       const data = await API.home()
       App.home = data
+      App.homeOwner = who
+      writeHomeCache(data, who)
       if (parseHash().path !== '/') return
       // 骨架 → 内容的交叉过渡：先让骨架淡出，再换上真内容。
       // 不这么做的话，数据回来那一下是「骨架瞬间消失 + 内容瞬间出现」，
@@ -496,6 +618,9 @@
         toast('正在按你的口味换一批，大约需要一分钟…')
         API.dailyRefresh().then(data => {
           App.home = Object.assign({}, App.home || {}, { hot: data.songs || [], keyword: data.title || '每日推荐', daily: { generator: data.generator, generatedAt: data.generatedAt, date: data.date } })
+          // 换了推荐就要回写缓存 —— 不然下次冷启动又拿旧的那一批顶上来
+          App.homeOwner = currentUser()
+          writeHomeCache(App.home, App.homeOwner)
           if (parseHash().path === '/') renderHome(App.home)
           toast('换好了：' + (data.title || '新一批推荐'))
         }).catch(e => {
@@ -1973,16 +2098,24 @@
   }
 
   /**
-   * 把版本号填进设置页。
+   * 把**服务端版本**填进设置页。
    *
    * 为什么要在设置页显示：用户报问题（「我这里没声音」「插件不工作」）时，
    * 第一件事永远是确认双方说的是同一个版本，否则半小时都在猜。
    *
-   * 两个数字分别来自不同宿主，**故意都显示**：
-   *   · 前端版本 —— 写死在 window.LX_VERSION_LINE（由 index.html 的内联脚本注入）
-   *   · 服务端版本 —— GET /api/version（Docker / CF / 壳内后端各回各的）
+   * 两个数字来自不同宿主，**都只显示在这一页**：
+   *   · 前端/客户端版本 —— window.LX_VERSION_LINE（index.html 的内联脚本注入），
+   *     渲染时就写进 #verLine 了，这里不用再管
+   *   · 服务端版本 —— GET /api/version（Docker / CF / 壳内后端各回各的），填进 #verHost
    * 两者不一致时高亮提示：这正是「App 装了新版但连的老服务器」的典型症状，
    * 以前只能靠人肉对比，现在一眼可见。
+   *
+   * ⚠ 只写 #verHost 这一个元素，**不要往 window.LX_VERSION_LINE 里追加**
+   *   （老板 2026-10-08：「服务端版本的显示，仅保留设置项里面，其他页面去掉」）。
+   *   那个全局变量是「关于」页等处的版本行数据源，往它后面追加「 · 服务端 V1.4」，
+   *   等于让服务端版本在设置页之外也露出来。
+   *   顺带修掉一个累积 bug：以前每次都往全局变量尾巴上追加一次，
+   *   进出设置页两回就会变成「… · 服务端 V1.4 · 服务端 V1.4」。
    */
   async function fillVersionBlock() {
     const host = document.getElementById('verHost')
@@ -1996,9 +2129,9 @@
       // 「比什么」分两种客户端，这一点很容易搞错：
       //   · 老壳（music-edge）：客户端与服务端**共用一条版本线**，直接比字符串即可。
       //   · 通用客户端（注入 LX_CLIENT_SERVICE）：客户端有自己的版本线（V1.0 起算），
-      //     与服务端版本**本来就不是一个号**（客户端 V1.0 / 服务端 V1.3）。
+      //     与服务端版本**本来就不是一个号**（客户端 V1.0 / 服务端 V1.4）。
       //     这里要比的是「客户端期望对接哪一版服务端」，而不是客户端自己的版本号 ——
-      //     拿 1.0 去比 V1.3 必然不等，那就成了一条永远亮着的**假警告**，
+      //     拿 1.0 去比 V1.4 必然不等，那就成了一条永远亮着的**假警告**，
       //     比没有警告更糟（用户会学会忽略它）。
       const clientVer = String(window.LX_VERSION || '')
       const expect = String(window.LX_CLIENT_SERVICE || '')
@@ -2006,9 +2139,6 @@
         || (expect ? v.version === expect : v.version === clientVer)
       host.innerHTML = '服务端 ' + esc(v.full || v.version || '?')
         + (same ? '' : '<span style="color:var(--warn,#e6a23c)"> ⚠ 与服务端版本不一致</span>')
-      window.LX_VERSION_LINE = (window.LX_VERSION_LINE || '') + ' · 服务端 ' + (v.version || '?')
-      const line = document.getElementById('verLine')
-      if (line) line.textContent = window.LX_VERSION_LINE
     } catch (e) {
       host.innerHTML = '<span style="color:var(--danger,#f56c6c)">服务端版本读取失败：'
         + esc((e && e.message) || '网络不可达') + '</span>'
@@ -2740,6 +2870,11 @@
         if (!await askConfirm({ title: '退出登录', message: '退出后需要重新输入密码。', okText: '退出', danger: true })) return
         API.setToken('')
         App.user = null
+        // 内存里那份必须清掉（不然同一个页面实例里换人登录会闪出上一个人的推荐）；
+        // 磁盘缓存**故意留着** —— 它按「服务器+账号」隔离，只有本人回来才读得到，
+        // 而「退出之后再登录」恰恰是最希望首页秒开的那条路径。
+        App.home = null
+        App.homeOwner = ''
         closeSheet(drawer)
         await boot()
         break
