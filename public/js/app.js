@@ -1473,7 +1473,7 @@
       + '<div class="note" style="margin-top:10px">AI 会理解你的描述并生成歌单，再自动从音源里匹配真实可播的歌曲。</div>'
       + '</div>'
       + '<div id="aiResult"></div>'
-      + (u.isAdmin ? '<div class="block"><a class="note" href="#/settings#ai" style="color:var(--brand)">⚙ 配置 AI 接口（千问 / OpenAI，管理员）</a></div>' : '')
+      + (u.isAdmin ? '<div class="block"><a class="note" href="#/settings#ai" style="color:var(--brand)">⚙ 配置 AI 接口（千问 / OpenAI / Gemini，管理员）</a></div>' : '')
 
     let aiCount = 20
     view.querySelectorAll('[data-act="ai-count"]').forEach(b => {
@@ -1491,7 +1491,7 @@
       const result = $('#aiResult')
       btn.disabled = true
       btn.textContent = '生成中…'
-      result.innerHTML = '<div class="block"><div class="note" style="text-align:center">正在让 AI 生成歌单…（最长可能需要一两分钟）</div></div>'
+      result.innerHTML = '<div class="block"><div class="note" style="text-align:center">正在让 AI 生成歌单…（20 首通常要 40~80 秒，歌越多越慢，期间请勿关闭页面）</div></div>'
       try {
         // 第一步：AI 出列表（歌名 + 歌手）。服务端只做这一件事，请求短、不容易被掐断。
         const res = await API.generatePlaylist(prompt, aiCount)

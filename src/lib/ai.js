@@ -4,9 +4,11 @@
  * 用大模型把「一句话/关键字」理解成一份歌单（歌名 + 歌手），再交给调用方逐首搜索落库。
  * 只做「意图 → 歌名列表」这一步，不生成歌曲 ID（AI 编的 ID 不可信，播放链路靠搜索兜底）。
  *
- * 支持三类提供商，按 protocol 区分请求格式：
+ * 支持四类提供商，按 protocol 区分请求格式：
  *   · openai —— OpenAI 官方 / 自建 OpenAI 兼容网关（/chat/completions）
  *   · qwen   —— 阿里云百炼（DashScope 兼容模式，同样是 /chat/completions）
+ *   · gemini —— Google Gemini（走官方 OpenAI 兼容层，仍是 /chat/completions；
+ *     见下方 jsonMode 注释：兼容层对 response_format 的支持与 OpenAI 不同）
  *   · cloudflare —— Cloudflare Workers AI（REST 端点 /accounts/{id}/ai/run/{model}，
  *     响应包一层 result；account_id 需要额外配置）
  */
@@ -28,6 +30,28 @@ export const AI_PROVIDERS = {
     protocol: 'openai',
     baseURL: 'https://api.openai.com/v1',
     model: 'gpt-4o-mini',
+  },
+  gemini: {
+    key: 'gemini',
+    name: 'Google Gemini',
+    protocol: 'openai',
+    // 官方 OpenAI 兼容层（2026 起稳定提供）：路径与 Bearer 鉴权都与 OpenAI 一致，
+    // 所以 protocol 仍是 'openai'，只是把地址换掉 —— 不需要另写一套协议。
+    baseURL: 'https://generativelanguage.googleapis.com/v1beta/openai',
+    // 默认用 flash：生成歌单是「输出一长串 JSON」，要的是快与稳，不是推理深度。
+    // 想换：gemini-2.5-pro（更聪明更慢）/ gemini-3.5-flash（更新的一代）。
+    model: 'gemini-2.5-flash',
+    /**
+     * ⚠ 不向 Gemini 发 `response_format`。
+     *
+     * OpenAI 的 `{"type":"json_object"}` 是「随便给我个 JSON」；Gemini 兼容层支持的是
+     * **JSON Schema 变体**（`{"type":"json_schema", ...}`），对前者的行为不作保证 ——
+     * 发过去有吃到 400 的风险，而这里本来就有两道兜底（system prompt 明令只输出 JSON
+     * + parsePlaylist 的「去 ``` 围栏 / 正则抠 {…} / 行文本」三级解析），
+     * 不值得为一个可选字段赌一次失败。其余字段（model / messages / temperature /
+     * max_tokens）兼容层都按 OpenAI 语义支持。
+     */
+    jsonMode: false,
   },
   cloudflare: {
     key: 'cloudflare',
@@ -69,7 +93,12 @@ export async function loadAiConfig(env, db) {
     ? !!(apiKey && accountId && model)
     : !!(baseURL && apiKey)
 
-  return { provider, protocol, baseURL, model, apiKey, accountId, configured }
+  /**
+   * jsonMode：provider 的「吃不吃 `response_format`」能力位，默认吃
+   * （OpenAI / 千问 / 自建兼容网关都吃）。目前只有 Gemini 关掉，原因见
+   * AI_PROVIDERS.gemini 里那段注释 —— 它的兼容层支持的是 JSON Schema 变体。
+   */
+  return { provider, protocol, baseURL, model, apiKey, accountId, configured, jsonMode: base.jsonMode !== false }
 }
 
 /** 把非流式 OpenAI 兼容响应解析成文本 */
@@ -128,15 +157,16 @@ function buildAiRequest(cfg, messages, extra = {}) {
     }
   }
 
-  // OpenAI 兼容（qwen / openai / 自定义网关）
+  // OpenAI 兼容（qwen / openai / gemini 兼容层 / 自定义网关）
   const url = cfg.baseURL.replace(/\/+$/, '') + '/chat/completions'
   const body = {
     model: cfg.model,
     messages,
     temperature: extra.temperature ?? 0.7,
   }
-  // 部分网关不支持 response_format，仅在显式要求时带
-  if (extra.json_mode) body.response_format = { type: 'json_object' }
+  // 部分网关不支持 response_format：既要调用方显式要求，也要 provider 的能力位允许
+  // （gemini 关掉了它，理由见 AI_PROVIDERS.gemini）
+  if (extra.json_mode && cfg.jsonMode !== false) body.response_format = { type: 'json_object' }
   if (extra.max_tokens) body.max_tokens = extra.max_tokens
   return {
     url,
@@ -208,9 +238,19 @@ export async function generatePlaylist(env, db, { prompt, count = 20 }) {
 
   const user = `请生成一份歌单：${String(prompt || '').trim() || '随便推荐一些好听的歌'}`
 
-  // 超时按数量放宽：实测 qwen3.8-27b 生成 20 首 JSON 常超 30s，50 首更慢。
-  // 经验值 ~4s/首，下限 60s，上限 240s（CF Workers 等 I/O 不计 CPU，墙钟允许）。
-  const timeout = Math.min(240000, Math.max(60000, n * 4000))
+  /**
+   * 超时按数量放宽：实测 20 首 JSON 常要 40~80s（qwen 与 gemini 都差不多），50 首更慢。
+   * 经验值 ~4s/首，下限 60s，**上限 180s**。
+   *
+   * ⚠ 这个上限**必须小于前端的等待上限**（`public/js/api.js` 的 `AI_TIMEOUT` = 200s）。
+   * 反过来的话就是「服务端还在算、前端已经掐断」—— 用户看到超时、服务端白跑一轮，
+   * 而下一轮重试大概率再次撞上同一堵墙。三层（服务端 / 网页端 / 壳内桥）的对齐关系
+   * 集中写在 api.js 的 AI_TIMEOUT 注释里，改任何一层都要回去看那张表。
+   *
+   * CF Workers 对 HTTP 触发**没有硬性墙钟上限**（只要客户端还连着），I/O 等待也不计 CPU，
+   * 所以这里的时间真能等满 —— 卡住它的从来不是 CF，是前端那条早到的 40s。
+   */
+  const timeout = Math.min(180000, Math.max(60000, n * 4000))
 
   const content = await chatOnce(env, db, {
     messages: [

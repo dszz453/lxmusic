@@ -278,8 +278,12 @@ ok('合并键还带上令牌（换人登录时绝不共用同一个在途请求�
 ok('失败/成功都要把条目清掉（否则用户点「重试」会粘在上一发上）',
   /const drop = \(\) => \{[\s\S]{0,140}inflight\.delete\(path\)/.test(APIJS)
   && /promise\.then\(drop, drop\)/.test(APIJS))
+/**
+ * post 从「两参」放开成「两参 + 可选 opts」是为了 AI 生成那条要单独传 timeout
+ * （见 api.js 的 AI_TIMEOUT）；关键性质没变 —— 它仍然直接走 req，不经过 once()。
+ */
 ok('合并只发生在 GET 这一层，POST/PATCH/DELETE 仍走裸 req()',
-  /const post = \(p, body\) => req\(p, \{ method: 'POST', body \}\)/.test(APIJS)
+  /const post = \(p, body, opts\) => req\(p, Object\.assign\(\{ method: 'POST', body \}, opts \|\| \{\}\)\)/.test(APIJS)
   && /const patch = \(p, body\) => req\(p, \{ method: 'PATCH', body \}\)/.test(APIJS)
   && /const del = \(p\) => req\(p, \{ method: 'DELETE' \}\)/.test(APIJS))
 

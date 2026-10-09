@@ -37,6 +37,45 @@ W() { cygpath -w "$1"; }                          # MSYS 路径 → Windows 路�
 LIST_WIN() { find "$@" | while read -r f; do cygpath -w "$f"; done; }
 
 APP_NAME="music-edge"
+# 2.4：AI 接口兼容 Gemini + 修「AI 生成歌单偶发失败、提示超时」。两件事都在 AI 这一条链上。
+#
+#  ① **兼容 Gemini**：src/lib/ai.js 的 AI_PROVIDERS 增加 gemini，走 Google 官方
+#     OpenAI 兼容层（https://generativelanguage.googleapis.com/v1beta/openai，
+#     Bearer 传 Gemini 的 key），protocol 仍是 'openai' —— 与 OpenAI 同形，不另写协议。
+#     ⚠ 但它**关掉了 response_format**（新增 provider 能力位 jsonMode:false）：
+#     兼容层支持的是 **JSON Schema 变体**，对 OpenAI 的 {"type":"json_object"}
+#     不作保证，发过去有吃 400 的风险；而这条链路本来就有 system prompt 明令
+#     「只输出 JSON」+ parsePlaylist 的三级兜底（去 ``` 围栏 / 正则抠 {…} / 行文本），
+#     不值得为一个可选字段赌一次失败。管理后台的提供商下拉与预设
+#     （public/js/admin.js 的 AI_PRESET / AI_HINT）同步加了 Gemini，
+#     默认模型 gemini-2.5-flash（可改 gemini-2.5-pro / gemini-3.5-flash）。
+#
+#  ② **AI 生成歌单偶发超时**：根因不是 AI 慢，是**我们自己先不等了**。这条链上原来
+#     叠着三层「早到的超时」，而它们都短于 AI 真正需要的时间：
+#
+#         壳内桥（原生读超时）  30s
+#         壳内页面侧守卫        35s
+#         网页端 api.js 默认    40s
+#         服务端 ai.js 预算     60~240s  ← 真正需要的时间（20 首常要 40~80s）
+#
+#     于是请求只要慢过 30~40 秒必被掐断，而模型响应时长本来就在这个量级上下浮动 ——
+#     表现就是「有时成功、有时一句超时」，也就是报障人说的「偶发」。
+#     修法：给 AI 单独一条 200s 的长超时（public/js/api.js 的 AI_TIMEOUT），并把
+#     「页面侧打算等多久」随请求递给壳内的桥（自定义字段 lxTimeout），桥据此把
+#     **原生读超时排在前面**（lxTimeout-10s）、**兜底守卫排在后面**（+5s）；
+#     没带该字段时逐字退回原来的 30s/35s，普通请求的行为一点不变。
+#     服务端上限同时收到 180s，保证「服务端还在算、前端已经掐断」不会发生。三层新序：
+#
+#         AI 请求  原生 190s < 守卫 195s < 网页端 200s    服务端上限 180s
+#         普通请求 原生  30s < 守卫  35s < 网页端  40s    （原样不变）
+#
+#     顺带记一条平台的账：**CF 对 HTTP 触发没有硬性墙钟上限**（只要客户端还连着），
+#     且等待 I/O 不计 CPU —— 卡住这条链的从来不是 CF，是前端那条早到的 40s。
+#
+#  护栏：test/ai-route.test.mjs 19 → 33（走兼容层 / 不发 response_format / 三层超时顺序）、
+#        test/client-wiring.test.mjs 109 → 111（桥按 lxTimeout 推导、缺省逐字退回原值）、
+#        test/boot-speed.test.mjs（post 支持可选 opts，但仍走裸 req 不并入 once）。
+#
 # 2.3：修「Docker 版每次打开都要等 10 秒 / 点『我的』显示未登录、过几秒自己好」——
 #  这次是**2.1 自己埋下的**一个无限循环，报障人第三次报同一件事才挖出来。
 #

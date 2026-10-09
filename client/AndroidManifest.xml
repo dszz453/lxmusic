@@ -31,8 +31,8 @@
 -->
 <manifest xmlns:android="http://schemas.android.com/apk/res/android"
     package="com.zyplnn.lxclient"
-    android:versionCode="110"
-    android:versionName="2.0">
+    android:versionCode="111"
+    android:versionName="2.1">
     <!--
       versionCode / versionName 是 aapt2 link 时用 version-code / version-name 参数覆盖的
       （见 build-client.sh，值来自 client/version.js —— 客户端自己的版本线）。

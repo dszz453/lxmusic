@@ -491,11 +491,21 @@ console.log('\n== 10. 出站 HTTP 桥（「桥请求超时: /api/playlists」那
   // 页面侧守卫必须**晚于**原生侧，否则真实原因永远传不回来
   ok('页面侧等待上限比原生侧晚到（HTTP_GUARD = HTTP_TIMEOUT + 余量）',
     /HTTP_GUARD\s*=\s*HTTP_TIMEOUT\s*\+/.test(NATIVEJS))
-  ok('装进 pendingHttp 的那个定时器用的是 HTTP_GUARD（改回 HTTP_TIMEOUT 就白改了）',
-    /\}\s*,\s*HTTP_GUARD\)/.test(NATIVEJS)
-    && /setTimeout\([\s\S]{0,400}?HTTP_GUARD\)/.test(NATIVEJS))
-  ok('发给原生侧的读超时仍是 HTTP_TIMEOUT（两者是两件事，别合成一个常量）',
-    /timeout:\s*HTTP_TIMEOUT/.test(NATIVEJS))
+  ok('装进 pendingHttp 的那个定时器用的是 guard（比原生侧晚，改回 native 就白改了）',
+    /\}\s*,\s*t\.guard\)/.test(NATIVEJS)
+    && /const t = bridgeTimeout\(o\.lxTimeout\)/.test(NATIVEJS))
+  ok('发给原生侧的读超时用的是 native（两者是两件事，别合成一个常量）',
+    /timeout:\s*t\.native/.test(NATIVEJS))
+  /**
+   * 2026-10-09：AI 生成歌单偶发超时的根因就是「网页端肯等 200s、桥只肯等 30s」。
+   * 现在页面把超时随请求递下来（lxTimeout），桥照着排；下面两条钉住
+   * 「递下来要认」与「没递时逐字退回原值」——后者保证普通请求完全不受影响。
+   */
+  ok('缺省（页面没递 lxTimeout）时逐字退回原来的 30000 / 35000',
+    /return \{ native: HTTP_TIMEOUT, guard: HTTP_GUARD \}/.test(NATIVEJS))
+  ok('递了 lxTimeout 时按它推导，且 guard 永远比 native 晚 5s',
+    /const native = Math\.max\(15000, page - 10000\)/.test(NATIVEJS)
+    && /return \{ native, guard: native \+ 5000 \}/.test(NATIVEJS))
 
   /**
    * 两份 HttpBridge 是同一个类的两个副本，最怕「只改了一份」——

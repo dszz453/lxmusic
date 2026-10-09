@@ -21,6 +21,31 @@
    */
   const DEFAULT_TIMEOUT = 40000
 
+  /**
+   * AI 生成歌单的专用超时 —— 它和别的接口**不是一个量级**，不能共用上面那个 40s。
+   *
+   * 为什么必须单独给（2026-10-09 老板报「AI 生成歌单偶发失败、提示超时」的根因）：
+   * 服务端 `src/lib/ai.js` 给 AI 留的预算是 **60~180s**（按 ~4s/首估算，
+   * 20 首要 40~80s），可这条链路原来有三层「早到的超时」叠在一起：
+   *
+   *     安卓壳桥（原生读超时）  30s   ← 最早
+   *     安卓壳页面侧守卫        35s
+   *     网页端 api.js 默认      40s   ← 最后，但仍远早于 AI 算完
+   *     服务端 AI 预算          60~180s ← 真正需要的时间
+   *
+   * 于是请求只要慢过 30~40 秒就必被掐断，而模型响应时长本来就在这个量级上下浮动 ——
+   * 表现就是「有时成功、有时一句超时」，也就是「偶发」。**请求本身没坏，是我们自己
+   * 先不等了**。所以这里把 AI 的等待上限单独抬到 200s，并让壳内桥跟着一起抬（见
+   * `native.js` 的 lxTimeout 处理），三层重新排好序：
+   *
+   *     AI 请求：原生读超时 190s < 页面守卫 195s < 本层 200s < 服务端上限 180s ✅
+   *     普通请求：原生读超时 30s  < 页面守卫 35s  < 本层 40s（原样不变）✅
+   *
+   * ⚠ 200 是「比服务端 180s 多留 20s 余量」得来的，不是随手写的。动任何一层都要
+   * 回来核对整张表 —— 这类 bug 的形态就是「改了一处、另一处还在早到」。
+   */
+  const AI_TIMEOUT = 200000
+
   async function req(path, options) {
     const opts = options || {}
     const headers = Object.assign({}, opts.headers || {})
@@ -36,7 +61,11 @@
     const timer = setTimeout(() => ctrl.abort(), ms)
     let res
     try {
-      res = await fetch('/api' + path, { method: opts.method || 'GET', headers, body, signal: ctrl.signal })
+      // `lxTimeout` 是本项目自定义的字段（fetch 规范里没有、浏览器会直接忽略它）：
+      // 目的是把「页面侧打算等多久」告诉壳内的桥，让桥据此把**原生读超时排在前面**、
+      // **兜底守卫排在后面**。没有它的话，AI 这种要等 200s 的请求会被桥固定的 30s
+      // 先掐死 —— 见 public/js/native.js 里 bridgeFetch 的推导。
+      res = await fetch('/api' + path, { method: opts.method || 'GET', headers, body, signal: ctrl.signal, lxTimeout: ms })
     } catch (e) {
       // AbortError 会因为浏览器版本不同而以不同面目出现，统一成一句人话
       if (e && (e.name === 'AbortError' || /aborted/i.test(String(e.message)))) {
@@ -108,7 +137,9 @@
   }
 
   const get = (p) => once(p)
-  const post = (p, body) => req(p, { method: 'POST', body })
+  // 第三个参数是可选 opts（目前只有 AI 生成那条在用它传 timeout）；
+  // 其余调用点保持两参写法，行为完全不变。
+  const post = (p, body, opts) => req(p, Object.assign({ method: 'POST', body }, opts || {}))
   const patch = (p, body) => req(p, { method: 'PATCH', body })
   const del = (p) => req(p, { method: 'DELETE' })
 
@@ -170,7 +201,8 @@
 
     // 第一步只返回 AI 列表 { title, songs:[{name,singer}] }；匹配与落库由 app.js 逐首完成
     // 注意：生成歌单是**用户端**能力，配置 AI 接口才是管理端的事，两者路径已经分开
-    generatePlaylist: (prompt, count) => post('/ai-playlist', { prompt, count }),
+    // ⚠ 必须带 AI_TIMEOUT：这一步在等大模型把整份歌单写成 JSON，不是普通查询
+    generatePlaylist: (prompt, count) => post('/ai-playlist', { prompt, count }, { timeout: AI_TIMEOUT }),
 
     /* ---- 播放进度 / 播放历史（用户端） ---- */
 

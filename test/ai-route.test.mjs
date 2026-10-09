@@ -148,7 +148,7 @@ ok('返回 configured=true', r.data.configured === true, JSON.stringify(r.data))
 ok('provider=qwen', r.data.provider === 'qwen')
 ok('model=qwen-plus', r.data.model === 'qwen-plus')
 ok('hasKey 脱敏（不返回明文）', r.data.hasKey === true && r.data.apiKey === undefined)
-ok('providers 含千问与 OpenAI', Array.isArray(r.data.providers) && r.data.providers.some(p => p.key === 'qwen') && r.data.providers.some(p => p.key === 'openai'))
+ok('providers 含千问 / OpenAI / Gemini', Array.isArray(r.data.providers) && r.data.providers.some(p => p.key === 'qwen') && r.data.providers.some(p => p.key === 'openai') && r.data.providers.some(p => p.key === 'gemini'))
 
 console.log('== 2. /ai-config 保存 ==')
 r = await auth('/admin/ai-config', 'POST', { provider: 'openai', model: 'gpt-4o-mini', api_key: 'sk-new' })
@@ -191,6 +191,60 @@ const res2 = await LB.handleApi(req2, env2, new URL(req2.url))
 const d2 = await res2.json()
 ok('未配置报错 500', res2.status === 500, String(res2.status))
 ok('错误信息含「未配置」', /未配置/.test(d2.error || ''), d2.error)
+
+console.log('== 6. 切到 Gemini：走 Google 兼容层，且不发 response_format ==')
+// 模拟管理后台的点选行为：切 provider 时 base_url / model 会一起被预设填上再保存
+// （admin.js 的 applyPreset）。只改 provider 而留着旧 base_url 是无效的 ——
+// loadAiConfig 里 DB 的值优先于 provider 预设。
+r = await auth('/admin/ai-config', 'POST', {
+  provider: 'gemini',
+  base_url: 'https://generativelanguage.googleapis.com/v1beta/openai',
+  model: 'gemini-2.5-flash',
+})
+ok('保存 gemini 配置成功', r.data.ok === true, JSON.stringify(r.data))
+r = await auth('/admin/ai-config')
+ok('provider=gemini、protocol 仍是 openai（兼容层与 OpenAI 同形，不另写协议）',
+  r.data.provider === 'gemini' && r.data.protocol === 'openai', JSON.stringify(r.data))
+
+aiUrl = ''; lastAiBody = null
+r = await auth('/ai-playlist', 'POST', { prompt: '深夜开车', count: 2 })
+ok('请求打到 generativelanguage.googleapis.com 的兼容层',
+  /generativelanguage\.googleapis\.com\/v1beta\/openai\/chat\/completions$/.test(aiUrl), aiUrl)
+ok('带上了 Gemini 模型名', lastAiBody && lastAiBody.model === 'gemini-2.5-flash', lastAiBody && lastAiBody.model)
+/**
+ * 这条是本轮的兼容性要害：Gemini 兼容层支持的是 **JSON Schema 变体**，
+ * 对 OpenAI 的 `{"type":"json_object"}` 不作保证 —— 发过去有吃 400 的风险。
+ * 所以 provider 上关掉 jsonMode，改靠 system prompt + parsePlaylist 的三级兜底解析。
+ */
+ok('⚠ 不发 response_format（Gemini 只保证 JSON Schema 变体）',
+  lastAiBody && lastAiBody.response_format === undefined, JSON.stringify(lastAiBody && lastAiBody.response_format))
+ok('仍能解析出歌单（没有 response_format 也不影响这条链路）',
+  r.data.ok === true && Array.isArray(r.data.songs) && r.data.songs.length === 2, JSON.stringify(r.data).slice(0, 160))
+
+console.log('== 7. 结构护栏：Gemini 接线 + 三层超时对齐 ==')
+const AISRC = readFileSync(path.join(__dirname, '..', 'src', 'lib', 'ai.js'), 'utf8')
+const APISRC = readFileSync(path.join(__dirname, '..', 'public', 'js', 'api.js'), 'utf8')
+ok('gemini 的 baseURL 指向 Google 官方 OpenAI 兼容层',
+  /gemini:\s*\{[\s\S]{0,400}?generativelanguage\.googleapis\.com\/v1beta\/openai/.test(AISRC))
+ok('⚠ gemini 的 jsonMode = false（否则会带上兼容层不保证的 json_object）',
+  /gemini:\s*\{[\s\S]{0,1600}?jsonMode:\s*false/.test(AISRC))
+ok('能力位默认「能吃」，只有显式 false 才关',
+  /jsonMode:\s*base\.jsonMode !== false/.test(AISRC))
+ok('buildAiRequest 把能力位接进了 json_mode 判断',
+  /extra\.json_mode && cfg\.jsonMode !== false/.test(AISRC))
+/**
+ * AI 生成歌单偶发超时（2026-10-09 老板报障）的根因是三层超时错配：
+ * 服务端肯等 180s，而网页端只有 40s、壳内桥只有 30s —— 慢过 30~40s 必被掐断。
+ * 下面几条把「谁该比谁晚」钉住，改任何一层都要回来看这张表。
+ */
+ok('api.js 给 AI 单独一条长超时，不用默认的 40s',
+  /const AI_TIMEOUT = 200000/.test(APISRC))
+ok('generatePlaylist 真的用上了 AI_TIMEOUT（否则常量是摆设）',
+  /generatePlaylist:\s*\(prompt, count\) => post\('\/ai-playlist', \{ prompt, count \}, \{ timeout: AI_TIMEOUT \}\)/.test(APISRC))
+ok('req 把页面侧超时透给壳内的桥（少了它，AI 在 APP 里仍被 30s 掐断）',
+  /lxTimeout:\s*ms/.test(APISRC))
+ok('服务端 AI 上限 180s < 前端 200s（留 20s，别让前端先掐断服务端）',
+  /Math\.min\(180000, Math\.max\(60000, n \* 4000\)\)/.test(AISRC))
 
 console.log(`\n${pass} 通过 / ${fail} 失败`)
 process.exit(fail ? 1 : 0)

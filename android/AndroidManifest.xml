@@ -9,8 +9,8 @@
 -->
 <manifest xmlns:android="http://schemas.android.com/apk/res/android"
     package="com.zyplnn.musicedge"
-    android:versionCode="113"
-    android:versionName="2.3">
+    android:versionCode="114"
+    android:versionName="2.4">
     <!--
       versionCode / versionName 是 aapt2 link 时用 version-code / version-name 参数覆盖的
       （见 build-apk.sh，值来自 src/version.js）。这里写的是兜底值：

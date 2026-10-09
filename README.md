@@ -1,6 +1,6 @@
 # music-edge · 安卓 APP（自包含） + Cloudflare Workers 源码包
 
-> **当前版本：V2.3**
+> **当前版本：V2.4**
 >
 > 同一份 `src/` 同时服务三个宿主，靠**运行时宿主能力判定**分支，不做编译期分叉：
 > Cloudflare Workers（线上）、安卓壳（APK 内自带）、Docker（你自己的服务器）。
@@ -162,9 +162,9 @@ GH_TOKEN=ghp_xxx node tools/publish-github.mjs --dry    # 只看清单
 |---|---|---|
 | 后端 | 永远在设备内 | 跟着「服务器档案」走：**CF / Docker / 自建 / 内置**四选一 |
 | 名字 | 固定 `music-edge` | 由所连服务端自报（`music-edge` 或 `LX-MUSIC`） |
-| 版本 | 与服务端同号 V2.3 | **客户端独立版本线 V2.0**（服务端是 V2.3） |
+| 版本 | 与服务端同号 V2.4 | **客户端独立版本线 V2.1**（服务端是 V2.4） |
 | 包名 | `com.zyplnn.musicedge` | `com.zyplnn.lxclient`（可同时安装） |
-| 产物 | `dist/music-edge-2.3.apk` | `dist/lx-music-client-2.0.apk` |
+| 产物 | `dist/music-edge-2.4.apk` | `dist/lx-music-client-2.1.apk` |
 
 首启会问你连哪条线，之后随时可以从**顶栏的连接状态条**或设置里换。
 连上后品牌与版本按服务端自报显示 —— 连 CF 显示 `music-edge`，连 Docker 显示 `LX-MUSIC`。
@@ -786,6 +786,56 @@ body { overflow: hidden; }
 > 版本号在**两处**都要改，别只改一处：`android/AndroidManifest.xml` 的
 > `versionCode/versionName`，和 `android/build-apk.sh` 里的 `VERSION_CODE/VERSION_NAME`
 > （aapt2 用的是命令行上那两个，不看清单文件里的）。
+
+### 2.4 改了什么（本轮）：AI 兼容 Gemini + 修「生成歌单偶发超时」
+
+老板两条要求：「CF 版本 AI 接口兼容 Gemini」「排查 AI 生成歌单存在偶发的生成失败，
+提示超时」。两件事都落在 AI 这一条链上。
+
+#### ① 兼容 Gemini
+
+`src/lib/ai.js` 的 `AI_PROVIDERS` 增加 `gemini`，走 **Google 官方的 OpenAI 兼容层**
+（`https://generativelanguage.googleapis.com/v1beta/openai`，Bearer 传 Gemini 的 key），
+`protocol` 仍是 `openai` —— 兼容层与 OpenAI 同形，不必另写一套请求 / 响应协议。
+管理后台的提供商下拉与预设（`public/js/admin.js` 的 `AI_PRESET` / `AI_HINT`）同步加上，
+默认模型 `gemini-2.5-flash`。
+
+**有一处刻意的例外**：provider 上新增了能力位 `jsonMode`，Gemini 是 `false` ——
+**不向它发 `response_format`**。因为兼容层支持的是 **JSON Schema 变体**
+（`{"type":"json_schema",…}`），对 OpenAI 那个 `{"type":"json_object"}` 不作保证，
+发过去有吃 400 的风险。而这条链路本来就有两道兜底（system prompt 明令「只输出 JSON」
++ `parsePlaylist` 的去围栏 / 正则抠 `{…}` / 行文本三级解析），
+不值得为一个可选字段赌一次失败。
+
+#### ② 修「AI 生成歌单偶发超时」
+
+根因不是 AI 慢，是**我们自己先不等了** —— 这条链上叠着三层「早到的超时」，
+而它们全短于 AI 真正需要的时间：
+
+| 层 | 原来 | 真正需要 |
+|---|---|---|
+| 壳内桥（原生读超时） | 30s | |
+| 壳内页面侧守卫 | 35s | |
+| 网页端 `api.js` 默认 | 40s | |
+| **服务端 `ai.js` 预算** | 60~240s | **20 首常要 40~80s** |
+
+于是请求只要慢过 30~40 秒就必被掐断，而模型响应时长本来就在这个量级上下浮动 ——
+表现就是「有时成功、有时一句超时」，正是报障说的「偶发」。
+
+修法是给 AI 单独一条长超时，并把三层重新排序：
+
+- `api.js` 新增 `AI_TIMEOUT = 200000`，`generatePlaylist` 显式用它（不再吃默认 40s）
+- 页面把自己的超时随请求递给壳内的桥（自定义字段 `lxTimeout`），桥据此把
+  **原生读超时排在前面**（`lxTimeout - 10s`）、**兜底守卫排在后面**（`+5s`）；
+  没带该字段时逐字退回原来的 30s / 35s，**普通请求的行为一点不变**
+- 服务端上限从 240s 收到 **180s**，保证「服务端还在算、前端已经掐断」不会发生
+
+最终顺序：`原生 190s < 守卫 195s < 网页端 200s`，服务端上限 180s。
+
+> 顺带记一条平台的账：**Cloudflare Workers 对 HTTP 触发没有硬性墙钟上限**（只要客户端
+> 还连着），且等待 I/O 不计 CPU。卡住这条链的从来不是 CF，是前端那条早到的 40s。
+
+护栏：`test/ai-route.test.mjs` 19 → **33**、`test/client-wiring.test.mjs` 109 → **111**。
 
 ### 2.3 改了什么（本轮）：一个自己埋的「无限重算」
 

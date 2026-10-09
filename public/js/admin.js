@@ -1210,11 +1210,14 @@
   const AI_PRESET = {
     qwen: ['https://dashscope.aliyuncs.com/compatible-mode/v1', 'qwen-plus'],
     openai: ['https://api.openai.com/v1', 'gpt-4o-mini'],
+    // Gemini 走官方 OpenAI 兼容层，地址固定填到 /v1beta/openai 为止（Bearer 传 Gemini 的 key）
+    gemini: ['https://generativelanguage.googleapis.com/v1beta/openai', 'gemini-2.5-flash'],
     cloudflare: ['', '@cf/qwen/qwen3.8-27b'],
   }
   const AI_HINT = {
     qwen: '',
     openai: '',
+    gemini: '（官方 OpenAI 兼容层；不要填原生 /v1beta/models 地址）',
     cloudflare: '（可留空自动拼装；填 .../ai/v1 则走 OpenAI 兼容层）',
     '': '（OpenAI 兼容格式，填到 /v1 为止）',
   }
@@ -1237,6 +1240,7 @@
       + '<select class="select" id="aiProvider">'
       + '<option value="qwen">通义千问（阿里云百炼）</option>'
       + '<option value="openai">OpenAI</option>'
+      + '<option value="gemini">Google Gemini</option>'
       + '<option value="cloudflare">Cloudflare Workers AI</option>'
       + '<option value="">自定义（OpenAI 兼容）</option>'
       + '</select></div>'
@@ -1245,7 +1249,7 @@
       + '<div class="field"><div class="field__label" style="font-size:12px">Base URL <span id="aiBaseHint" class="note" style="display:inline"></span></div>'
       + '<input class="input" id="aiBaseURL" placeholder="https://dashscope.aliyuncs.com/compatible-mode/v1" autocomplete="off"></div>'
       + '<div class="field"><div class="field__label" style="font-size:12px">模型名</div>'
-      + '<input class="input" id="aiModel" placeholder="qwen-plus / gpt-4o-mini / @cf/qwen/qwen3.8-27b" autocomplete="off"></div>'
+      + '<input class="input" id="aiModel" placeholder="qwen-plus / gpt-4o-mini / gemini-2.5-flash / @cf/qwen/qwen3.8-27b" autocomplete="off"></div>'
       + '<div class="field"><div class="field__label" style="font-size:12px">API Key'
       + (cfg.hasKey ? '（已保存，留空表示不改）' : '') + '</div>'
       + '<input class="input" id="aiKey" type="password" placeholder="sk-... / cfut_..." autocomplete="off"></div>'
@@ -1270,7 +1274,7 @@
       if (hint) hint.textContent = AI_HINT[v] || ''
       baseInput.placeholder = (v === 'cloudflare')
         ? '留空即可（自动拼装）；或填 https://api.cloudflare.com/client/v4/accounts/…/ai/v1'
-        : 'https://dashscope.aliyuncs.com/compatible-mode/v1'
+        : ((AI_PRESET[v] && AI_PRESET[v][0]) || 'https://your-gateway.example.com/v1')
     }
     provSelect.addEventListener('change', () => applyPreset(provSelect.value))
 

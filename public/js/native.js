@@ -86,6 +86,28 @@
    * 只有原生侧整个没动静（进程被杀、线程池真卡死）才由这里兜底。
    */
   const HTTP_GUARD = HTTP_TIMEOUT + 5000
+
+  /**
+   * 由「页面侧打算等多久」推导桥这边的两个时限，让三层永远保持同一顺序：
+   *
+   *     原生读超时  <  页面侧超时  <  兜底守卫
+   *
+   * 为什么要有它（2026-10-09 老板报「AI 生成歌单偶发失败、提示超时」）：
+   * 网页端给 AI 生成单独放了 200s（见 public/js/api.js 的 AI_TIMEOUT），可桥这边
+   * 是写死的 30000 / 35000 —— 一个本该等 200s 的请求会被桥在 30s 掐死，上层那个
+   * 200s 形同虚设。现在页面把自己的超时随请求递下来（api.js 传的 `lxTimeout`），
+   * 桥照着排；没带时**逐字返回原来的 30000 / 35000**，普通请求的行为一点不变。
+   *
+   * 10s / 5s 这两个差值沿用原设计：原生侧要早到，才能带着「连接超时 / 读超时 /
+   * 重定向过多 / 桥太忙」这类明确文案回投，而不是被上层抢先盖成一句「桥请求超时」。
+   */
+  function bridgeTimeout(pageMs) {
+    const page = Number(pageMs)
+    if (!(page > 0)) return { native: HTTP_TIMEOUT, guard: HTTP_GUARD }
+    const native = Math.max(15000, page - 10000)
+    return { native, guard: native + 5000 }
+  }
+
   const SERVER_KEY = 'lx.serverBase'  // 非空 = 远程模式（见第 8 节）
   // 远程模式判定要在 fetch 劫持之前就定下来（劫持层每次请求现读它），
   // 所以放在常量区；readServerBase 是函数声明，会提升，这里能直接调。
@@ -171,6 +193,10 @@
 
     if (signal && signal.aborted) return Promise.reject(new DOMException('Aborted', 'AbortError'))
 
+    // 页面侧的超时（api.js 的 req 递下来的 lxTimeout）决定桥这两个时限；
+    // 缺省时就是原来的 30s / 35s，普通请求行为不变。
+    const t = bridgeTimeout(o.lxTimeout)
+
     return new Promise((resolve, reject) => {
       const id = 'h' + (++httpSeq)
       const entry = { resolve, reject, timer: null }
@@ -181,7 +207,7 @@
         // 正常的超时、连不上、重定向过多、桥忙，都由 Java 带着明确文案先回投，
         // 见 HTTP_GUARD 上方那段说明。
         reject(new Error('桥请求超时: ' + url))
-      }, HTTP_GUARD)
+      }, t.guard)
       pendingHttp.set(id, entry)
 
       // 接住 AbortSignal：api.js 给每个请求套了 40s 超时（AbortController），
@@ -202,7 +228,9 @@
         method,
         headers,
         body: bodyToString(o.body),
-        timeout: HTTP_TIMEOUT,
+        // 原生侧用它做 connect / read 超时，也是「整条请求含全部重定向跳」的总预算。
+        // 由页面侧的超时推导（见 bridgeTimeout），AI 那类长请求会拿到 190s 而不是 30s。
+        timeout: t.native,
       })
 
       try {
