@@ -243,8 +243,15 @@ ok('generatePlaylist 真的用上了 AI_TIMEOUT（否则常量是摆设）',
   /generatePlaylist:\s*\(prompt, count\) => post\('\/ai-playlist', \{ prompt, count \}, \{ timeout: AI_TIMEOUT \}\)/.test(APISRC))
 ok('req 把页面侧超时透给壳内的桥（少了它，AI 在 APP 里仍被 30s 掐断）',
   /lxTimeout:\s*ms/.test(APISRC))
-ok('服务端 AI 上限 180s < 前端 200s（留 20s，别让前端先掐断服务端）',
-  /Math\.min\(180000, Math\.max\(60000, n \* 4000\)\)/.test(AISRC))
+/**
+ * 90 这个数同时被两堵墙夹着：
+ *   · 上前端 —— 必须小于 api.js 的 AI_TIMEOUT（200s），否则服务端还在算、前端已掐断；
+ *   · 上网关 —— 必须小于「Docker 挂 Cloudflare 代理」时 CF 到源站的 100s 硬超时，
+ *     否则用户看到的是一句没头没尾的 524，而不是「AI 慢，可减少歌曲数量」。
+ * 老板补报「docker 也存在 AI 生成超时」后才收到 90 —— 别随手调大。
+ */
+ok('服务端 AI 上限 90s：既小于前端 200s，也小于 CF 代理到源站的 100s 硬超时',
+  /Math\.min\(90000, Math\.max\(60000, n \* 4000\)\)/.test(AISRC))
 
 console.log(`\n${pass} 通过 / ${fail} 失败`)
 process.exit(fail ? 1 : 0)

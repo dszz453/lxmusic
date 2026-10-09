@@ -64,13 +64,21 @@ APP_NAME="music-edge"
 #     「页面侧打算等多久」随请求递给壳内的桥（自定义字段 lxTimeout），桥据此把
 #     **原生读超时排在前面**（lxTimeout-10s）、**兜底守卫排在后面**（+5s）；
 #     没带该字段时逐字退回原来的 30s/35s，普通请求的行为一点不变。
-#     服务端上限同时收到 180s，保证「服务端还在算、前端已经掐断」不会发生。三层新序：
+#     服务端上限同时从 240s **收到 90s** —— 它被两堵墙夹着：上前端是 200s，
+#     上网关是「Docker 前面挂 Cloudflare 代理（橙云）时 CF 到源站的 100s 硬超时」，
+#     超了直接回 524（用户看到的是没头没尾的错误，连「AI 慢」都看不出来）。
+#     宁可自己 90s 放弃、回一句「可重试或减少歌曲数量」。三层新序：
 #
-#         AI 请求  原生 190s < 守卫 195s < 网页端 200s    服务端上限 180s
+#         AI 请求  原生 190s < 守卫 195s < 网页端 200s    服务端上限 90s
 #         普通请求 原生  30s < 守卫  35s < 网页端  40s    （原样不变）
 #
-#     顺带记一条平台的账：**CF 对 HTTP 触发没有硬性墙钟上限**（只要客户端还连着），
-#     且等待 I/O 不计 CPU —— 卡住这条链的从来不是 CF，是前端那条早到的 40s。
+#     顺带记两条平台的账：
+#       · **CF Workers 那一侧没有这堵墙** —— HTTP 触发没有硬性墙钟上限（只要客户端
+#         还连着），等待 I/O 也不计 CPU。卡住 CF 版的从来不是 CF，是前端那条早到的 40s。
+#       · **Docker 服务端链路本身也没有掐断点** —— /api/* 直接 await，Node 的
+#         requestTimeout 与 undici Agent 都是默认 300s（server/outbound-pool.mjs 只设了
+#         keepAlive，没设 headers/body timeout）。Docker 版的超时来自前端与（可能的）
+#         代理层，不是 server/index.mjs。
 #
 #  护栏：test/ai-route.test.mjs 19 → 33（走兼容层 / 不发 response_format / 三层超时顺序）、
 #        test/client-wiring.test.mjs 109 → 111（桥按 lxTimeout 推导、缺省逐字退回原值）、
