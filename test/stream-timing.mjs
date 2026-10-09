@@ -1,6 +1,7 @@
 /** 代理取流分段计时：定位 19~38 秒起播到底耗在哪 */
 const BASE = 'https://music.zyplnn.dpdns.org'
-const PASS = process.env.LX_PASS || 'Zyp200709+'
+const PASS = process.env.LX_PASS || ''
+if (!PASS) console.warn('[warn] 未设置 LX_PASS，需要登录的接口会 401')
 
 const tok = (await (await fetch(BASE + '/api/login', {
   method: 'POST', headers: { 'Content-Type': 'application/json' },

@@ -1,6 +1,7 @@
 /** 线上验收：/api/url?fast=1 的三件事 —— 协议升级、并发探测、体积降序 */
 const BASE = 'https://music.zyplnn.dpdns.org'
-const PASS = process.env.LX_PASS || 'Zyp200709+'
+const PASS = process.env.LX_PASS || ''
+if (!PASS) console.warn('[warn] 未设置 LX_PASS，需要登录的接口会 401')
 
 const j = async (p, opt) => {
   const r = await fetch(BASE + p, opt)

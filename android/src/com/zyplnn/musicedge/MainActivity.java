@@ -43,7 +43,7 @@ import org.json.JSONObject;
  * StoreBridge 两个原生桥。也就是说 —— 除了音频字节本身，其余全部不依赖任何服务端，
  * Cloudflare 上的那份部署挂了也不影响 App。
  *
- * 之所以仍然加载 https://music.zyplnn.dpdns.org/ 这个 URL 而不是 file://：
+ * 之所以仍然加载一个 https 的「假域名」（见下面 START_URL）而不是 file://：
  *   · file:// 页面是 opaque origin，localStorage / IndexedDB / Worker 都会变得别扭；
  *   · https origin 才是正常的 secure context，前端里大量既有的存储与 Worker 逻辑不用改。
  * 拦截层保证这份「假域名」下面的东西全部来自本地 assets，一个字节都不出设备。

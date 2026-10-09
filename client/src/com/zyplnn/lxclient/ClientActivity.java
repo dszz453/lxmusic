@@ -352,7 +352,7 @@ public class ClientActivity extends Activity {
     /* ══════════════════ 连接状态条 ══════════════════ */
 
     /**
-     * 顶栏下面那条 24dp 的细条：`● music-edge · 已连接 · music.zyplnn.dpdns.org`。
+     * 顶栏下面那条 24dp 的细条：`● music-edge · 已连接 · 你的站点域名`。
      *
      * 为什么值得占这 24dp：这个客户端是**通用**的，同一个 APK 可能连着家里的 Docker、
      * 公司内网的一台、或者外面那台 CF —— 用户最容易搞混的就是「我现在看的这份数据是谁的」。

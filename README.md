@@ -185,7 +185,7 @@ LX_PASS='密码' node test/ui-dialogs.mjs   # 31 项真浏览器：对话框 / �
 ### 界面约定（2026-10-08 第二轮）
 
 **用户端一律不用系统 `prompt/confirm`。** 安卓 WebView 会把**页面地址**印在弹窗标题上
-（`https://music.zyplnn.dpdns.org` 就是这么露出来的），样式也不受控，还可能被拦掉导致回调不回来。
+（站点域名就是这么露出来的），样式也不受控，还可能被拦掉导致回调不回来。
 统一走站内对话框：`openDialog()` / `askText()` / `askConfirm()`，三个都返回 Promise。
 
 > 管理后台（`/admin`）里那几处 `confirm` **是有意保留的** —— 它是桌面网页控制台，
@@ -897,7 +897,7 @@ text/plain 渲染。桌面替身走真 HTTP 服务器设 Content-Type，永远�
 
 ### 1.2 和 1.1 的区别（关键）
 
-**1.1 只是个套壳**：WebView 打开 `https://music.zyplnn.dpdns.org`，页面、后端、插件全在 Cloudflare 上，
+**1.1 只是个套壳**：WebView 打开线上站点（自建的那份部署），页面、后端、插件全在 Cloudflare 上，
 站点一停或网络一断，APP 就是白屏。
 
 **1.2 把整套后端搬进了设备**：
@@ -1037,7 +1037,7 @@ for n in z.namelist():
 > 在 Worker 上的行为与改动前一致（`LX_NATIVE` 未置位 → 走原逻辑），但**要重新部署才会生效**。
 > 部署方法见本节。
 
-站点：https://music.zyplnn.dpdns.org
+站点：你自己的自定义域名（即 `wrangler.toml` 里 `routes` 绑定的那个）
 
 ```bash
 npm install

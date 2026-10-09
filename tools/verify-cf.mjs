@@ -5,7 +5,7 @@
 //
 // 用法：
 //   node tools/verify-cf.mjs [baseUrl]
-//   默认 baseUrl = https://music.zyplnn.dpdns.org
+//   默认 baseUrl = https://<你的站点域名>
 import { readFileSync, readdirSync, statSync } from 'node:fs'
 import { createHash } from 'node:crypto'
 import { join, relative, sep } from 'node:path'

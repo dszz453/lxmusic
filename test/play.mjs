@@ -13,7 +13,8 @@ import path from 'node:path'
 
 const HOST = 'music.zyplnn.dpdns.org'
 const IP = process.env.CF_IP || '104.21.10.218'
-const PASS = process.env.LX_PASS || 'Zyp200709+'
+const PASS = process.env.LX_PASS || ''
+if (!PASS) console.warn('[warn] 未设置 LX_PASS，需要登录的接口会 401')
 const CHROME = 'C:\\Program Files\\Google\\Chrome\\Application\\chrome.exe'
 const OUT = path.join(process.cwd(), 'shots')
 fs.mkdirSync(OUT, { recursive: true })

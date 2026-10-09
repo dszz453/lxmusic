@@ -16,7 +16,7 @@
  * 断言的是**期望值**，不是「等于 Docker 那个」——
  * 同一个脚本既能验 Docker 也能验 CF，靠 LX_EXPECT 指定：
  *   Docker：LX_BASE=http://127.0.0.1:8795 LX_EXPECT=LX-MUSIC node test/brand-live.mjs
- *   CF    ：LX_BASE=https://music.zyplnn.dpdns.org LX_EXPECT=music-edge node test/brand-live.mjs
+ *   CF    ：LX_BASE=https://<你的站点域名> LX_EXPECT=music-edge node test/brand-live.mjs
  */
 import fs from 'node:fs'
 import os from 'node:os'
@@ -56,7 +56,7 @@ const profile = fs.mkdtempSync(path.join(os.tmpdir(), 'lxbrand-'))
  * 为什么需要：测 localhost 时要 --no-proxy-server（直连本机）；
  * 测 CF 线上时沙箱 IPv4 到 Cloudflare 不通，得靠 host-resolver-rules
  * 把域名钉到已知可达的边缘 IPv6 上，例如：
- *   LX_CHROME_EXTRA='--host-resolver-rules=MAP music.zyplnn.dpdns.org [2606:4700:3030::6815:ada]'
+ *   LX_CHROME_EXTRA='--host-resolver-rules=MAP <你的站点域名> [2606:4700:3030::6815:ada]'
  */
 const EXTRA = (process.env.LX_CHROME_EXTRA || '').split('@@').map((s) => s.trim()).filter(Boolean)
 const chrome = spawn(CHROME, [
