@@ -145,13 +145,27 @@ ok('needsSetup 分支仍在，且优先于登录判断',
   /status\.needsSetup/.test(boot)
   && (boot.indexOf('status.needsSetup') < boot.indexOf('if (!token)')))
 ok('无令牌时仍然跳登录页', /if\s*\(\s*!token\s*\)/.test(boot))
-ok('me 失败仍然清令牌并跳登录页',
-  /API\s*\.\s*setToken\s*\(\s*''\s*\)/.test(boot) && /#\/login/.test(boot))
+ok('只有「明确被拒绝」那条分支才清令牌并跳登录页',
+  (() => {
+    const i = boot.indexOf('if (tokenRejected)')
+    if (i < 0) return false
+    const seg = boot.slice(i, i + 400)
+    return /setToken\s*\(\s*''\s*\)/.test(seg) && /#\/login/.test(seg)
+  })())
 ok('setup 分支仍跳 #/setup', /#\/setup/.test(boot))
-ok('App.user 取自 me 的结果（不再取自被吞掉的局部变量）',
-  /App\.user\s*=\s*meRes\.user/.test(boot))
+ok('me 的结果仍然落到身份上（不再取自被吞掉的局部变量）',
+  /trustIdentity\s*\(\s*meRes\.user\s*\)/.test(boot))
+ok('身份确认后仍记下 username（下一次冷启动的首帧靠它读磁盘缓存）',
+  /trustIdentity\s*\(\s*meRes\.user\s*\)[\s\S]{0,220}rememberUser\s*\(\s*App\.user/.test(boot))
+/**
+ * 2026-10-09 补的一条：`me` 失败（超时/断网/服务器重启）**不等于**未登录，
+ * 手里那份「服务端刚确认过的身份」不许被降级 —— 老板在这个点上报过
+ * 「重新登录之后我的歌单空白、我的页显示未登录、大概 10 秒才好」。
+ */
+ok('me 失败时先看身份是否已确认（确认过就不降级、不标离线）',
+  /if \(meRes\.error\)[\s\S]{0,320}if \(identityTrusted\)/.test(boot))
 ok('App.ready 在身份确定之后才置位',
-  boot.indexOf('App.ready = true') > boot.indexOf('App.user = meRes.user'))
+  boot.indexOf('App.ready = true') > boot.indexOf('trustIdentity(meRes.user)'))
 
 /* ============================================================
    4. 客户端首屏：别再解析 1.9 MB 用不到的本机后端
@@ -227,6 +241,47 @@ ok('init() 里 boot 之前的装配步骤包在 try/catch 里（那几步抛了 
   /try\s*\{[\s\S]{0,700}watchBrandForLogin\s*\(\s*\)[\s\S]{0,500}\}\s*catch/.test(initFn))
 ok('装配 try/catch 在 init() 内部（不是在 init 调用处糊一层 —— 那样 boot 照样不执行）',
   initFn.indexOf('watchBrandForLogin') > 0 && initFn.indexOf('try') < initFn.indexOf('watchBrandForLogin'))
+
+/* ============================================================
+   6. 一次登录不许把最贵的接口打三遍
+   ============================================================ */
+
+console.log('\n== 6. 一次登录的请求风暴：同刻同请求合并 ==')
+
+const APIJS = stripComments(read('public/js/api.js'))
+
+/**
+ * 2026-10-09 老板报「Docker 版客户端**重新登录**之后，我的歌单是空白、加载要半天」。
+ * 真浏览器取证（tools/login-flow-probe.mjs，本地自建宿主 + 干净档案）看到的一次登录：
+ *
+ *     3× /api/home        2× /api/setup-status        2× /api/version
+ *
+ * 来源是「一次登录把首页渲染了好几遍」：`location.hash = '#/'` 派一次 hashchange、
+ * `boot()` 里还有「首帧抢跑」的 route() 与结尾的 `await route()`。
+ * 而 `/api/home` 在冷缓存上要「抓榜单 + 跨 6 个音源搜 24 首」，三份并发就是白算三遍 ——
+ * 自建实例上别的请求（`/api/playlists`、`/api/me`）跟着一起卡，用户看到的就是
+ * 「歌单空白转半天」「我的页还没登录」。
+ *
+ * 修法是在出口处合并（改那几处渲染点迟早会漏一个），下面钉住这条接线。
+ */
+ok('api.js 有同刻同请求合并（inflight 表）', /const inflight = new Map\(\)/.test(APIJS))
+ok('GET 全走合并后的 once()（写操作是 POST/PATCH/DELETE，不受影响）',
+  /const get = \(p\) => once\(p\)/.test(APIJS))
+ok('合并键是**完整路径**（含 query —— 少了它会把不同查询合成一次）',
+  /inflight\.get\(path\)/.test(APIJS) && /req\(path\)/.test(APIJS))
+/**
+ * 只按路径合并的话，「A 退出、B 登录」那一瞬间 A 在途的请求会被 B 复用 ——
+ * 那是本项目最忌讳的串号（首页缓存专门按「服务器 + 账号」隔离同一个道理）。
+ */
+ok('合并键还带上令牌（换人登录时绝不共用同一个在途请求）',
+  /const token = getToken\(\)[\s\S]{0,200}hit\.token === token/.test(APIJS))
+ok('失败/成功都要把条目清掉（否则用户点「重试」会粘在上一发上）',
+  /const drop = \(\) => \{[\s\S]{0,140}inflight\.delete\(path\)/.test(APIJS)
+  && /promise\.then\(drop, drop\)/.test(APIJS))
+ok('合并只发生在 GET 这一层，POST/PATCH/DELETE 仍走裸 req()',
+  /const post = \(p, body\) => req\(p, \{ method: 'POST', body \}\)/.test(APIJS)
+  && /const patch = \(p, body\) => req\(p, \{ method: 'PATCH', body \}\)/.test(APIJS)
+  && /const del = \(p\) => req\(p, \{ method: 'DELETE' \}\)/.test(APIJS))
 
 console.log('\n' + '='.repeat(62))
 if (fails.length === 0) {

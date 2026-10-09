@@ -41,6 +41,13 @@
 
   const App = {
     user: null,
+    /**
+     * `user` 这份身份是不是**服务端确认过的**（登录正文里给的，或 /api/me 回的）。
+     * 见 trustIdentity() 的说明：确认过的身份不允许被「这一趟没问到」降级。
+     */
+    userTrusted: false,
+    /** 「这一趟没问到」时为真：用来在设置页提示「离线」，不代表未登录 */
+    offline: false,
     home: null,
     /** home 这份数据属于哪个账号 —— 换人登录时靠它判断该不该作废（见 pageHome） */
     homeOwner: '',
@@ -414,6 +421,52 @@
   function currentUser() {
     if (App.user && App.user.username) return App.user.username
     return lastUserName()
+  }
+
+  /* ══════════════ 身份：什么是「已经确认过的身份」 ══════════════
+   *
+   * 为什么需要这么一个标记（2026-10-09 老板报「Docker 版客户端**重新登录**之后，
+   * 我的歌单是空白、加载要半天，这时候点『我的』发现未登录，大概要 10 秒才能登录」）：
+   *
+   * `pageLogin` 成功那一刻，`/api/login` 的正文里**已经带着身份**（id / username /
+   * isAdmin），那是服务端刚刚核对过口令给出来的，比什么都可信。可是紧接着的
+   * `boot()` 又去问了一趟 `/api/me`，而那一趟失败时会被当成「身份不明」——
+   * 于是刚登录成功的身份被**降级**：轻则丢掉 isAdmin（管理后台入口消失、
+   * 「我的」页从「管理员账号」变成「普通账号」），重则整份变 null，
+   * 「我的」页就印出「未登录」。用真浏览器复现过（`tools/login-flow-probe.mjs --me-fail`）：
+   *
+   *     App.user 由 {probe, isAdmin:true} → {probe, isAdmin:false, unconfirmed:true}
+   *
+   * 结论：**手里已经有一份服务端亲口给的身份时，第二趟问不到不该把它抹掉。**
+   * 这个标记就是用来表达「这份身份是确认过的，别再降级」。它只在两处被点亮：
+   *   · 登录 / 初始化成功（正文里带身份）；
+   *   · `/api/me` 成功返回（服务端刚刚又确认了一次）。
+   * 而**明确被拒**（401/403）与退出登录会把标记连同身份一起清掉 —— 那才是真的换人了。
+   */
+  let identityTrusted = false
+  /**
+   * 身份的「代」：登出 / 被明确拒绝时 +1。
+   *
+   * 为什么需要：补确认是**定时器**（见 confirmIdentityLater），退避里带着几秒延迟。
+   * 用户在等待期间自己退出登录（或者令牌被判作废）之后，那个迟到的回调不能再把
+   * 身份写回去 —— 否则「刚点完退出，界面又自己登上了」。回调里比对代次即可作废。
+   */
+  let identityGen = 0
+
+  /** 记下「这份身份是确认过的」，并把可见状态一并拉正 */
+  function trustIdentity(user) {
+    identityTrusted = true
+    App.userTrusted = true
+    App.offline = false
+    if (user) App.user = user
+  }
+
+  /** 身份作废（明确被拒 / 退出登录）：连「已确认」标记与重试次数一起清 */
+  function forgetIdentity() {
+    identityGen++
+    identityTrusted = false
+    App.userTrusted = false
+    App.user = null
   }
 
   /**
@@ -1832,13 +1885,30 @@
       const adminHref = (window.LX_REMOTE && window.LXApp ? window.LXApp.serverBase : '') + '/admin'
       items.push({ act: 'link', href: adminHref, icon: 'key', text: '管理后台（音源 / 用户 / 记录）' })
     }
+    /**
+     * 「没问到身份」和「确实没登录」必须能分开显示 —— 两种情况的处置完全不同。
+     *
+     * 2026-10-09 老板报「重新登录之后点『我的』发现未登录」。那一刻的真实状态是
+     * 「令牌还在、只是没问到」，与「你真的没登录」在界面上却长得一模一样，
+     * 用户唯一能做的就是退出再登一次。现在：
+     *   · 前者（有令牌 + offline）→ 说「正在确认登录状态…」，并给一个「重新确认」；
+     *   · 后者（无令牌）→ 才是「未登录」。
+     * 补确认成功时 `confirmIdentityLater` 会自己重画这一页，这句话会自己变成用户名。
+     */
+    const pending = !u.username && App.offline && !!API.getToken()
+    const whoText = u.username || (pending ? '正在确认登录状态…' : '未登录')
+    const subText = u.username
+      ? (u.isAdmin ? '管理员账号' : '普通账号')
+      : (pending
+        ? '<span style="color:var(--brand);text-decoration:underline;cursor:pointer" data-act="retry-identity">重新确认</span>'
+        : '')
     items.push({ act: 'logout', icon: 'logout', text: '退出登录' })
 
     view.innerHTML = '<div class="block" style="display:flex;align-items:center;gap:14px">'
       + '<div style="width:58px;height:58px;border-radius:50%;background:linear-gradient(135deg,#ff7a7a,#ec4141);display:grid;place-items:center;color:#fff;font-size:22px;font-weight:700">'
       + esc((u.username || '?').slice(0, 1).toUpperCase()) + '</div>'
-      + '<div><div style="font-size:18px;font-weight:700">' + esc(u.username || '未登录') + '</div>'
-      + '<div class="note">' + (u.isAdmin ? '管理员账号' : '普通账号') + '</div></div></div>'
+      + '<div><div style="font-size:18px;font-weight:700">' + esc(whoText) + '</div>'
+      + '<div class="note">' + subText + '</div></div></div>'
       + '<div style="border-top:8px solid var(--bg)"></div>'
       + items.map(it => {
         const inner = '<span class="quick__icon ' + (it.act === 'logout' ? 'c-gray' : 'c-red') + '">' + ICON[it.icon] + '</span>'
@@ -2272,7 +2342,12 @@
       try {
         const res = await API.login(username, password)
         API.setToken(res.token)
-        App.user = res.user
+        /**
+         * 登录正文里就带着身份 —— 这一份**就是确认过的**，别让紧接着那一趟
+         * `/api/me` 的成败来决定「我到底登录了没」（见 trustIdentity 的说明）。
+         * 老板「重新登录之后『我的』还显示未登录、要等十秒」就是这个降级造成的。
+         */
+        trustIdentity(res.user)
         rememberUser(res.user && res.user.username)
         toast('欢迎回来，' + res.user.username)
         location.hash = '#/'
@@ -2305,7 +2380,8 @@
       try {
         const res = await API.setup(username, password)
         API.setToken(res.token)
-        App.user = res.user
+        // 与登录同理：初始化正文里带的就是确认过的身份（见 trustIdentity）
+        trustIdentity(res.user)
         rememberUser(res.user && res.user.username)
         toast('初始化完成')
         location.hash = '#/'
@@ -2727,6 +2803,20 @@
       case 'reload-home': App.home = null; pageHome(); break
       // 只重画当前页，不清任何缓存 —— 「我的歌单」本来就是每次现取，没有可清的缓存
       case 'reload-library': pageLibrary(); break
+      /**
+       * 手动重新确认身份。
+       *
+       * 为什么给这个入口：补确认是自动的（见 confirmIdentityLater 的档位表），
+       * 但四次都没够着（服务器在重启、人在地下车库）时不该只剩「退出登录再登回来」
+       * 这一条路 —— 那要用户重新输密码，而问题根本不在密码。
+       * 点了就把档位重置、立刻再来一轮。
+       */
+      case 'retry-identity': {
+        identityRetry = 0
+        toast('正在确认登录状态…')
+        confirmIdentityLater()
+        break
+      }
       case 'do-search': doSearch(); break
       case 'switch-source': {
         const src = node.dataset.source
@@ -2932,7 +3022,9 @@
       case 'logout': {
         if (!await askConfirm({ title: '退出登录', message: '退出后需要重新输入密码。', okText: '退出', danger: true })) return
         API.setToken('')
-        App.user = null
+        // 身份连同「已确认」标记一起清（见 forgetIdentity）：退出之后补确认的
+        // 定时器即便还在路上，也会因为代次变了而作废，不会把人又「登」回去。
+        forgetIdentity()
         // 临时身份（lx.lastUser）一并清掉：它只服务于「本人冷启动读自己的缓存」，
         // 留着会让下一个人登录时先闪出上一个人的推荐。
         rememberUser('')
@@ -3194,17 +3286,55 @@
    * 下次切换页面自然就对了 —— 这里只把内存里的身份修正掉。
    */
   let identityRetry = 0
+  /**
+   * 补确认的**档位**（毫秒）。第一档是 0 —— 立刻重试。
+   *
+   * 为什么第一档立刻、为什么要有四档（2026-10-09 老板报「大概要 10 秒才能登录」）：
+   *
+   * 原来写的是 `setTimeout(..., 3000 * identityRetry)`、`if (identityRetry >= 2) return`，
+   * 看着是「退避两次」，实际上这个函数**只有一个调用点**（boot 的「没问到」分支），
+   * 所以它只排了一次定时器 —— 而那一档是 3 秒。失败之后没有人再喊它，于是：
+   *
+   *     · 用户白等 3 秒（那一趟明明可以立刻重试，服务器可能只是重启了一瞬间）；
+   *     · 3 秒那次要是也没够着，**就永远不再试了**，身份一直悬在「未确认」上
+   *       （真浏览器复现：`tools/login-flow-probe.mjs --stale-device` 里 9 秒后仍显示未登录）。
+   *
+   * 换成档位表之后：立刻一发，不够就 1.5s / 4s / 9s 各再来一发，每发失败都自己排下一档。
+   * 第一发立刻是对的 —— 这一趟失败本来就多半是瞬时抖动（服务器重启、切基站），
+   * 而它成功的话用户**一帧都不会看到「未登录」**。
+   */
+  const IDENTITY_RETRY_DELAYS = [0, 1500, 4000, 9000]
+
   function confirmIdentityLater() {
-    if (identityRetry >= 2) return
+    const delay = IDENTITY_RETRY_DELAYS[identityRetry]
+    if (delay === undefined) return
     identityRetry++
+    const gen = identityGen
     setTimeout(() => {
+      // 这期间用户登出了 / 令牌被判作废 → 这次迟到的确认作废，别把人又「登」回去
+      if (gen !== identityGen) return
       API.me().then((r) => {
+        if (gen !== identityGen) return
         if (!r || !r.user) return
-        App.user = r.user
-        App.offline = false
+        /**
+         * 身份从「空 / 未确认」变成「确认过的」时，**必须重画一次当前页面**。
+         *
+         * 原来这里只改内存、不重新路由（理由是「别把用户正在看的页面重画一遍，
+         * 歌单详情会回到顶部」）—— 那条理由只对「本来就是同一个人、只是 isAdmin
+         * 之类的细节变准了」成立。可如果用户此刻看到的正是「未登录」，那不重画就等于
+         * **屏幕上那句错话永远留着**，他还得自己再点一下才发现其实已经好了 ——
+         * 老板说的「大概要 10 秒才能登录」就是这个形状。
+         * 真浏览器复现：补确认成功后 9 秒，页面正文仍然是「未登录」。
+         */
+        const wasBlind = !App.user || App.user.unconfirmed
+        trustIdentity(r.user)
         rememberUser(r.user.username)
-      }).catch(() => { /* 还是够不着：交给用户下次操作时自然重试 */ })
-    }, 3000 * identityRetry)
+        if (wasBlind) route().catch(() => { /* 重画失败不影响身份已修正 */ })
+      }).catch(() => {
+        // 还是没够着：按下一档再试（档位用完为止）
+        if (gen === identityGen) confirmIdentityLater()
+      })
+    }, delay)
   }
 
   async function boot() {
@@ -3216,6 +3346,8 @@
     bindBrand()
 
     const token = API.getToken()
+    // 每次启动都从退避的第一档重来 —— 上一次启动里用掉的档位不该省给这一次
+    identityRetry = 0
 
     /**
      * **首帧不等网络** —— 有令牌就先把当前路由画出来，再回头去确认身份。
@@ -3296,31 +3428,46 @@
     const tokenRejected = meStatus === 401 || meStatus === 403
     if (tokenRejected) {
       API.setToken('')
-      App.user = null
-      // 令牌作废 = 换人了，临时身份也要跟着清（否则首帧会读到上一个人的缓存）
+      // 令牌作废 = 换人了：身份（连同「已确认」标记与补确认代次）一起清，
+      // 否则首帧会读到上一个人的缓存
+      forgetIdentity()
       rememberUser('')
       location.hash = '#/login'
       await route()
       return
     }
     if (meRes.error) {
-      // 问不到（超时/断网）：保留令牌与上次身份，按「已登录」继续渲染。
-      // 上一次的用户名可能为空（从没在这台设备登录过）—— 那确实是未登录，如实渲染。
-      const who = lastUserName()
-      App.user = who ? { username: who, isAdmin: false, unconfirmed: true } : null
-      App.offline = true
-      // 网络抖动多半是瞬时的：过几秒自己补确认一次，用户不用「退出再登进来」
-      confirmIdentityLater()
+      /**
+       * **问不到 ≠ 未登录**，先看手里那份身份是不是确认过的。
+       *
+       * 刚登录 / 刚初始化成功之后走到这里，说明这几百毫秒内网络抖了一下 ——
+       * 而 `res.user` 是服务端几毫秒前刚刚核对口令给出来的。
+       * 这时候把它降级成 `unconfirmed` 或 null，用户看到的就是老板报的那个
+       * 「重新登录之后还显示未登录、要等十秒才自己好」。
+       * 所以**确认过的身份原样留着**，连 offline 都不标 —— 我们刚刚才跟服务器说过话。
+       */
+      if (identityTrusted) {
+        App.offline = false
+      } else {
+        // 没确认过的（冷启动、令牌是从别处传来的）：保留令牌与上次身份，按「已登录」继续渲染。
+        // 上一次的用户名可能为空（从没在这台设备登录过）—— 那确实是未登录，如实渲染。
+        const who = lastUserName()
+        App.user = who ? { username: who, isAdmin: false, unconfirmed: true } : null
+        App.offline = true
+        // 网络抖动多半是瞬时的：立刻补确认一次（必要时按档位退避），用户不用「退出再登进来」
+        confirmIdentityLater()
+      }
     } else if (!meRes.user) {
       // 服务端认了令牌却没给出用户 —— 理论上不该发生，按未登录处理，别让它悬着
       API.setToken('')
-      App.user = null
+      forgetIdentity()
       rememberUser('')
       location.hash = '#/login'
       await route()
       return
     } else {
-      App.user = meRes.user
+      // 服务端刚刚确认过：这份身份是可信的（记下 isAdmin 之类的细节）
+      trustIdentity(meRes.user)
       // 记下身份：下一次冷启动的首帧要靠它读磁盘缓存（见 currentUser 的说明）
       rememberUser(App.user && App.user.username)
     }

@@ -182,8 +182,23 @@ console.log('\n== 4. 服务端榜单缓存（/home 里最贵的一步）==')
 
 console.log('\n== 4b. /home 兜底分支：整份结果进缓存，不再每次回源 ==')
 {
-  const fb = (() => {
+  /**
+   * 切两段：外层的 cachedHomeFallback（算键：天 + 音源清单）与内层的
+   * cachedHomeFallbackByKey（读缓存 / 回源 / 宽限期）。
+   *
+   * 为什么要切**两段**：2026-10-09 给「一次登录打三份 /home」加同刻单飞时，
+   * 键的计算必须留在外层（它要 await searchSources），而单飞与宽限期在内层。
+   * 原来只切 `cachedHomeFallback` 一个函数，加了这一层之后就会切到一个几百字节的
+   * 壳子 —— 下面那些断言会**全部变成空断言而依然显示通过**，正是本文件开头
+   * 「接好了但没人调」那类静默失效。所以这里两个都切，并各自断言长度。
+   */
+  const fb0 = (() => {
     const a = SRV.indexOf('async function cachedHomeFallback(')
+    const b = SRV.indexOf('\n}', a)
+    return (a >= 0 && b > a) ? SRV.slice(a, b) : ''
+  })()
+  const fb = (() => {
+    const a = SRV.indexOf('async function cachedHomeFallbackByKey(')
     const b = SRV.indexOf('\n}', a)
     return (a >= 0 && b > a) ? SRV.slice(a, b) : ''
   })()
@@ -192,7 +207,8 @@ console.log('\n== 4b. /home 兜底分支：整份结果进缓存，不再每次�
     const b = SRV.indexOf('\n}', a)
     return (a >= 0 && b > a) ? SRV.slice(a, b) : ''
   })()
-  ok('cachedHomeFallback 存在且切得出来（否则下面是空断言）', fb.length > 400, 'len=' + fb.length)
+  ok('cachedHomeFallback（算键那一层）切得出来', fb0.length > 200, 'len=' + fb0.length)
+  ok('cachedHomeFallbackByKey 存在且切得出来（否则下面是空断言）', fb.length > 400, 'len=' + fb.length)
   ok('homeFallbackFromCache 切得出来（否则下面几条是空断言）', fbHelper.length > 100, 'len=' + fbHelper.length)
   ok('兜底分支改走它，不再内联现场搜索',
     /const fb = await cachedHomeFallback\(env, db\)/.test(SRV))
@@ -200,7 +216,7 @@ console.log('\n== 4b. /home 兜底分支：整份结果进缓存，不再每次�
     (SRV.match(/HOME_KEYWORDS\[/g) || []).length === 1,
     '出现 ' + (SRV.match(/HOME_KEYWORDS\[/g) || []).length + ' 次')
   ok('缓存键按「天 + 音源清单」，不按用户（这份内容本来就跟用户无关）',
-    /'https:\/\/lx\.cache\.internal\/home-fallback\/' \+ dayIndex \+ '\/' \+ sources\.join\('-'\)/.test(fb))
+    /'https:\/\/lx\.cache\.internal\/home-fallback\/' \+ dayIndex \+ '\/' \+ sources\.join\('-'\)/.test(fb0))
   ok('只在拿到非空 hot 时才写（空结果多半是上游抖动，钉住它首页就空 20 分钟）',
     /if \(hot\.length\) \{/.test(fb))
   ok('榜单没拿到时给短 TTL，恢复后能很快补上',
@@ -221,8 +237,20 @@ console.log('\n== 4b. /home 兜底分支：整份结果进缓存，不再每次�
     /HOME_FALLBACK_STALE_MS = 12 \* 60 \* 60 \* 1000/.test(SRV) &&
     /if \(age < HOME_FALLBACK_STALE_MS\) stale = rec/.test(fb))
   ok('宽限期内先交旧的、重算甩到后台（waitUntil），且**不**用 Promise.race 甩副作用',
-    /const work = compute\(\)/.test(fb) && /env\.waitUntil\(work\)/.test(fb) &&
+    /const work = recompute\(\)/.test(fb) && /env\.waitUntil\(work\)/.test(fb) &&
     !/withDeadline\(compute/.test(fb))
+  /**
+   * 2026-10-09 加的同刻单飞。这一组要钉的是**粒度**，不是「有没有这个词」：
+   *   · 单飞必须包住 compute（贵的只有它）；
+   *   · 键必须带这份内容自己的缓存键 —— 不带就把不同音源 / 不同天算错成一份；
+   *   · 失败要不留存，否则一次抖动会变成「永久不再重算」。
+   */
+  ok('真正贵的那一段（compute）走同刻单飞',
+    /const recompute = \(\) => once\(key\.url \+ '#compute', compute\)/.test(fb))
+  ok('单飞键带上这份内容自己的缓存键（否则不同音源/不同天会串成一份）',
+    /key\.url \+ '#compute'/.test(fb))
+  ok('单飞失败不留存（一次抖动不能变成「永久不再重算」）',
+    /singleFlight\.delete\(key\)/.test(SRV))
   ok('交出去的那份被标记成 stale（debug 里能看出来走的是哪条路）',
     /homeFallbackFromCache\(stale, keyword, true\)/.test(fb) && /stale: !!stale/.test(fbHelper))
   ok('带 ?debug=1 时吐出两段的真实耗时（下次再慢，有数可看）',
@@ -279,10 +307,75 @@ console.log('\n== 4c. 首帧不等网络：身份还没确认时也读得到自�
   ok('超时/断网**不**清令牌、**不**跳登录页（否则服务器重启一下用户就被登出了）',
     offlineBranch.length > 80 && !/setToken/.test(offlineBranch)
     && !/rememberUser\(''\)/.test(offlineBranch) && !/#\/login/.test(offlineBranch))
-  ok('断网时退回上一次的身份继续渲染（发现页才不会显示成未登录）',
-    /if \(meRes\.error\)[\s\S]{0,220}lastUserName\(\)/.test(APPJS))
+  ok('没确认过身份时退回上一次的 username 继续渲染（发现页才不会显示成未登录）',
+    /if \(identityTrusted\) \{[\s\S]{0,120}else \{[\s\S]{0,300}lastUserName\(\)/.test(offlineBranch))
   ok('身份确认后写入临时身份（下一次冷启动的首帧靠它）',
-    /App\.user = meRes\.user[\s\S]{0,200}rememberUser\(App\.user/.test(APPJS))
+    /trustIdentity\(meRes\.user\)[\s\S]{0,200}rememberUser\(App\.user/.test(APPJS))
+
+  /* ------------------------------------------------------------------------
+   * 「手里那份身份是确认过的时候，不许被『这一趟没问到』降级」
+   *
+   * 2026-10-09 老板报：「Docker 版客户端**重新登录**之后，我的歌单是空白、加载要半天，
+   * 这时候点『我的』发现未登录，大概 10 秒才能登录」。
+   * 真浏览器取证（tools/login-flow-probe.mjs --me-fail）复现的是**降级**这一段：
+   *
+   *     /api/login 正文给的身份 {probe, isAdmin:true}
+   *        ↓ 紧接着的 /api/me 失败
+   *     App.user 变成 {probe, isAdmin:false, unconfirmed:true} + offline:true
+   *
+   * 登录正文里的身份是服务端几毫秒前刚核对过口令给的 —— 第二趟问不到只是「没问到」，
+   * 不能把它抹掉。下面几条把这条规矩钉住（含「标记的来源」与「什么时候才作废」）。
+   * ---------------------------------------------------------------------- */
+  ok('有「身份已确认」这个标记，且默认是未确认',
+    /userTrusted: false/.test(APPJS) && /let identityTrusted = false/.test(APPJS))
+  ok('登录 / 初始化成功那一刻就把身份标成确认过的（不再等第二趟 /api/me 说了算）',
+    (APPJS.match(/trustIdentity\(res\.user\)/g) || []).length >= 2,
+    '出现 ' + (APPJS.match(/trustIdentity\(res\.user\)/g) || []).length + ' 次')
+  ok('「没问到」时先看标记：确认过的身份原样留着，不去降级、也不标离线',
+    /if \(meRes\.error\) \{[\s\S]{0,320}if \(identityTrusted\) \{[\s\S]{0,120}App\.offline = false/.test(APPJS))
+  ok('「被明确拒绝」与「退出登录」都把标记一起清掉（那才是真的换人了）',
+    /forgetIdentity\(\)/.test(rejectedBranch) && /case 'logout'[\s\S]{0,600}forgetIdentity\(\)/.test(APPJS))
+  ok('清身份时把「代次」+1（补确认的定时器迟到时据此作废，不会把人又登回去）',
+    /function forgetIdentity\(\) \{[\s\S]{0,80}identityGen\+\+/.test(APPJS))
+
+  /* ------------------------------------------------------------------------
+   * 补确认：档位、以及「确认回来之后屏幕要跟着改」
+   *
+   * 原来写的是 `setTimeout(..., 3000 * identityRetry)` + `if (identityRetry >= 2) return`，
+   * 看着是退避两次，其实这个函数只有一个调用点（boot 的「没问到」分支），
+   * 所以只排了一次 3 秒的定时器 —— 那一发要是也没够着，就**永远不再试**了。
+   * 而且它成功时只改内存、不重画，用户屏幕上那句「未登录」会一直挂着。
+   * ---------------------------------------------------------------------- */
+  ok('补确认有档位表，且第一档是「立刻」（不为一次瞬时抖动白等 3 秒）',
+    /IDENTITY_RETRY_DELAYS = \[0,/.test(APPJS))
+  ok('档位不止两发（原来那个「两次」是假的，只有一个调用点）',
+    (() => {
+      const m = /IDENTITY_RETRY_DELAYS = \[([^\]]*)\]/.exec(APPJS)
+      return !!m && m[1].split(',').filter((s) => s.trim()).length >= 3
+    })())
+  ok('一发失败就自己排下一档（否则第一发没够着就再也不试）',
+    /\.catch\(\(\) => \{[\s\S]{0,160}if \(gen === identityGen\) confirmIdentityLater\(\)/.test(APPJS))
+  ok('身份从「空 / 未确认」回到「已确认」时重画一次（否则屏幕上那句未登录永远留着）',
+    /const wasBlind = !App\.user \|\| App\.user\.unconfirmed/.test(APPJS) &&
+    /if \(wasBlind\) route\(\)/.test(APPJS))
+  ok('补确认成功的回调会比对代次（用户已经登出的话就作废）',
+    /if \(gen !== identityGen\) return/.test(APPJS))
+
+  /**
+   * 界面上「没问到身份」与「确实没登录」必须分得开。
+   *
+   * 老板看到的那句「未登录」就是这里来的 —— 而那一刻的真实状态是「令牌还在、
+   * 只是没问到」。两者处置完全不同（前者等一下就好，后者才要输密码），
+   * 长得一样就等于把用户逼去「退出再登一次」。顺带给一个手动重新确认的入口。
+   */
+  ok('「我的」页把「没问到」和「未登录」分开显示',
+    /const pending = !u\.username && App\.offline && !!API\.getToken\(\)/.test(APPJS)
+    && /pending \? '正在确认登录状态…' : '未登录'/.test(APPJS))
+  ok('只是没问到时不写死「普通账号」（那是「确实没登录」才该有的样子）',
+    /u\.username\s*\n?\s*\?\s*\(u\.isAdmin \? '管理员账号' : '普通账号'\)/.test(APPJS))
+  ok('给一个手动「重新确认」（四次自动补确认都没够着时的自救，不用退出重登）',
+    /data-act="retry-identity"/.test(APPJS)
+    && /case 'retry-identity'[\s\S]{0,160}identityRetry = 0[\s\S]{0,80}confirmIdentityLater\(\)/.test(APPJS))
 }
 
 /* ══════════════ 5. 服务端版本只在设置页 ══════════════ */

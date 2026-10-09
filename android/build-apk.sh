@@ -37,6 +37,27 @@ W() { cygpath -w "$1"; }                          # MSYS 路径 → Windows 路�
 LIST_WIN() { find "$@" | while read -r f; do cygpath -w "$f"; done; }
 
 APP_NAME="music-edge"
+# 2.2：优化登录机制 —— 修「Docker 版客户端重新登录之后，我的歌单空白转半天、
+#  点『我的』还显示未登录、大概 10 秒才登录」。服务端接口实测毫秒级
+#  （/playlists 3.9ms、/me 19.6ms），所以三处都在前端/客户端这条链上：
+#  ① **一次登录把首页渲染了 3 遍** → 3 个 /api/home。真浏览器取证
+#     （probe/login-flow.mjs）：3× /api/home、2× /api/setup-status、2× /api/version。
+#     而 /api/home 在冷缓存上要「抓榜单 + 跨 6 源搜 24 首」（兜底内容全站同一份），
+#     三份并发就是把同一件事算三遍，自建实例上别的请求跟着卡 —— 这就是「歌单空白转半天」。
+#     修法：public/js/api.js 出口处加同刻同请求合并（once/inflight，只合 GET）；
+#     服务端把真正贵的那一段（cachedHomeFallback 的 compute、cachedToplists）也单飞。
+#  ② **登录成功后的身份被第二趟 /api/me 覆盖**。pageLogin 里 res.user 是服务端刚核对
+#     口令给的，boot() 又问一次；那趟失败就把身份降级（实测 isAdmin:true → false、
+#     加 unconfirmed、offline:true），lastUser 为空时更是整份变 null → 「我的」页印
+#     「未登录」。修法：新增「身份已确认」标记 trustIdentity/forgetIdentity，
+#     确认过的身份不允许被「这一趟没问到」降级。
+#  ③ **补确认只有一发、而且不重画**。原写法 setTimeout(..., 3000 * identityRetry) +
+#     if (identityRetry >= 2) return 看着像退避两次，实际这个函数只有一个调用点
+#     （boot 的「没问到」分支）→ 只排了一次 3 秒的定时器；没够着就再也不试。
+#     而且成功时只改内存不重画，屏幕那句「未登录」会一直挂着。
+#     修法：档位表 [0, 1500, 4000, 9000]（第一档立刻），每发失败自己排下一档；
+#     身份从「空/未确认」回到「已确认」时重画一次；登出/被拒时用代次作废迟到回调。
+#     另外「我的」页把「没问到」与「确实没登录」分开显示，并给一个手动「重新确认」。
 # 2.1：修「2.0 那版让改设置当天生效的机制**其实根本没生效**」—— CF 端今日推荐仍是酷狗。
 #  根因不是逻辑写错，而是**参数传错后被 catch 吞掉**：dailySourcesStale 原签名是
 #  (env, db, record)，api.js 传的 db 是 `import * as db from '../db.js'` 那个**模块**，

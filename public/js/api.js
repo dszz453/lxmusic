@@ -60,7 +60,54 @@
     return data
   }
 
-  const get = (p) => req(p)
+  /**
+   * 同刻同请求合并（in-flight 单飞）。
+   *
+   * 为什么需要（2026-10-09 老板报「Docker 版客户端重新登录之后，我的歌单是空白、
+   * 加载要半天，这时候点『我的』还显示未登录」）：
+   *
+   * 一次登录会**把首页渲染好几遍** —— `pageLogin` 里的 `location.hash = '#/'` 派一次
+   * hashchange、`boot()` 里还有「首帧抢跑」的 `route()` 与结尾的 `await route()`。
+   * 用真浏览器取证（`tools/login-flow-probe.mjs`）看到的一次登录：
+   *
+   *     3× /api/home        2× /api/setup-status        2× /api/version
+   *
+   * 而 `/api/home` 在冷缓存上要「抓榜单 + 跨 6 个音源搜 24 首」—— 三份并发就是把
+   * 同一件事算三遍（那一份兜底内容还是**全站同一份**，见 src/server/api.js），
+   * 自建实例上 CPU 与出网全被占住，别的请求（`/api/playlists`、`/api/me`）跟着一起卡。
+   * 用户看到的就是「歌单空白转半天」「歌单页在转、我的页还没登录」。
+   *
+   * 为什么合并在这一层、而不是去改那几处渲染：
+   * 重复的调用点分散在 pageHome / 品牌对齐 / 设置页好几处，逐个去重迟早漏一个；
+   * 而「同一时刻、同一路径的同一个 GET」本来就该是同一次读。放在出口处一次说清。
+   *
+   * ⚠ 只合 GET，且要求**本项目的 GET 都没有副作用** —— 这是这份前端的一条约定
+   * （写操作一律 POST/PATCH/DELETE：`/daily/refresh`、`/favorite`、`/progress` …）。
+   * 以后若要加一个「GET 但会改数据」的接口，要么改成 POST，要么绕开 `once`。
+   *
+   * ⚠ 合并键是「**令牌 + 完整路径**」，不是光一个路径。
+   * 只按路径合并的话，「A 退出、B 登录」那一瞬间 A 在途的请求会被 B 复用 ——
+   * 这正是本项目最忌讳的串号（首页缓存专门按「服务器+账号」隔离同一个道理）。
+   * 令牌换了就当成另一次读，绝不共用。
+   *
+   * 失败**不留存**：结束就把这条删掉，所以用户点「重试」拿到的一定是新的一次
+   * 请求，不会被上一发失败钉住（这点很关键 —— 否则一次抖动会变成永久加载失败）。
+   */
+  const inflight = new Map()
+  function once(path) {
+    const token = getToken()
+    const hit = inflight.get(path)
+    if (hit && hit.token === token) return hit.promise
+    const promise = req(path)
+    const rec = { token, promise }
+    inflight.set(path, rec)
+    // 成败都要清：成功后再来一次是「用户主动刷新」，本就该真打一次
+    const drop = () => { if (inflight.get(path) === rec) inflight.delete(path) }
+    promise.then(drop, drop)
+    return promise
+  }
+
+  const get = (p) => once(p)
   const post = (p, body) => req(p, { method: 'POST', body })
   const patch = (p, body) => req(p, { method: 'PATCH', body })
   const del = (p) => req(p, { method: 'DELETE' })

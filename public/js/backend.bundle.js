@@ -1,5 +1,5 @@
 /* 由 tools/build-app.mjs 自动生成，请勿手动修改。
- * 源摘要: 996271088c2a9606
+ * 源摘要: 291cb709bb12ce90
  * 模块数: 25
  *
  * 这是给安卓壳用的后端展平版：把 src/ 的 ESM 后端打成单个 IIFE，
@@ -407,7 +407,38 @@ function withDeadline(promise, ms, fallback) {
 /** 榜单回源的上限。榜单没出来首页照样能开，不值得为它等十几秒 */
 const TOPLISTS_DEADLINE_MS = 2500
 
+/**
+ * 同刻同算合并（in-flight 单飞）。
+ *
+ * 为什么必须有（2026-10-09 老板报「Docker 版客户端重新登录之后，我的歌单是空白、
+ * 加载要半天」）：一次登录会**把首页渲染好几遍**（页面侧的 hashchange 一波 +
+ * boot() 的抢跑一波 + 结尾一波），前端那侧已经用 `public/js/api.js` 的 `once()`
+ * 合成一次请求了；但服务端不能只指望前端 —— 同一时刻可能有浏览器、两个 App、
+ * 一次冷启动同时在问同一份内容，而**这份内容是全站同一份**（关键词按天轮换、
+ * 榜单与热歌跟哪个用户无关），把它算三遍纯属自残：自建实例上 CPU 与出网被占满，
+ * 别的请求（`/api/playlists`、`/api/me`）跟着一起卡 —— 那就是「歌单空白转半天」。
+ *
+ * 键必须是**那份内容自己的缓存键**（带上天序号与音源清单），这样不同设置、
+ * 不同天的计算不会被错误地合成一次。
+ *
+ * 失败**不留存**：结束就删，下一次请求该重算就重算（与缓存「失败不写」同一条纪律）。
+ */
+const singleFlight = new Map()
+function once(key, run) {
+  const hit = singleFlight.get(key)
+  if (hit) return hit
+  const p = Promise.resolve().then(run)
+  singleFlight.set(key, p)
+  p.then(() => { if (singleFlight.get(key) === p) singleFlight.delete(key) },
+    () => { if (singleFlight.get(key) === p) singleFlight.delete(key) })
+  return p
+}
+
 async function cachedToplists() {
+  return once('toplists/wy', cachedToplistsUncached)
+}
+
+async function cachedToplistsUncached() {
   const key = new Request('https://lx.cache.internal/toplists/wy', { method: 'GET' })
   try {
     const hit = await edgeCache.match(key)
@@ -483,7 +514,10 @@ async function cachedHomeFallback(env, db) {
   const key = new Request(
     'https://lx.cache.internal/home-fallback/' + dayIndex + '/' + sources.join('-'),
     { method: 'GET' })
+  return cachedHomeFallbackByKey(env, keyword, sources, key)
+}
 
+async function cachedHomeFallbackByKey(env, keyword, sources, key) {
   let stale = null
   try {
     const hit = await edgeCache.match(key)
@@ -530,6 +564,17 @@ async function cachedHomeFallback(env, db) {
     return { keyword, charts, hot, errors, fromCache: false, stale: false }
   }
 
+  /**
+   * 单飞的粒度**必须落在 compute 上**，不能落在整个函数上。
+   *
+   * 为什么：这份函数有三条出口，其中「命中且没过期」与「过期但还在宽限期内」两条
+   * 都是**毫秒级返回**（只读一次缓存）。要是把整个函数包进单飞，那两条会瞬间结束、
+   * 条目立刻被删掉 —— 紧接着到的第二个请求就找不到可复用的条目，于是各自再起一次
+   * `compute()`，白忙一场。真正贵的、也是唯一值得合并的，是 `compute()` 本身
+   * （抓榜单 + 跨 6 个音源搜 24 首），所以键也按它来。
+   */
+  const recompute = () => once(key.url + '#compute', compute)
+
   if (stale) {
     /**
      * 先把过期的那份交出去，重算甩到后台。
@@ -539,12 +584,12 @@ async function cachedHomeFallback(env, db) {
      * 想要的语义。这里要的是「让它完整跑完，只是不等它」，所以用 waitUntil；
      * 没有 waitUntil 的环境（部分替身）就让它自由跑完。
      */
-    const work = compute().catch(() => { /* 后台重算失败：旧内容继续顶着 */ })
+    const work = recompute().catch(() => { /* 后台重算失败：旧内容继续顶着 */ })
     try { if (env && env.waitUntil) env.waitUntil(work) } catch { /* 自由跑完即可 */ }
     return homeFallbackFromCache(stale, keyword, true)
   }
 
-  return compute()
+  return recompute()
 }
 
 /**
@@ -8183,10 +8228,10 @@ __modules["src/version.js"] = function (__exports, __require) {
  */
 
 /** 产品版本（对外展示用）。每发一版升 0.1。 */
-const APP_VERSION = 'V2.1'
+const APP_VERSION = 'V2.2'
 
 /** Android versionCode：整数、单调递增、跨次发布不可重复。每发一版 +1。 */
-const APP_VERSION_CODE = 111
+const APP_VERSION_CODE = 112
 
 /** 人类可读的完整标识，日志/关于页用。 */
 const APP_ID = 'lxmusic'
