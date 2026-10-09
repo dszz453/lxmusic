@@ -768,16 +768,17 @@ body { overflow: hidden; }
 
 ## 一、安卓 APP（先看这个）
 
-**`dist/music-edge-2.3.apk`** —— 直接装到手机上即可，**装完不需要联网到本项目的服务器**。
+**`dist/music-edge-2.4.apk`** —— 直接装到手机上即可，**装完不需要联网到本项目的服务器**。
 
-- 包名 `com.zyplnn.musicedge`，versionCode 113 / versionName 2.3，最低 Android 5.0（API 21），目标 API 34
+- 包名 `com.zyplnn.musicedge`，versionCode 114 / versionName 2.4，最低 Android 5.0（API 21），目标 API 34
 - 桌面名称 **music-edge**
 - 已用 v1 + v2 + v3 三种方案签名，校验通过（`apksigner verify -v`）
-- 大小 895,962 字节，sha256 `34c365bd3a825545b2cbbcfa63be84a9fd6a13e69ceddebb616bbcac861121c7`
-- 通用客户端 `dist/lx-music-client-2.0.apk`（包名 `com.zyplnn.lxclient`，versionCode 110 / 2.0）
-  945,852 字节，sha256 `a688b5139f6a07179d3f44054dd8cd4f28ab420abf66da4234091edf3fd117e7`；
+- 大小 895,962 字节，sha256 `b2c038e01d91d1f31ddd1138ee8d33d54713788210cd6fe454d9afaa7dc40d35`
+- 通用客户端 `dist/lx-music-client-2.1.apk`（包名 `com.zyplnn.lxclient`，versionCode 111 / 2.1）
+  949,948 字节，sha256 `9b77c8bf9f011a88be86184b3f47f7f76896a6ce356089f596237f36ced35a62`；
   两个包的签名证书与在线资源**逐文件 sha256 均已核对一致**（26 个文件、0 处不一致；
-  客户端包多出的 `js/client-layer.js` 与 `client-build.txt` 是构建期生成物，不在 `public/` 内）
+  客户端包多出的 `js/client-layer.js` 与 `client-build.txt` 是构建期生成物，不在 `public/` 内）。
+  客户端包内 `client-build.txt` = `b26a86b37a52`，即构建时的 HEAD
 - 签名证书 SHA-256 `dff16588…4eda52`，与历次（1.3 起）**完全一致** —— 可以原地覆盖升级，数据不丢
 - 签名密钥 `android/keystore/yunmusic.keystore`（口令 `android`），升级包必须沿用它
   （密钥文件名与别名沿用早期的 `yunmusic`，那只是签名身份、与 App 名无关，改它会找不到签名入口）
