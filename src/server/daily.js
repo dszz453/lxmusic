@@ -208,6 +208,29 @@ async function rememberSourcesSig(db, sig) {
   try { await setSetting(db, DAILY_SOURCES_SETTING, sig) } catch { /* 下次再记 */ }
 }
 
+/**
+ * 当天那份推荐是不是「用另一份音源生成的」。
+ *
+ * 为什么需要它：`daily_recommend` 是按日期一行缓存的，而 `/api/home` 与 `/daily`
+ * 一看到当天有记录就**直接返回**（首页要秒开，这是对的）—— 于是「改了默认搜索源」
+ * 这件事在**当天**永远不生效，用户只能等第二天早上 6 点的 cron 重算，
+ * 表现依旧是「设置不起作用」（老板 2026-10-09 报的就是这个）。
+ *
+ * 所以这两处读接口顺手问一句「这份是不是旧音源生成的」；是的话由调用方
+ * **在后台重算**（`env.waitUntil`）—— 仍然先把旧的交出去，绝不让用户等 30~90 秒。
+ *
+ * 返回 false 的两种情况：没有记录；或**读不到**签名（替身 / 没有 settings 表），
+ * 那种情况按老行为办，别拿一个猜出来的结论去触发重算。
+ * 注意空串（老库从没记过签名）**算变了** —— 那正是升级后该立刻生效的第一次。
+ */
+export async function dailySourcesStale(env, db, record) {
+  if (!record || !record.songs || !record.songs.length) return false
+  const prev = await lastSourcesSig(db)
+  if (prev === null) return false
+  const now = (await searchSources(env, dbmod)).join(',')
+  return prev !== now
+}
+
 /** 读某天的推荐。没有返回 null。 */
 export async function getDaily(db, date = todayBJ()) {
   try {

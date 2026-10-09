@@ -1,7 +1,8 @@
 // 每日推荐单元测试：不真出网 —— AI 与搜索都通过参数注入 fake。
 // 覆盖：北京时间跨日、prompt 组装、信号表缺席容错、生成编排（AI 成功 / AI 失败兜底 /
 // 解析不足兜底）、当天已有记录不重生成、手动刷新 force 覆盖、落库后 getDaily 读回。
-import { todayBJ, buildPrompt, collectSignals, generateDaily, getDaily, resolveAiSongs } from '../src/server/daily.js'
+import { todayBJ, buildPrompt, collectSignals, generateDaily, getDaily, resolveAiSongs, dailySourcesStale } from '../src/server/daily.js'
+import { readFileSync } from 'node:fs'
 
 let pass = 0, fail = 0
 const results = []
@@ -227,6 +228,50 @@ const searchEmpty = async () => ({ list: [] })
   })
   ok('音源设置变了 → 当天那份立刻重算', called6 === 1 && rec8.title === '换源之后')
   ok('重算时用的是新设置（酷我）', seen[seen.length - 1] === 'kw', seen.join(' / '))
+
+  /* 4h. 「当天那份是不是旧音源生成的」判据
+   *
+   * 为什么单独要它：`/api/home` 与 `/daily` 一看到当天有记录就**直接返回**（首页要秒开），
+   * 于是即使 generateDaily 改好了，改了设置之后**当天**仍然看不到效果 ——
+   * 用户要等到第二天 06:00 的 cron，表现还是「设置不起作用」。
+   * 所以这两个读接口要顺手问一句这里，是旧的就后台重算。
+   */
+  const recX = { date: '2026-10-09', songs: [{ name: 'x' }] }
+  ok('没有记录 → 谈不上「旧」（不该触发重算）',
+    (await dailySourcesStale(env6, db6, null)) === false
+    && (await dailySourcesStale(env6, db6, { date: 'x', songs: [] })) === false)
+
+  // 当前设置是 kw（上面 4g 最后改的），而签名记的是上一次生成用的 kw → 不算旧
+  const sigNow = db6._settings.get('daily.sources')
+  ok('签名记下了（否则下面两条是空断言）', typeof sigNow === 'string' && sigNow.length > 0, String(sigNow))
+  ok('签名 = 当前设置 → 不算旧', (await dailySourcesStale(env6, db6, recX)) === false, String(sigNow))
+
+  // 老库：从没记过签名（键不存在）→ 算旧。这正是「升级后第一次就该立刻生效」的那次
+  db6._settings.delete('daily.sources')
+  ok('老库没记过签名 → 算旧（升级后第一次访问就该重算，而不是等到明天）',
+    (await dailySourcesStale(env6, db6, recX)) === true)
+
+  // 设置又改了 → 算旧
+  db6._settings.set('daily.sources', 'kg,wy,kw')
+  ok('设置换了但当天那份还是旧源生成的 → 算旧', (await dailySourcesStale(env6, db6, recX)) === true)
+
+  // 读不到 settings 表（替身 / 老库）→ 退化成老行为，别拿猜出来的结论去重算
+  ok('读不到签名表 → 返回 false（退化成老行为，不拿猜的结论重算）',
+    (await dailySourcesStale(env6, { prepare() { throw new Error('no table') } }, recX)) === false)
+
+  /* 4i. api.js 必须真的把这两处接上去（helper 写好了没人调 = 白写） */
+  const apiSrc = readFileSync(new URL('../src/server/api.js', import.meta.url), 'utf8')
+  ok('/api/home 的「当天已有记录」分支会做旧源检查',
+    /if \(daily && daily\.songs\.length\)[\s\S]{0,500}?regenDailyIfStale\(/.test(apiSrc))
+  ok('/api/daily 也做同一件事（否则从「每日推荐」页进来还是看不到效果）',
+    /path === '\/daily' && method === 'GET'[\s\S]{0,300}?regenDailyIfStale\(/.test(apiSrc))
+  ok('重算走 waitUntil 后台做（绝不为了换源把首页卡 30~90 秒）',
+    /env\.waitUntil\(generateDaily\([\s\S]{0,200}?force: true/.test(apiSrc) === false
+    && /env\.waitUntil\(generateDaily\(env, env\.DB, \{ userId, toWeb \}\)/.test(apiSrc))
+  ok('有节流（连点首页不该把同一份算好几遍）',
+    /dailyRegenAt = now[\s\S]{0,80}?60000/.test(apiSrc) || /now - dailyRegenAt < 60000/.test(apiSrc))
+  ok('没有 waitUntil 的环境不重算（同步等 30~90s 会卡死页面）',
+    /if \(!env\.waitUntil\) return true/.test(apiSrc))
 }
 
 /* ---------- 5. resolveAiSongs ---------- */

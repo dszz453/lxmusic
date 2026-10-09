@@ -37,6 +37,16 @@ W() { cygpath -w "$1"; }                          # MSYS 路径 → Windows 路�
 LIST_WIN() { find "$@" | while read -r f; do cygpath -w "$f"; done; }
 
 APP_NAME="music-edge"
+# 2.0：让「改了默认搜索源」**当天**就生效 —— 补上 1.9 漏掉的那条读取路径。
+#  1.9 把 daily.js 里写死的 ['kg','wy','kw'] 换成读 src/server/sources.js 的唯一口径，
+#  但那只修了**生成**那一步。`/api/home` 与 `/daily` 一看到当天已有记录就**直接返回**
+#  （首页要秒开，这是对的）→ 用户改完设置，当天依旧看旧内容，只能等第二天 06:00 的 cron，
+#  表现还是「设置不起作用」。实测线上就是如此：search.sources = wy,kg,kw,tx,mg,xm（网易云
+#  排第一），而 daily_recommend 里 10-08 / 10-09 两天 13 首**全是 kg**。
+#  现在：这两处读接口顺手问一句 dailySourcesStale(env, db, record) —— 签名对不上就在
+#  **后台**（env.waitUntil）按新设置重算，本次响应照旧把旧的给出去，绝不为了换源卡首页；
+#  60 秒节流，免得连点首页把同一份算好几遍；没有 waitUntil 的环境（替身）不重算，
+#  交给 cron 或「换一批」。`?debug=1` 的 daily 段新增 stale 字段可供排查。
 # 1.9：一次报障四件事，其中三件都是**「同一个东西有两份口径 / 两份实现」**。
 #  ① 客户端里出现**两个搜索框**，上面那个点了没反应。网页端靠
 #     `#app.is-subpage .topbar{display:none}` 收起全局顶栏，但客户端顶栏是 Java 画的
