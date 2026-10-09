@@ -633,7 +633,13 @@ export function songForWeb(song) {
 let dailyRegenAt = 0
 let dailyRegenTask = null
 
-/** 换源预算：首页要快，给 9 秒；「今日推荐」页是用户专门进来看的，可以宽到 14 秒 */
+/**
+ * 换源预算。
+ *
+ * `HOME_REQUERY_BUDGET_MS` 现在是**后台任务**的预算（首页走 `sync: false`，见 /home 里的
+ * ⚠ 说明），所以它不再影响首屏 —— 给 9 秒只是「一轮最多花这么久」的上限。
+ * `DAILY_REQUERY_BUDGET_MS` 仍走同步等：「今日推荐」页是用户主动进来等结果的，14 秒合理。
+ */
 const HOME_REQUERY_BUDGET_MS = 9000
 const DAILY_REQUERY_BUDGET_MS = 14000
 
@@ -643,15 +649,23 @@ function regenDailyIfStale(env, record, toWeb, { sync = true, budgetMs } = {}) {
       if (!stale) return false
 
       if (!sync) {
-        // 替身 / 本地环境可能没有 waitUntil：那就不动它，交给 cron 或「换一批」
-        if (!env.waitUntil) return true
+        /**
+         * 后台重算：**没有 `waitUntil` 的宿主也必须真跑**。
+         *
+         * 这里原来写着 `if (!env.waitUntil) return true` —— 在 CF 上没问题（它一定有），
+         * 但 Docker / 本机 node **没有** `env.waitUntil`，那一句在自建实例上等于
+         * 「永远不重算」，签名也就永远记不上。而 `waitUntil` 的存在意义只是
+         * 「保住响应返回后还要跑的任务不被回收」；Node 进程不会因为回了响应就把
+         * 在途的 promise 掐掉，所以**把 promise 丢出去它就会跑完**，不需要 waitUntil。
+         */
         const t0 = Date.now()
         if (t0 - dailyRegenAt < 60000) return true
         dailyRegenAt = t0
-        try {
-          env.waitUntil(requeryDailySources(env, record, { toWeb, budgetMs })
-            .catch(() => { /* 后台失败静默，下次访问再试 */ }))
-        } catch { /* waitUntil 自己抛了也不能影响本次响应 */ }
+        const task = requeryDailySources(env, record, { toWeb, budgetMs })
+          .catch(() => { /* 后台失败静默，下次访问再试 */ })
+        if (env.waitUntil) {
+          try { env.waitUntil(task) } catch { /* waitUntil 自己抛了也不能影响本次响应 */ }
+        }
         return true
       }
 
@@ -780,14 +794,26 @@ export async function handleApi(request, env, url) {
 
       if (daily && daily.songs.length) {
         // 当天已有 AI 推荐：直接用，首页秒开。
-        // 顺手核对「这份是用当前设置的音源生成的吗」——不是就**当场换源**
+        // 顺手核对「这份是用当前设置的音源生成的吗」——不是就**换源**
         // （只换源、不重跑 AI，理由见 daily.js 的 requeryDailySources）。
+        //
+        // ⚠ `sync: false` —— 首页**绝不同步等**换源。2026-10-09 报障：「docker 每次
+        // 重新打开，登录需要 10s，这个时候我的歌单加载不出来」、之后又报「打开 APP
+        // 后 app 一直在重新登录后台」。根因就是这里原来写的 `sync: true` +
+        // 9 秒预算串在响应里，弱网自建实例上跑不完 → 签名记不上 → **每次访问都等满
+        // 9 秒**，而同一时刻的 `/api/me`、`/api/playlists` 全被压在这 9 秒后面。
+        //
+        // 换源是**优化**（让当天推荐尽快用上你新设的音源），不是首页能不能用的前提；
+        // 为它押上首屏 9 秒是本末倒置。改到后台之后：本次响应照旧给当前内容，
+        // 后台换完写库，下次访问自然就是新的（daily.js 的签名修复保证它只换一次）。
+        // 用户主动点进「今日推荐」页时仍走同步等（`/daily` 的 14s 预算）——
+        // 那一页是专门进来看推荐的，等得起。
         const [charts, dstale] = await Promise.all([
           cachedToplists(),
-          regenDailyIfStale(env, daily, songForWeb, { sync: true, budgetMs: HOME_REQUERY_BUDGET_MS }),
+          regenDailyIfStale(env, daily, songForWeb, { sync: false, budgetMs: HOME_REQUERY_BUDGET_MS }),
         ])
         if (dstale) {
-          // 换过源就重读一次：本次响应直接给新的，用户不必刷新第二遍
+          // 后台可能刚好在这一瞬写完了（上一发任务的尾巴）：重读一次，读到新的就用新的
           const fresh = await getDaily(env.DB).catch(() => null)
           if (fresh && fresh.songs && fresh.songs.length) daily = fresh
         }

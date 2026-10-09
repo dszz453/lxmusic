@@ -1,6 +1,6 @@
 # music-edge · 安卓 APP（自包含） + Cloudflare Workers 源码包
 
-> **当前版本：V2.2**
+> **当前版本：V2.3**
 >
 > 同一份 `src/` 同时服务三个宿主，靠**运行时宿主能力判定**分支，不做编译期分叉：
 > Cloudflare Workers（线上）、安卓壳（APK 内自带）、Docker（你自己的服务器）。
@@ -162,9 +162,9 @@ GH_TOKEN=ghp_xxx node tools/publish-github.mjs --dry    # 只看清单
 |---|---|---|
 | 后端 | 永远在设备内 | 跟着「服务器档案」走：**CF / Docker / 自建 / 内置**四选一 |
 | 名字 | 固定 `music-edge` | 由所连服务端自报（`music-edge` 或 `LX-MUSIC`） |
-| 版本 | 与服务端同号 V2.2 | **客户端独立版本线 V1.9**（服务端是 V2.2） |
+| 版本 | 与服务端同号 V2.3 | **客户端独立版本线 V2.0**（服务端是 V2.3） |
 | 包名 | `com.zyplnn.musicedge` | `com.zyplnn.lxclient`（可同时安装） |
-| 产物 | `dist/music-edge-2.2.apk` | `dist/lx-music-client-1.9.apk` |
+| 产物 | `dist/music-edge-2.3.apk` | `dist/lx-music-client-2.0.apk` |
 
 首启会问你连哪条线，之后随时可以从**顶栏的连接状态条**或设置里换。
 连上后品牌与版本按服务端自报显示 —— 连 CF 显示 `music-edge`，连 Docker 显示 `LX-MUSIC`。
@@ -785,6 +785,46 @@ body { overflow: hidden; }
 > 版本号在**两处**都要改，别只改一处：`android/AndroidManifest.xml` 的
 > `versionCode/versionName`，和 `android/build-apk.sh` 里的 `VERSION_CODE/VERSION_NAME`
 > （aapt2 用的是命令行上那两个，不看清单文件里的）。
+
+### 2.3 改了什么（本轮）：一个自己埋的「无限重算」
+
+老板**第三次**报同一件事，但口径变了：「docker 版本我的歌单加载慢问题还存在，这个问题是
+由于打开 APP 后，app 一直在重新登录后台」，并补了两条定位信息 —— **「CF 不存在这个问题」
+「docker 用谷歌浏览器 PWA 打开也不存在」**。
+
+这三条事实把范围锁死到很窄：**同一台服务器、同一个地址，Chrome 好而 APP 坏 ⇒ 不是服务端**
+（实测 `/api/me` 4ms、`/api/playlists` 4ms）；前端是四宿主同一份 ⇒ 差异只可能在
+**「那 9 秒挡住了谁」**。顺带也否掉了一个更早的假设（Docker 无 gzip → 首屏传 2.4 MB）——
+那是浏览器独有的开销，而浏览器反而是好的。
+
+根因是 **2.1 自己埋下的一个无限循环**，两层叠在一起：
+
+1. **签名只在「全部换完」时才记。** `src/server/daily.js` 的 `requeryDailySources` 里写的是
+   `if (completed) rememberSourcesSig(...)`，而 `completed` 要求 24 首**全部**在预算内跑完。
+   首页给的预算是 9 秒（`HOME_REQUERY_BUDGET_MS`），弱网自建实例上跑不完
+   → 签名永远记不上 → 下次访问又判 stale → **又同步等 9 秒** → 无限循环。
+   CF 上不出现，是因为线上那份早就换成功过一次、签名记上了 —— 所以这个 bug
+   **只在慢实例上现形**，报障口径也就一直是「CF 没问题」。
+   判据改成「**这一轮真的跑过**」（`ran`）：签名回答的是「这份 daily 是按哪套音源生成的」，
+   不是「换源全部成功了」。
+2. **那 9 秒是串在 `/api/home` 响应里的**（`sync: true`）。首页是首屏路径，为「让当天推荐
+   尽快用上新音源」这个优化押上 9 秒是本末倒置；而同一刻的 `/api/me` 与 `/api/playlists`
+   全被压在它后面 → 界面停在「未登录」，老板描述成「app 一直在重新登录后台」。
+   改成后台（`sync: false`，换完写库、下次访问自然就是新的）；
+   「今日推荐」页是用户主动进来看推荐的，仍同步等 14 秒。
+3. **没有 `waitUntil` 的宿主也必须真跑后台重算。** 前端那条 `!sync` 分支原来写着
+   `if (!env.waitUntil) return true` —— CF 一定有 `waitUntil`，但 Docker / 本机 node
+   **没有**，那句在自建实例上等于「永远不重算」。`waitUntil` 的唯一作用是「保住响应返回后
+   还要跑的任务不被回收」；Node 不会因为回了响应就掐掉在途的 promise，所以把 task 丢出去
+   它就会跑完。
+4. **前端「我的」页的 `pending` 判据漏了「还没问」这一相。** `boot()` 的「首帧不等网络」
+   抢跑会先 `route()` 画一版，那一刻 `App.user` 是 null 而 `App.offline` 还是默认的 `false`
+   → 印的是**「未登录」**而不是「正在确认登录状态…」。判据改成「**有令牌 + 身份未确认**」。
+   （这一条正好解释了为什么服务端一慢，那句错话就停留好几秒。）
+
+护栏：`test/daily.test.mjs` 48 → **52**、`test/home-cache.test.mjs` 80 → **81**。
+另外给 `home-cache.test.mjs` 加了「去注释副本」工具 —— 「不包含」型断言必须先去注释，
+否则注释里引用的旧写法会让它永远红（项目里已踩过这个坑）。
 
 ### 2.2 改了什么（本轮）：登录机制
 

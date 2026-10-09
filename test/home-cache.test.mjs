@@ -46,6 +46,14 @@ function ok(name, cond, detail) {
 }
 
 const APPJS = read('public/js/app.js')
+/**
+ * 去注释副本 —— 所有「**不包含**」型断言必须用它。
+ *
+ * 注释里必然写着那条规则的**反面写法**（下面那段说明就一字不差地引用了旧的
+ * `App.offline && !!API.getToken()`），拿整文件做「不包含」断言会永远红。
+ * 这是这个项目已经踩过的坑，见 daily.test.mjs 的 deComment。
+ */
+const APPJS_NC = APPJS.replace(/\/\*[\s\S]*?\*\//g, '').replace(/^\s*\/\/.*$/gm, '')
 const SRV = read('src/server/api.js')
 const SHELL = read('client/rn/src/50-shell.js')
 const BRANDJS = read('client/rn/src/20-brand.js')
@@ -369,8 +377,21 @@ console.log('\n== 4c. 首帧不等网络：身份还没确认时也读得到自�
    * 长得一样就等于把用户逼去「退出再登一次」。顺带给一个手动重新确认的入口。
    */
   ok('「我的」页把「没问到」和「未登录」分开显示',
-    /const pending = !u\.username && App\.offline && !!API\.getToken\(\)/.test(APPJS)
+    /const pending = !u\.username && !!API\.getToken\(\) && !App\.userTrusted/.test(APPJS)
     && /pending \? '正在确认登录状态…' : '未登录'/.test(APPJS))
+  /**
+   * ⚠ 判据必须是「**有令牌 + 身份未确认**」，不能是 `App.offline`。
+   *
+   * 上一版写的是 `App.offline && !!API.getToken()`，**漏掉了「还没问」这一相**：
+   * `boot()` 的「首帧不等网络」抢跑会先 `route()` 画一版，那一刻 `App.user` 还是 null
+   * 而 `App.offline` 还是默认的 false —— 于是身份回来之前印的是「未登录」，
+   * 而不是「正在确认登录状态…」。服务端一慢（Docker 上 `/api/home` 曾同步等 9 秒、
+   * 把 `/api/me` 压在后面），这句错话会停留好几秒 ——
+   * 报障原话「打开 APP 后，app 一直在重新登录后台」就是这么来的。
+   */
+  ok('⚠ pending 判据含「抢跑阶段」（那时 App.offline 还是 false，会误印「未登录」）',
+    /const pending = !u\.username && !!API\.getToken\(\) && !App\.userTrusted/.test(APPJS_NC)
+    && /App\.offline && !!API\.getToken\(\)/.test(APPJS_NC) === false)
   ok('只是没问到时不写死「普通账号」（那是「确实没登录」才该有的样子）',
     /u\.username\s*\n?\s*\?\s*\(u\.isAdmin \? '管理员账号' : '普通账号'\)/.test(APPJS))
   ok('给一个手动「重新确认」（四次自动补确认都没够着时的自救，不用退出重登）',

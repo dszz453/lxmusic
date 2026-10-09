@@ -37,6 +37,39 @@ W() { cygpath -w "$1"; }                          # MSYS 路径 → Windows 路�
 LIST_WIN() { find "$@" | while read -r f; do cygpath -w "$f"; done; }
 
 APP_NAME="music-edge"
+# 2.3：修「Docker 版每次打开都要等 10 秒 / 点『我的』显示未登录、过几秒自己好」——
+#  这次是**2.1 自己埋下的**一个无限循环，报障人第三次报同一件事才挖出来。
+#
+#  ① 签名只在「全部换完」时才记。src/server/daily.js 的 requeryDailySources 里写的是
+#     `if (completed) rememberSourcesSig(...)`，而 completed 要求 24 首**全部**在预算内
+#     跑完。首页给的预算是 9 秒（HOME_REQUERY_BUDGET_MS），弱网自建实例上跑不完
+#     → 签名永远记不上 → 下次访问又判 stale → **又同步等 9 秒** → 无限循环。
+#     CF 上不出现，是因为线上那份早就换成功过一次、签名记上了 —— 所以这个 bug
+#     只在慢实例（自建 Docker）上现形，报障口径也一直是「CF 没问题」。
+#     判据改成「这一轮真的跑过」（ran）：签名回答的是「这份 daily 是按哪套音源生成的」，
+#     不是「换源全部成功了」。
+#  ② 那 9 秒是**串在 /api/home 响应里**的（`sync: true`）。首页是首屏路径，为
+#     「让当天推荐尽快用上新音源」这个优化押上 9 秒是本末倒置；而同一刻的 /api/me
+#     与 /api/playlists 全被压在它后面 → 界面停在「未登录」，
+#     老板描述成「打开 APP 后，app 一直在重新登录后台」。改成后台（sync: false）；
+#     「今日推荐」页是用户主动进来看推荐的，仍同步等 14 秒。
+#  ③ 顺带修一个漏相：前端 api.js 的 `!sync` 分支原来写着
+#     `if (!env.waitUntil) return true` —— CF 一定有 waitUntil，但 Docker / 本机 node
+#     **没有**，那句在自建实例上等于「永远不重算」。Node 不会因为回了响应就把在途的
+#     promise 掐掉，所以把 task 丢出去它就会跑完，不需要 waitUntil。
+#  ④ 前端「我的」页的 pending 判据漏了「还没问」这一相：boot() 的「首帧不等网络」
+#     抢跑会先 route() 画一版，那一刻 App.user 是 null 而 App.offline 还是默认 false
+#     → 印的是「未登录」而不是「正在确认登录状态…」。判据改成「有令牌 + 身份未确认」。
+#
+#  证据链（三条事实把范围锁死到「那 9 秒挡住了谁」）：
+#    APP+Docker ❌  /  APP+CF ✅  /  Chrome PWA+Docker ✅
+#    同一台服务器、同一个地址，Chrome 好而 APP 坏 ⇒ 不是服务端；
+#    前端四宿主同一份 ⇒ 差异只在连接方式：Chrome 多连接并行、不受单条慢请求拖累，
+#    APP 过原生桥，/api/me 排在慢的 /api/home 后面。
+#
+#  护栏：test/daily.test.mjs 48 → 52（ran 判据 / 首页必须 sync:false / 无 waitUntil 也要真跑）、
+#        test/home-cache.test.mjs 80 → 81（pending 判据含抢跑相）。
+#
 # 2.2：优化登录机制 —— 修「Docker 版客户端重新登录之后，我的歌单空白转半天、
 #  点『我的』还显示未登录、大概 10 秒才登录」。服务端接口实测毫秒级
 #  （/playlists 3.9ms、/me 19.6ms），所以三处都在前端/客户端这条链上：

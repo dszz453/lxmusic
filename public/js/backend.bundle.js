@@ -1,5 +1,5 @@
 /* 由 tools/build-app.mjs 自动生成，请勿手动修改。
- * 源摘要: 291cb709bb12ce90
+ * 源摘要: f9a89ac9f7424710
  * 模块数: 25
  *
  * 这是给安卓壳用的后端展平版：把 src/ 的 ESM 后端打成单个 IIFE，
@@ -652,7 +652,13 @@ function songForWeb(song) {
 let dailyRegenAt = 0
 let dailyRegenTask = null
 
-/** 换源预算：首页要快，给 9 秒；「今日推荐」页是用户专门进来看的，可以宽到 14 秒 */
+/**
+ * 换源预算。
+ *
+ * `HOME_REQUERY_BUDGET_MS` 现在是**后台任务**的预算（首页走 `sync: false`，见 /home 里的
+ * ⚠ 说明），所以它不再影响首屏 —— 给 9 秒只是「一轮最多花这么久」的上限。
+ * `DAILY_REQUERY_BUDGET_MS` 仍走同步等：「今日推荐」页是用户主动进来等结果的，14 秒合理。
+ */
 const HOME_REQUERY_BUDGET_MS = 9000
 const DAILY_REQUERY_BUDGET_MS = 14000
 
@@ -662,15 +668,23 @@ function regenDailyIfStale(env, record, toWeb, { sync = true, budgetMs } = {}) {
       if (!stale) return false
 
       if (!sync) {
-        // 替身 / 本地环境可能没有 waitUntil：那就不动它，交给 cron 或「换一批」
-        if (!env.waitUntil) return true
+        /**
+         * 后台重算：**没有 `waitUntil` 的宿主也必须真跑**。
+         *
+         * 这里原来写着 `if (!env.waitUntil) return true` —— 在 CF 上没问题（它一定有），
+         * 但 Docker / 本机 node **没有** `env.waitUntil`，那一句在自建实例上等于
+         * 「永远不重算」，签名也就永远记不上。而 `waitUntil` 的存在意义只是
+         * 「保住响应返回后还要跑的任务不被回收」；Node 进程不会因为回了响应就把
+         * 在途的 promise 掐掉，所以**把 promise 丢出去它就会跑完**，不需要 waitUntil。
+         */
         const t0 = Date.now()
         if (t0 - dailyRegenAt < 60000) return true
         dailyRegenAt = t0
-        try {
-          env.waitUntil(requeryDailySources(env, record, { toWeb, budgetMs })
-            .catch(() => { /* 后台失败静默，下次访问再试 */ }))
-        } catch { /* waitUntil 自己抛了也不能影响本次响应 */ }
+        const task = requeryDailySources(env, record, { toWeb, budgetMs })
+          .catch(() => { /* 后台失败静默，下次访问再试 */ })
+        if (env.waitUntil) {
+          try { env.waitUntil(task) } catch { /* waitUntil 自己抛了也不能影响本次响应 */ }
+        }
         return true
       }
 
@@ -799,14 +813,26 @@ async function handleApi(request, env, url) {
 
       if (daily && daily.songs.length) {
         // 当天已有 AI 推荐：直接用，首页秒开。
-        // 顺手核对「这份是用当前设置的音源生成的吗」——不是就**当场换源**
+        // 顺手核对「这份是用当前设置的音源生成的吗」——不是就**换源**
         // （只换源、不重跑 AI，理由见 daily.js 的 requeryDailySources）。
+        //
+        // ⚠ `sync: false` —— 首页**绝不同步等**换源。2026-10-09 报障：「docker 每次
+        // 重新打开，登录需要 10s，这个时候我的歌单加载不出来」、之后又报「打开 APP
+        // 后 app 一直在重新登录后台」。根因就是这里原来写的 `sync: true` +
+        // 9 秒预算串在响应里，弱网自建实例上跑不完 → 签名记不上 → **每次访问都等满
+        // 9 秒**，而同一时刻的 `/api/me`、`/api/playlists` 全被压在这 9 秒后面。
+        //
+        // 换源是**优化**（让当天推荐尽快用上你新设的音源），不是首页能不能用的前提；
+        // 为它押上首屏 9 秒是本末倒置。改到后台之后：本次响应照旧给当前内容，
+        // 后台换完写库，下次访问自然就是新的（daily.js 的签名修复保证它只换一次）。
+        // 用户主动点进「今日推荐」页时仍走同步等（`/daily` 的 14s 预算）——
+        // 那一页是专门进来看推荐的，等得起。
         const [charts, dstale] = await Promise.all([
           cachedToplists(),
-          regenDailyIfStale(env, daily, songForWeb, { sync: true, budgetMs: HOME_REQUERY_BUDGET_MS }),
+          regenDailyIfStale(env, daily, songForWeb, { sync: false, budgetMs: HOME_REQUERY_BUDGET_MS }),
         ])
         if (dstale) {
-          // 换过源就重读一次：本次响应直接给新的，用户不必刷新第二遍
+          // 后台可能刚好在这一瞬写完了（上一发任务的尾巴）：重读一次，读到新的就用新的
           const fresh = await getDaily(env.DB).catch(() => null)
           if (fresh && fresh.songs && fresh.songs.length) daily = fresh
         }
@@ -8069,10 +8095,10 @@ const REQUERY_BUDGET_MS = 12000
  * ══════════════ 预算与部分成功 ══════════════
  * `budgetMs` 用尽就停止发起新的搜索，**已经换好的照常写回**：宁可只换一部分，
  * 也不要整份丢弃 —— 用户至少能立刻看到一部分新源的结果。
- * 只有**全部处理完**（`completed`）才记签名；没跑完就不记，等下次访问继续换，
- * 逐步收敛（已换过的歌再搜一次仍命中同一个源，不会来回抖）。
+ * 记签名的判据是「**这一轮真的跑过**」（`ran`），不是「全部换完」——
+ * 理由见下面那段 ⚠ 注释，那是这个函数第二次踩同一个坑。
  *
- * 返回 `{ replaced, total, completed, saved }`，方便调试与断言。
+ * 返回 `{ replaced, total, completed, ran, saved }`，方便调试与断言。
  */
 async function requeryDailySources(env, record, { toWeb = null, budgetMs = REQUERY_BUDGET_MS, searchFn = searchOnline } = {}) {
   const songs = (record && record.songs) || []
@@ -8112,6 +8138,27 @@ async function requeryDailySources(env, record, { toWeb = null, budgetMs = REQUE
   await Promise.all(Array.from({ length: Math.min(REQUERY_CONCURRENCY, songs.length) }, worker))
 
   const completed = cursor >= songs.length
+  /**
+   * ══════════════ ⚠ 「记签名」的判据不能是 completed（2026-10-09 第二次踩） ══════════════
+   *
+   * 签名（`daily.sources`）回答的问题是「**这份 daily 是按哪套音源生成的**」，
+   * 不是「换源有没有全部成功」。原来写成 `if (completed)`，于是：
+   *
+   *   首页给换源的预算是 9 秒（api.js 的 HOME_REQUERY_BUDGET_MS），而自建 Docker 上
+   *   24 首跨源搜一遍常常跑不完 9 秒 → `completed === false` → **签名不记**
+   *   → 下一次访问 `dailySourcesStale` 又是 true → 又同步等 9 秒 → 又跑不完 …… **无限循环**。
+   *
+   * 报障原话正是这个形状：「docker 每次重新打开，登录需要 10s，这个时候我的歌单
+   * 加载不出来」「打开 APP 后，app 一直在重新登录后台」—— 那 9 秒是**串在
+   * `/api/home` 响应里的**，把 `/api/me` 与 `/api/playlists` 一起压在后面，
+   * 界面就停在「未登录」。CF 上不出现，是因为线上那份早就换成功过一次、签名记上了，
+   * 此后 `stale` 恒为 false —— 所以这个 bug **只在慢实例上现形**。
+   *
+   * 正确判据是「**这一轮真的按当前设置跑过**」：只要有歌被处理过（`cursor > 0`），
+   * 这份 daily 的源就已经是当前设置了。没跑到的几首还留在老源上，那属于「还有尾巴」，
+   * 交给后台慢慢收敛即可，不该让整份被反复判定成 stale。
+   */
+  const ran = cursor > 0
   if (replaced > 0) {
     try {
       // generatedAt 一并更新：它是「这份内容的时间」，换源后内容确实变了，
@@ -8119,10 +8166,10 @@ async function requeryDailySources(env, record, { toWeb = null, budgetMs = REQUE
       await saveDaily(env.DB, { ...record, songs: out, generatedAt: Date.now() })
     } catch { /* 写失败只是这次白换，不影响返回 */ }
   }
-  if (completed) {
+  if (ran) {
     try { await rememberSourcesSig(env.DB, sig) } catch { /* 记不上就下次多重算一次 */ }
   }
-  return { replaced, total: songs.length, completed, saved: replaced > 0 }
+  return { replaced, total: songs.length, completed, ran, saved: replaced > 0 }
 }
 
 /** 读某天的推荐。没有返回 null。 */
@@ -8202,7 +8249,7 @@ __modules["src/version.js"] = function (__exports, __require) {
  * 所以统一读这里，谁也别再各写各的。
  *
  * ── 两条版本线，别混 ──────────────────────────────────────────
- *   APP_VERSION      产品版本，人看的。改功能才动它。当前 V2.1
+ *   APP_VERSION      产品版本，人看的。改功能才动它。当前 V2.3
  *   APP_VERSION_CODE 整数构建号，Android 靠它判断「能不能覆盖安装」。
  *                    每次要发新版就 +1，**不能倒退、不能重复**，
  *                    否则手机上会报「应用未安装」（签名相同也装不上）。
@@ -8228,10 +8275,10 @@ __modules["src/version.js"] = function (__exports, __require) {
  */
 
 /** 产品版本（对外展示用）。每发一版升 0.1。 */
-const APP_VERSION = 'V2.2'
+const APP_VERSION = 'V2.3'
 
 /** Android versionCode：整数、单调递增、跨次发布不可重复。每发一版 +1。 */
-const APP_VERSION_CODE = 112
+const APP_VERSION_CODE = 113
 
 /** 人类可读的完整标识，日志/关于页用。 */
 const APP_ID = 'lxmusic'

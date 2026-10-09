@@ -1891,11 +1891,19 @@
      * 2026-10-09 老板报「重新登录之后点『我的』发现未登录」。那一刻的真实状态是
      * 「令牌还在、只是没问到」，与「你真的没登录」在界面上却长得一模一样，
      * 用户唯一能做的就是退出再登一次。现在：
-     *   · 前者（有令牌 + offline）→ 说「正在确认登录状态…」，并给一个「重新确认」；
+     *   · 前者（有令牌 + 身份还没确认）→ 说「正在确认登录状态…」，并给一个「重新确认」；
      *   · 后者（无令牌）→ 才是「未登录」。
      * 补确认成功时 `confirmIdentityLater` 会自己重画这一页，这句话会自己变成用户名。
+     *
+     * ⚠ 判据曾经写成 `App.offline && !!API.getToken()`，**漏掉了「还没问」这一相**：
+     * `boot()` 的「首帧不等网络」抢跑会先 `route()` 画一版，那一刻 `App.user` 还是 null
+     * 而 `App.offline` 还是默认的 false —— 于是「我的」页在身份回来之前印的是
+     * **「未登录」**，而不是「正在确认登录状态…」。服务端一慢（Docker 上 /api/home
+     * 曾同步等 9 秒、把 /api/me 压在后面），这个错误文案就会停留好几秒，
+     * 报障原话正是「打开 APP 后，app 一直在重新登录后台」。
+     * 正确的判据是「**有令牌但身份未确认**」——「还没问」和「问了没问到」都算未确认。
      */
-    const pending = !u.username && App.offline && !!API.getToken()
+    const pending = !u.username && !!API.getToken() && !App.userTrusted
     const whoText = u.username || (pending ? '正在确认登录状态…' : '未登录')
     const subText = u.username
       ? (u.isAdmin ? '管理员账号' : '普通账号')

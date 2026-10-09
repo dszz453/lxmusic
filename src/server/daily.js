@@ -277,10 +277,10 @@ const REQUERY_BUDGET_MS = 12000
  * ══════════════ 预算与部分成功 ══════════════
  * `budgetMs` 用尽就停止发起新的搜索，**已经换好的照常写回**：宁可只换一部分，
  * 也不要整份丢弃 —— 用户至少能立刻看到一部分新源的结果。
- * 只有**全部处理完**（`completed`）才记签名；没跑完就不记，等下次访问继续换，
- * 逐步收敛（已换过的歌再搜一次仍命中同一个源，不会来回抖）。
+ * 记签名的判据是「**这一轮真的跑过**」（`ran`），不是「全部换完」——
+ * 理由见下面那段 ⚠ 注释，那是这个函数第二次踩同一个坑。
  *
- * 返回 `{ replaced, total, completed, saved }`，方便调试与断言。
+ * 返回 `{ replaced, total, completed, ran, saved }`，方便调试与断言。
  */
 export async function requeryDailySources(env, record, { toWeb = null, budgetMs = REQUERY_BUDGET_MS, searchFn = searchOnline } = {}) {
   const songs = (record && record.songs) || []
@@ -320,6 +320,27 @@ export async function requeryDailySources(env, record, { toWeb = null, budgetMs 
   await Promise.all(Array.from({ length: Math.min(REQUERY_CONCURRENCY, songs.length) }, worker))
 
   const completed = cursor >= songs.length
+  /**
+   * ══════════════ ⚠ 「记签名」的判据不能是 completed（2026-10-09 第二次踩） ══════════════
+   *
+   * 签名（`daily.sources`）回答的问题是「**这份 daily 是按哪套音源生成的**」，
+   * 不是「换源有没有全部成功」。原来写成 `if (completed)`，于是：
+   *
+   *   首页给换源的预算是 9 秒（api.js 的 HOME_REQUERY_BUDGET_MS），而自建 Docker 上
+   *   24 首跨源搜一遍常常跑不完 9 秒 → `completed === false` → **签名不记**
+   *   → 下一次访问 `dailySourcesStale` 又是 true → 又同步等 9 秒 → 又跑不完 …… **无限循环**。
+   *
+   * 报障原话正是这个形状：「docker 每次重新打开，登录需要 10s，这个时候我的歌单
+   * 加载不出来」「打开 APP 后，app 一直在重新登录后台」—— 那 9 秒是**串在
+   * `/api/home` 响应里的**，把 `/api/me` 与 `/api/playlists` 一起压在后面，
+   * 界面就停在「未登录」。CF 上不出现，是因为线上那份早就换成功过一次、签名记上了，
+   * 此后 `stale` 恒为 false —— 所以这个 bug **只在慢实例上现形**。
+   *
+   * 正确判据是「**这一轮真的按当前设置跑过**」：只要有歌被处理过（`cursor > 0`），
+   * 这份 daily 的源就已经是当前设置了。没跑到的几首还留在老源上，那属于「还有尾巴」，
+   * 交给后台慢慢收敛即可，不该让整份被反复判定成 stale。
+   */
+  const ran = cursor > 0
   if (replaced > 0) {
     try {
       // generatedAt 一并更新：它是「这份内容的时间」，换源后内容确实变了，
@@ -327,10 +348,10 @@ export async function requeryDailySources(env, record, { toWeb = null, budgetMs 
       await saveDaily(env.DB, { ...record, songs: out, generatedAt: Date.now() })
     } catch { /* 写失败只是这次白换，不影响返回 */ }
   }
-  if (completed) {
+  if (ran) {
     try { await rememberSourcesSig(env.DB, sig) } catch { /* 记不上就下次多重算一次 */ }
   }
-  return { replaced, total: songs.length, completed, saved: replaced > 0 }
+  return { replaced, total: songs.length, completed, ran, saved: replaced > 0 }
 }
 
 /** 读某天的推荐。没有返回 null。 */

@@ -298,9 +298,22 @@ const searchEmpty = async () => ({ list: [] })
   ok('换源走 requeryDailySources（只换源、不重跑 AI）',
     /function regenDailyIfStale\(env, record, toWeb/.test(apiSrc)
     && /requeryDailySources\(env, record/.test(apiSrc))
-  ok('默认同步等结果（不然用户改完设置第一眼还是旧源，得刷第二遍）',
-    /\{ sync = true, budgetMs \} = \{\}/.test(apiSrc)
-    && /regenDailyIfStale\(env, daily, songForWeb, \{ sync: true/.test(apiSrc))
+  ok('函数默认同步等（真实调用点由下面两条分别钉住）',
+    /\{ sync = true, budgetMs \} = \{\}/.test(apiSrc))
+  /**
+   * ⚠ 首页必须 `sync: false` —— 2026-10-09 第二次报障的根因。
+   *
+   * 原来首页写的是 `sync: true, budgetMs: 9000`，那 9 秒是**串在 /home 响应里**的。
+   * 弱网自建实例上跑不完 → 签名记不上（见 daily.js 的 `ran` 注释）→ 每次访问都等满
+   * 9 秒，而同一刻的 /api/me 与 /api/playlists 全被压在这 9 秒后面 ——
+   * 界面停在「未登录」，报障原话「docker 每次重新打开，登录需要 10s」。
+   * 所以这条断言钉的是「首页绝不再同步等」，别改回去。
+   */
+  ok('⚠ 首页换源走后台（绝不同步等 —— 9 秒串进 /home 会压住 /api/me 与 /api/playlists）',
+    /regenDailyIfStale\(env, daily, songForWeb, \{ sync: false/.test(apiSrc)
+    && /sync: true, budgetMs: HOME_REQUERY_BUDGET_MS/.test(apiSrc) === false)
+  ok('「今日推荐」页仍同步等（那一页是用户主动进来看推荐的，等得起）',
+    /regenDailyIfStale\(env, daily, songForWeb, \{ sync: true, budgetMs: DAILY_REQUERY_BUDGET_MS/.test(apiSrc))
   ok('换完重读一次再返回（本次响应给的就是新内容）',
     /if \(dstale\)[\s\S]{0,220}?getDaily\(env\.DB\)/.test(apiSrc))
   ok('⚠ 调用点不许再传 db（模块当句柄 → TypeError 被 catch 吞掉 → 永远 false）',
@@ -308,8 +321,19 @@ const searchEmpty = async () => ({ list: [] })
     && /dailySourcesStale\(\s*env\s*,\s*db\b/.test(apiSrc) === false)
   ok('同步路径也有去重（同一 isolate 复用任务 + 冷却），连点首页不会反复等',
     /dailyRegenTask/.test(apiSrc) && /now - dailyRegenAt < 20000/.test(apiSrc))
-  ok('没有 waitUntil 的环境不硬等（sync=false 分支仍守着这条）',
-    /if \(!env\.waitUntil\) return true/.test(apiSrc))
+  /**
+   * ⚠ 没有 `waitUntil` 的宿主（Docker / 本机 node）**也必须真跑**后台重算。
+   *
+   * 原来这里写的是 `if (!env.waitUntil) return true` —— 在 CF 上没问题（它一定有），
+   * 但自建实例没有 `env.waitUntil`，那一句在 Docker 上等于**永远不重算**。
+   * `waitUntil` 的唯一作用是「保住响应返回后还要跑的任务不被回收」；Node 进程不会
+   * 因为回了响应就掐掉在途的 promise，所以把 promise 丢出去它就会跑完。
+   * 所以断言要同时钉两件：旧短路不在了 + 新写法里 task 真的被创建。
+   */
+  ok('⚠ 没有 waitUntil 的宿主也必须真跑（旧的 `if (!env.waitUntil) return true` 在 Docker 上=永不重算）',
+    /if \(!env\.waitUntil\) return true/.test(apiSrc) === false
+    && /const task = requeryDailySources\(env, record, \{ toWeb, budgetMs \}\)/.test(apiSrc)
+    && /if \(env\.waitUntil\) \{/.test(apiSrc))
   ok('generateDaily 的调用点传的是 env.DB（句柄），不是 db 模块',
     /generateDaily\(env, env\.DB,/.test(apiSrc)
     && /generateDaily\(\s*env\s*,\s*db\b/.test(apiSrc) === false)
@@ -347,7 +371,17 @@ const searchEmpty = async () => ({ list: [] })
     const rb = await requeryDailySources(env7, recB, { toWeb: (s) => s, searchFn: hitWy })
     ok('已经在目标源上 → 不算替换（避免把 id/封面抖坏）', rb.replaced === 0 && rb.completed === true)
 
-    // 预算用尽：没跑完就不记签名，下次访问继续换，逐步收敛
+    /**
+     * ⚠ 预算用尽（没跑完）**也必须记签名** —— 2026-10-09 第二次踩的坑，别改回去。
+     *
+     * 签名回答的是「这份 daily 是按哪套音源生成的」，不是「换源全部成功了」。
+     * 原先写成 `if (completed)`，于是弱网自建实例上（9 秒跑不完 24 首）：
+     *   completed=false → 签名不记 → 下次访问又判 stale → 又同步等 9 秒 → **无限循环**。
+     * 报障原话「docker 每次重新打开，登录需要 10s，这个时候我的歌单加载不出来」
+     * 就是这个循环：那 9 秒会把同一刻的 `/api/me`、`/api/playlists` 一起压在后面。
+     * CF 上不出现，是因为线上那份早就换成功过一次、签名记上了 —— 所以这个 bug
+     * **只在慢实例上现形**，是这个项目最难查的一类。
+     */
     const db8 = withHistory(fakeDb(), [], [])
     const env8 = fakeEnv({ DB: db8 })
     await db8.prepare('INSERT OR REPLACE INTO settings (k, v) VALUES (?,?)').bind('search.sources', 'wy').run()
@@ -357,8 +391,12 @@ const searchEmpty = async () => ({ list: [] })
       songs: Array.from({ length: 48 }, (_, i) => ({ name: 'S' + i, singer: '', source: 'kg', id: 'kg_' + i })),
     }
     const rc = await requeryDailySources(env8, many, { toWeb: (s) => s, budgetMs: 100, searchFn: slow })
-    ok('预算用尽：未跑完 → 不记签名，下次继续（逐步收敛，不会假装已完成）',
-      rc.completed === false && db8._settings.get('daily.sources') === undefined, JSON.stringify(rc))
+    ok('预算用尽：没跑完（completed=false，尾巴留给下次）', rc.completed === false, JSON.stringify(rc))
+    ok('⚠ 但真的跑过（ran=true）→ 必须记下签名，否则每次访问都要白等一整轮',
+      rc.ran === true && db8._settings.get('daily.sources') === 'wy', JSON.stringify(rc))
+    ok('结构断言：结尾用 ran 判据（不许再出现 completed 把关的 rememberSourcesSig）',
+      /if \(ran\)/.test(dailySrc)
+      && /if \(completed\)[\s\S]{0,40}?rememberSourcesSig/.test(dailySrc) === false)
   }
 }
 
