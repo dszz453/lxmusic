@@ -768,12 +768,15 @@ body { overflow: hidden; }
 
 ## 一、安卓 APP（先看这个）
 
-**`dist/music-edge-1.8.apk`** —— 直接装到手机上即可，**装完不需要联网到本项目的服务器**。
+**`dist/music-edge-2.2.apk`** —— 直接装到手机上即可，**装完不需要联网到本项目的服务器**。
 
-- 包名 `com.zyplnn.musicedge`，versionCode 108 / versionName 1.8，最低 Android 5.0（API 21），目标 API 34
+- 包名 `com.zyplnn.musicedge`，versionCode 112 / versionName 2.2，最低 Android 5.0（API 21），目标 API 34
 - 桌面名称 **music-edge**
 - 已用 v1 + v2 + v3 三种方案签名，校验通过（`apksigner verify -v`）
-- 大小 752,156 字节，sha256 `e80992a84143ea550474a0542fc70b92063dfa9d183c3fe2846eff66aef0a51a`
+- 大小 891,866 字节，sha256 `36e9349a02cc321de83e960c65257124eef120db9bfa985c88ae63610de006ae`
+- 通用客户端 `dist/lx-music-client-1.9.apk`（包名 `com.zyplnn.lxclient`，versionCode 109 / 1.9）
+  945,852 字节，sha256 `8a2d3e951bc37ea409e7b45bb30a8c1736fc6fabf591dc8fe83e6541f2b910e5`；
+  两个包的签名证书与在线资源**逐文件 sha256 均已核对一致**（26 个文件、0 处不一致）
 - 签名证书 SHA-256 `dff16588…4eda52`，与 1.3 / 1.4 / 1.5 **完全一致** —— 可以原地覆盖升级，数据不丢
 - 签名密钥 `android/keystore/yunmusic.keystore`（口令 `android`），升级包必须沿用它
   （密钥文件名与别名沿用早期的 `yunmusic`，那只是签名身份、与 App 名无关，改它会找不到签名入口）
@@ -783,7 +786,30 @@ body { overflow: hidden; }
 > `versionCode/versionName`，和 `android/build-apk.sh` 里的 `VERSION_CODE/VERSION_NAME`
 > （aapt2 用的是命令行上那两个，不看清单文件里的）。
 
-### 1.6 改了什么（本轮）
+### 2.2 改了什么（本轮）：登录机制
+
+老板报「Docker 版客户端重新登录之后，我的歌单是空白、加载要半天，这时候点『我的』
+发现未登录，大概 10 秒才能登录」。服务端接口实测都是毫秒级，三处根因都在前端/客户端这条链上：
+
+1. **一次登录把首页渲染 3 遍 → 3 个 `/api/home`**。`/api/home` 在冷缓存上要
+   「抓榜单 + 跨 6 个音源搜 24 首」，而兜底内容是全站同一份 —— 三份并发就是白算三遍，
+   自建实例上别的请求（`/api/playlists`、`/api/me`）跟着一起卡，这就是「歌单空白转半天」。
+   修法：`public/js/api.js` 出口处加**同刻同请求合并**（`once`，只合 GET，
+   键 = 令牌 + 完整路径）；服务端把真正贵的那一段（`cachedHomeFallback` 的 `compute`、
+   `cachedToplists`）也单飞。
+2. **登录成功后的身份被第二趟 `/api/me` 覆盖**。`/api/login` 的正文里已经带着身份
+   （服务端刚核对过口令），那一趟失败却会把它降级（丢掉 `isAdmin`、加 `unconfirmed`），
+   设备上没记住用户名时更是整份变 `null` → 「我的」页印「未登录」。
+   修法：新增「身份已确认」标记，确认过的身份不允许被「这一趟没问到」降级。
+3. **补确认只有一发、而且不重画**。原写法看着像退避两次，实际只有一个调用点 →
+   只排了一次 3 秒的定时器，没够着就再也不试；而且成功时只改内存不重画，
+   屏幕那句「未登录」一直挂着。修法：档位表 `[0, 1500, 4000, 9000]`（第一档立刻），
+   每发失败自己排下一档；身份从「空/未确认」回到「已确认」时重画一次。
+
+取证工具：`node tools/login-flow-probe.mjs`（CDP 直连 Chrome 跑真页面，不需要 puppeteer），
+三种模式 `--me-fail` / `--stale-device` / 正常，可复现上面三条并验证修复。
+
+### 1.6 改了什么
 
 - **服务端地址可配置**：设置页与登录页都能填自建后端（Cloudflare / Docker / 自家反代都行），
   带连通性自检；填了就变纯客户端，账号 / 播放记录 / 音源插件全在服务器那一侧，可随时切回本机模式。
