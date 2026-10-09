@@ -11,8 +11,14 @@
  *      同步品牌判据（LX_CLIENT_HOST_HINT），app.js 的版本一致性比较改为比
  *      「客户端期望的服务端版本」而不是客户端自己的版本号（客户端已有独立版本线）。
  *      两者都是运行时才生效的判定，不抬 VERSION 的话老缓存会一直赢。
+ *
+ * v41：`js/backend.bundle.js` 变了（`src/lib/ai.js` 的 AI 生成上限 180s → 90s）。
+ *      它不在 PRECACHE 里，但 `index.html` 每次都会 `<script src>` 它 ——
+ *      于是它落在下面那条「同源静态资源 stale-while-revalidate」分支上：
+ *      先给缓存里的旧版、后台再更新。不抬 VERSION 的话，用户手机上会先跑一版
+ *      旧后端（AI 上限还是 180s），要再刷一次才生效。
  */
-const VERSION = 'v40'
+const VERSION = 'v41'
 const STATIC_CACHE = 'lxmusic-static-' + VERSION
 const SHELL_CACHE = 'lxmusic-shell-' + VERSION
 
