@@ -1,5 +1,5 @@
 /* 由 tools/build-app.mjs 自动生成，请勿手动修改。
- * 源摘要: 9d8a627621b2a8e1
+ * 源摘要: 996271088c2a9606
  * 模块数: 25
  *
  * 这是给安卓壳用的后端展平版：把 src/ 的 ESM 后端打成单个 IIFE，
@@ -41,7 +41,7 @@ const db = __require("src/db.js");
 // 「默认搜索源改了不起作用」的根因，见 sources.js 顶部说明。
 const { searchSources, DEFAULT_SOURCES_SETTING } = __require("src/server/sources.js");
 const { importPlugin, removeImportedPlugin } = __require("src/server/plugin-import.mjs");
-const { generateDaily, getDaily, pickPrimaryUser, todayBJ, dailySourcesStale } = __require("src/server/daily.js");
+const { generateDaily, getDaily, pickPrimaryUser, todayBJ, dailySourcesStale, requeryDailySources } = __require("src/server/daily.js");
 const { HOME_KEYWORDS } = __require("src/server/keywords.js");
 const { versionInfo } = __require("src/version.js");
 
@@ -584,34 +584,59 @@ function songForWeb(song) {
 /* ---------------- 路由 ---------------- */
 
 /**
- * 「音源设置变了 → 当天那份推荐立刻重算」的触发点。
+ * 「音源设置变了 → 当天那份推荐立刻换源」的触发点。
  *
  * 背景见 `daily.js` 的 `dailySourcesStale`：`/api/home` 与 `/daily` 一看到当天有记录
  * 就直接返回（首页要秒开，这是对的），于是「改了默认搜索源」在**当天**永远不生效，
  * 用户只能等第二天 06:00 的 cron —— 表现仍然是「设置不起作用」。
  *
- * 两处读接口顺手调它一次：是旧源生成的就在**后台**重算，本次响应照旧给旧内容。
+ * ⚠ 参数里**没有 `db`**，这不是图省事，是踩过坑：
+ *   这个函数原先的签名是 `(env, db, record, userId, toWeb)`，而 api.js 作用域里的 `db`
+ *   是 `import * as db from '../db.js'` 的**模块**（它上面的函数第一个参数才是句柄，
+ *   例如 `db.ensureSchema(env.DB)`）。daily.js 内部却按 D1 句柄用 → `db.prepare is not
+ *   a function` → 被 `catch` 吞成 null → 永远 `return false` → **线上怎么修都不生效**。
+ *   现在句柄一律由被调用方从 `env.DB` 自取，参数形状回归「同一件事只有一种传法」。
  *
- * 节流 60 秒的理由：重算一次是 AI 生成 + 24 首跨源搜索（30~90s），而用户可能连点几下
- * 首页、或两台设备同时打开。没有这道闸，同一份东西会被并发算好几遍。只在同一个
- * isolate 内有效 —— 够用，重复触发的窗口本来就只有那几十秒。
+ * 默认**同步**（sync=true）：换源是「24 首并发重搜」，有硬预算，用户改完设置打开 App
+ * 最多等十来秒就能看到新源 —— 比「后台算到一半被 CF 回收、永远不生效」好得多。
+ * 传 `sync: false` 才走 `waitUntil`。
+ *
+ * 去重：同一 isolate 内复用进行中的任务；另加 20 秒冷却，避免用户连点首页时每点一次
+ * 都等一轮。（只在同一 isolate 内有效 —— 够用，重叠窗口本来就只有那十几秒。）
  */
 let dailyRegenAt = 0
-function regenDailyIfStale(env, db, record, userId, toWeb) {
-  return dailySourcesStale(env, db, record)
+let dailyRegenTask = null
+
+/** 换源预算：首页要快，给 9 秒；「今日推荐」页是用户专门进来看的，可以宽到 14 秒 */
+const HOME_REQUERY_BUDGET_MS = 9000
+const DAILY_REQUERY_BUDGET_MS = 14000
+
+function regenDailyIfStale(env, record, toWeb, { sync = true, budgetMs } = {}) {
+  return dailySourcesStale(env, record)
     .then((stale) => {
       if (!stale) return false
-      // 替身 / 本地环境可能没有 waitUntil：那就**不重算**（同步等 30~90s 会卡死页面），
-      // 交给 cron 或用户点「换一批」。这里如实返回 true，调试时看得见。
-      if (!env.waitUntil) return true
+
+      if (!sync) {
+        // 替身 / 本地环境可能没有 waitUntil：那就不动它，交给 cron 或「换一批」
+        if (!env.waitUntil) return true
+        const t0 = Date.now()
+        if (t0 - dailyRegenAt < 60000) return true
+        dailyRegenAt = t0
+        try {
+          env.waitUntil(requeryDailySources(env, record, { toWeb, budgetMs })
+            .catch(() => { /* 后台失败静默，下次访问再试 */ }))
+        } catch { /* waitUntil 自己抛了也不能影响本次响应 */ }
+        return true
+      }
+
+      if (dailyRegenTask) return dailyRegenTask.then(() => true)
       const now = Date.now()
-      if (now - dailyRegenAt < 60000) return true
+      if (now - dailyRegenAt < 20000) return true
       dailyRegenAt = now
-      try {
-        env.waitUntil(generateDaily(env, env.DB, { userId, toWeb })
-          .catch(() => { /* 后台失败静默，下次访问再试 */ }))
-      } catch { /* waitUntil 自己抛了也不能影响本次响应 */ }
-      return true
+      dailyRegenTask = requeryDailySources(env, record, { toWeb, budgetMs })
+        .catch(() => ({ replaced: 0, total: 0, completed: false, saved: false }))
+        .then((r) => { dailyRegenTask = null; return r })
+      return dailyRegenTask.then(() => true)
     })
     .catch(() => false)
 }
@@ -729,11 +754,17 @@ async function handleApi(request, env, url) {
 
       if (daily && daily.songs.length) {
         // 当天已有 AI 推荐：直接用，首页秒开。
-        // 顺手核对「这份是用当前设置的音源生成的吗」——不是就在后台重算（本次仍给旧的）。
+        // 顺手核对「这份是用当前设置的音源生成的吗」——不是就**当场换源**
+        // （只换源、不重跑 AI，理由见 daily.js 的 requeryDailySources）。
         const [charts, dstale] = await Promise.all([
           cachedToplists(),
-          regenDailyIfStale(env, db, daily, user.id, songForWeb),
+          regenDailyIfStale(env, daily, songForWeb, { sync: true, budgetMs: HOME_REQUERY_BUDGET_MS }),
         ])
+        if (dstale) {
+          // 换过源就重读一次：本次响应直接给新的，用户不必刷新第二遍
+          const fresh = await getDaily(env.DB).catch(() => null)
+          if (fresh && fresh.songs && fresh.songs.length) daily = fresh
+        }
         return json({
           ok: true,
           keyword: daily.title || '每日推荐',
@@ -779,9 +810,14 @@ async function handleApi(request, env, url) {
      *                      AI 链路 30~90s 属正常，前端要有 loading 态。
      */
     if (path === '/daily' && method === 'GET') {
-      const daily = await getDaily(env.DB)
-      // 同 /home：这份要是旧音源生成的，就在后台按新设置重算一次（本次仍给旧的）
-      const stale = await regenDailyIfStale(env, db, daily, user.id, songForWeb)
+      let daily = await getDaily(env.DB)
+      // 同 /home：这份要是旧音源生成的，就**当场换源**（只换源，不重跑 AI）
+      const stale = await regenDailyIfStale(env, daily, songForWeb, { sync: true, budgetMs: DAILY_REQUERY_BUDGET_MS })
+      if (stale) {
+        // 换过源就重读一次：进这个页面的用户就是来看推荐的，别让他再刷一遍
+        const fresh = await getDaily(env.DB).catch(() => null)
+        if (fresh && fresh.songs && fresh.songs.length) daily = fresh
+      }
       return json({
         ok: true,
         ready: !!(daily && daily.songs.length),
@@ -790,6 +826,7 @@ async function handleApi(request, env, url) {
         generatedAt: daily ? daily.generatedAt : 0,
         date: todayBJ(),
         songs: daily ? daily.songs : [],
+        // true = 本次发现是旧音源、已按新设置换过源（内容此时已是新的）
         stale,
       })
     }
@@ -7720,10 +7757,13 @@ __modules["src/server/daily.js"] = function (__exports, __require) {
  *   5. 兜底：AI 未配置 / 生成失败 / 有效歌不足时，退回旧的关键词轮换搜索，
  *      保证「每日推荐」任何时候都有歌可放 —— 坏了也只是退回旧行为，不能白屏。
  *
- * 触发入口三个（都在 CF 端）：
+ * 触发入口四个（都在 CF 端）：
  *   · cron   —— wrangler.toml [triggers]，UTC 22:00 = 北京 06:00，见 index.js 的 scheduled
  *   · lazy   —— /api/home 发现当天还没有记录时，waitUntil 后台生成（明天就有了）
  *   · manual —— POST /api/daily/refresh，前端「换一批」按钮，强制重生成
+ *   · requery—— 改了「默认搜索源」时，把当天那份**只换源**重算（见 requeryDailySources）。
+ *               与上面三个不同：它不重新选曲、不跑 AI，因此能在请求生命周期内跑完。
+ *               少了这条，「设置改了当天不生效」会一直是老板的报障常客。
  */
 
 const { generatePlaylist } = __require("src/lib/ai.js");
@@ -7926,19 +7966,118 @@ async function rememberSourcesSig(db, sig) {
  * 这件事在**当天**永远不生效，用户只能等第二天早上 6 点的 cron 重算，
  * 表现依旧是「设置不起作用」（老板 2026-10-09 报的就是这个）。
  *
- * 所以这两处读接口顺手问一句「这份是不是旧音源生成的」；是的话由调用方
- * **在后台重算**（`env.waitUntil`）—— 仍然先把旧的交出去，绝不让用户等 30~90 秒。
+ * 所以这两处读接口顺手问一句「这份是不是旧音源生成的」；是的话由调用方重算。
  *
  * 返回 false 的两种情况：没有记录；或**读不到**签名（替身 / 没有 settings 表），
  * 那种情况按老行为办，别拿一个猜出来的结论去触发重算。
  * 注意空串（老库从没记过签名）**算变了** —— 那正是升级后该立刻生效的第一次。
+ *
+ * ══════════════ ⚠ 这里踩过一个「静默失效」的坑，别再犯 ══════════════
+ * 这个函数原先的签名是 `dailySourcesStale(env, db, record)`，api.js 照直传了自己作用域里
+ * 的 `db` —— 可那个 `db` 是 `import * as db from '../db.js'` 的**模块**，不是 D1 句柄！
+ * 于是 `lastSourcesSig` → `getSetting` → `db.prepare(...)` 抛 `TypeError: db.prepare
+ * is not a function`，又被 `lastSourcesSig` 的 `catch { return null }` 吞成 null，
+ * 这一层再 `if (prev === null) return false` —— **整条链路安静地永远返回 false**。
+ *
+ * 后果：2026-10-09 老板报「CF 端今日推荐还是酷狗」，而线上数据完全对得上这个 bug ——
+ * `settings` 里始终没有 `daily.sources`（重算从没跑过）、`daily_recommend` 的
+ * `generated_at` 停在当天 06:00 的 cron、13 首全是 kg。修完当天换上真正的句柄后
+ * 立刻变成按设置的 wy 优先。
+ *
+ * 教训不是「调用点写错了」，而是**这个参数本来就不该存在**：同一个名字 `db`
+ * 在 api.js 里是模块、在 daily.js 里是句柄，两处含义相反（`getSetting(db, …)` 要句柄，
+ * `searchSources(env, settingsDb)` 要模块）—— 只要它还接受外部传进来的「db」，
+ * 就迟早有人传错，而且错了不报错、只静默失效。所以现在**只收 env**，句柄自己从
+ * `env.DB` 取，签名上就没有可传错的地方。
  */
-async function dailySourcesStale(env, db, record) {
+async function dailySourcesStale(env, record) {
   if (!record || !record.songs || !record.songs.length) return false
-  const prev = await lastSourcesSig(db)
+  // ⚠ 必须是 D1 句柄：从 env 自己取，绝不由调用方传（见上面的坑）
+  const prev = await lastSourcesSig(env && env.DB)
   if (prev === null) return false
   const now = (await searchSources(env, dbmod)).join(',')
   return prev !== now
+}
+
+/**
+ * 总预算与并发（「只换源」用）。
+ *
+ * 为什么单独一套而不是复用 `SEARCH_CONCURRENCY`：那条是 AI 解析用的（6）。
+ * 换源是「24 首都要过一遍」的批处理，且必须在**请求生命周期内**跑完，
+ * 并发给足才有机会收敛；而 AI 解析不急于一次跑完，并发低一点少惹上游限流。
+ */
+const REQUERY_CONCURRENCY = 8
+const REQUERY_BUDGET_MS = 12000
+
+/**
+ * 「只换源」的重算：保留当天已经选好的曲目，按**当前的音源设置**把每一首重新解析一遍。
+ *
+ * ══════════════ 为什么不直接重跑 generateDaily ══════════════
+ * 上一版就是那么做的（在 `env.waitUntil` 里跑完整生成），但它注定不生效：
+ * 完整生成 = AI 出题 + 24 首逐首跨源搜索，daily.js 自己的注释都写着「30~90s」——
+ * 而 CF Worker 在响应返回后给 `waitUntil` 的预算只有约 30 秒，任务跑到一半就被
+ * 回收，`saveDaily` 和 `rememberSourcesSig` 都没执行。表现就是「怎么修都不生效」。
+ *
+ * 关键认识：**AI 只决定「推哪 24 首」，跟音源没关系**。改了音源设置，歌单本身不用变，
+ * 只需要把每首换到新源上取一次 —— 省掉 AI 那 10~30 秒，才有可能跑完。
+ *
+ * ══════════════ 预算与部分成功 ══════════════
+ * `budgetMs` 用尽就停止发起新的搜索，**已经换好的照常写回**：宁可只换一部分，
+ * 也不要整份丢弃 —— 用户至少能立刻看到一部分新源的结果。
+ * 只有**全部处理完**（`completed`）才记签名；没跑完就不记，等下次访问继续换，
+ * 逐步收敛（已换过的歌再搜一次仍命中同一个源，不会来回抖）。
+ *
+ * 返回 `{ replaced, total, completed, saved }`，方便调试与断言。
+ */
+async function requeryDailySources(env, record, { toWeb = null, budgetMs = REQUERY_BUDGET_MS, searchFn = searchOnline } = {}) {
+  const songs = (record && record.songs) || []
+  if (!songs.length) return { replaced: 0, total: 0, completed: true, saved: false }
+
+  const sources = await searchSources(env, dbmod)
+  const sig = sources.join(',')
+  const parsed = parseQuery('', sources)
+  // 预算由调用方定（首页 9s / 今日推荐页 14s，见 api.js）。不再设下限：
+  // 早先写成 Math.max(1000, budgetMs)，看着是防呆，实际把调用方的小预算悄悄抬成 1 秒，
+  // 于是「预算用尽」这条分支在测试里永远进不去 —— 护栏形同虚设。
+  const deadline = Date.now() + budgetMs
+
+  const out = songs.slice()
+  let cursor = 0
+  let replaced = 0
+
+  async function worker() {
+    for (;;) {
+      const i = cursor++
+      if (i >= songs.length) return
+      if (Date.now() > deadline) return // 预算用尽：剩下的原样保留，交给下一次
+      const s = songs[i] || {}
+      const q = ((s.name || '') + ' ' + (s.singer || '')).trim()
+      if (!q) continue
+      try {
+        const res = await searchFn(q, { sources: parsed.sources, limit: 3, pluginPool: env.PLUGIN_POOL })
+        const hit = res && Array.isArray(res.list) ? res.list[0] : null
+        // 只在**换到了别的源**时才替换：同一源重复搜到的不动，免得把 id/封面抖坏
+        if (hit && hit.source && hit.source !== s.source) {
+          out[i] = toWeb ? toWeb(hit) : hit
+          replaced++
+        }
+      } catch { /* 单首失败保留原样，不影响整体 */ }
+    }
+  }
+  await Promise.all(Array.from({ length: Math.min(REQUERY_CONCURRENCY, songs.length) }, worker))
+
+  const completed = cursor >= songs.length
+  if (replaced > 0) {
+    try {
+      // generatedAt 一并更新：它是「这份内容的时间」，换源后内容确实变了，
+      // 前端/缓存只要看它就知道该重渲染（沿用旧值会让「没变化」的假象一直挂着）。
+      await saveDaily(env.DB, { ...record, songs: out, generatedAt: Date.now() })
+    } catch { /* 写失败只是这次白换，不影响返回 */ }
+  }
+  if (completed) {
+    try { await rememberSourcesSig(env.DB, sig) } catch { /* 记不上就下次多重算一次 */ }
+  }
+  return { replaced, total: songs.length, completed, saved: replaced > 0 }
 }
 
 /** 读某天的推荐。没有返回 null。 */
@@ -7981,6 +8120,7 @@ async function pickPrimaryUser(db) {
   __exports.resolveAiSongs = resolveAiSongs;
   __exports.generateDaily = generateDaily;
   __exports.dailySourcesStale = dailySourcesStale;
+  __exports.requeryDailySources = requeryDailySources;
   __exports.getDaily = getDaily;
   __exports.pickPrimaryUser = pickPrimaryUser;
 };
@@ -8017,7 +8157,7 @@ __modules["src/version.js"] = function (__exports, __require) {
  * 所以统一读这里，谁也别再各写各的。
  *
  * ── 两条版本线，别混 ──────────────────────────────────────────
- *   APP_VERSION      产品版本，人看的。改功能才动它。当前 V2.0
+ *   APP_VERSION      产品版本，人看的。改功能才动它。当前 V2.1
  *   APP_VERSION_CODE 整数构建号，Android 靠它判断「能不能覆盖安装」。
  *                    每次要发新版就 +1，**不能倒退、不能重复**，
  *                    否则手机上会报「应用未安装」（签名相同也装不上）。
@@ -8043,10 +8183,10 @@ __modules["src/version.js"] = function (__exports, __require) {
  */
 
 /** 产品版本（对外展示用）。每发一版升 0.1。 */
-const APP_VERSION = 'V2.0'
+const APP_VERSION = 'V2.1'
 
 /** Android versionCode：整数、单调递增、跨次发布不可重复。每发一版 +1。 */
-const APP_VERSION_CODE = 110
+const APP_VERSION_CODE = 111
 
 /** 人类可读的完整标识，日志/关于页用。 */
 const APP_ID = 'lxmusic'

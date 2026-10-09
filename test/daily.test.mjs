@@ -1,8 +1,17 @@
 // 每日推荐单元测试：不真出网 —— AI 与搜索都通过参数注入 fake。
 // 覆盖：北京时间跨日、prompt 组装、信号表缺席容错、生成编排（AI 成功 / AI 失败兜底 /
 // 解析不足兜底）、当天已有记录不重生成、手动刷新 force 覆盖、落库后 getDaily 读回。
-import { todayBJ, buildPrompt, collectSignals, generateDaily, getDaily, resolveAiSongs, dailySourcesStale } from '../src/server/daily.js'
+import { todayBJ, buildPrompt, collectSignals, generateDaily, getDaily, resolveAiSongs, dailySourcesStale, requeryDailySources } from '../src/server/daily.js'
 import { readFileSync } from 'node:fs'
+
+/**
+ * 去掉注释再做「不包含 / 签名」断言。
+ * 注释里必然写着那条规则的**反面写法**（本文件就写了 `db.prepare is not a function`），
+ * 直接拿整文件匹配会永远红。
+ */
+function deComment(src) {
+  return String(src).replace(/\/\*[\s\S]*?\*\//g, '').replace(/^\s*\/\/.*$/gm, '')
+}
 
 let pass = 0, fail = 0
 const results = []
@@ -234,44 +243,123 @@ const searchEmpty = async () => ({ list: [] })
    * 为什么单独要它：`/api/home` 与 `/daily` 一看到当天有记录就**直接返回**（首页要秒开），
    * 于是即使 generateDaily 改好了，改了设置之后**当天**仍然看不到效果 ——
    * 用户要等到第二天 06:00 的 cron，表现还是「设置不起作用」。
-   * 所以这两个读接口要顺手问一句这里，是旧的就后台重算。
+   * 所以这两个读接口要顺手问一句这里，是旧的就当场换源。
    */
   const recX = { date: '2026-10-09', songs: [{ name: 'x' }] }
-  ok('没有记录 → 谈不上「旧」（不该触发重算）',
-    (await dailySourcesStale(env6, db6, null)) === false
-    && (await dailySourcesStale(env6, db6, { date: 'x', songs: [] })) === false)
+  ok('没有记录 → 谈不上「旧」（不该触发换源）',
+    (await dailySourcesStale(env6, null)) === false
+    && (await dailySourcesStale(env6, { date: 'x', songs: [] })) === false)
 
   // 当前设置是 kw（上面 4g 最后改的），而签名记的是上一次生成用的 kw → 不算旧
   const sigNow = db6._settings.get('daily.sources')
   ok('签名记下了（否则下面两条是空断言）', typeof sigNow === 'string' && sigNow.length > 0, String(sigNow))
-  ok('签名 = 当前设置 → 不算旧', (await dailySourcesStale(env6, db6, recX)) === false, String(sigNow))
+  ok('签名 = 当前设置 → 不算旧', (await dailySourcesStale(env6, recX)) === false, String(sigNow))
 
   // 老库：从没记过签名（键不存在）→ 算旧。这正是「升级后第一次就该立刻生效」的那次
   db6._settings.delete('daily.sources')
-  ok('老库没记过签名 → 算旧（升级后第一次访问就该重算，而不是等到明天）',
-    (await dailySourcesStale(env6, db6, recX)) === true)
+  ok('老库没记过签名 → 算旧（升级后第一次访问就该换源，而不是等到明天）',
+    (await dailySourcesStale(env6, recX)) === true)
 
   // 设置又改了 → 算旧
   db6._settings.set('daily.sources', 'kg,wy,kw')
-  ok('设置换了但当天那份还是旧源生成的 → 算旧', (await dailySourcesStale(env6, db6, recX)) === true)
+  ok('设置换了但当天那份还是旧源生成的 → 算旧', (await dailySourcesStale(env6, recX)) === true)
 
-  // 读不到 settings 表（替身 / 老库）→ 退化成老行为，别拿猜出来的结论去重算
-  ok('读不到签名表 → 返回 false（退化成老行为，不拿猜的结论重算）',
-    (await dailySourcesStale(env6, { prepare() { throw new Error('no table') } }, recX)) === false)
+  // 读不到 settings 表（替身 / 老库）→ 退化成老行为，别拿猜出来的结论去换源
+  ok('读不到签名表 → 返回 false（退化成老行为，不拿猜的结论换源）',
+    (await dailySourcesStale(fakeEnv({ DB: { prepare() { throw new Error('no table') } } }), recX)) === false)
 
-  /* 4i. api.js 必须真的把这两处接上去（helper 写好了没人调 = 白写） */
-  const apiSrc = readFileSync(new URL('../src/server/api.js', import.meta.url), 'utf8')
+  /* 4h-2. ⚠ 血泪护栏：这个判据**只能收 env**
+   *
+   * 它原先的签名是 `(env, db, record)`，而 api.js 传的 `db` 是
+   * `import * as db from '../db.js'` 那个**模块**，daily.js 却按 D1 句柄用 ——
+   * getSetting 拿到模块 → `db.prepare is not a function` → 被 catch 吞成 null →
+   * `if (prev === null) return false` → **整条链路安静地永远返回 false**。
+   * 于是线上「改了音源设置」在 CF 端怎么修都不生效，`settings` 里始终没有
+   * `daily.sources`（2026-10-09 老板报障）。这类 bug 不报错、只静默失效，
+   * 所以把「参数形状」本身钉进测试：句柄必须自己从 env.DB 取。
+   */
+  const dailySrc = deComment(readFileSync(new URL('../src/server/daily.js', import.meta.url), 'utf8'))
+  ok('dailySourcesStale 只收 env（句柄自取，从签名上消除「模块 vs 句柄」传错的可能）',
+    /export async function dailySourcesStale\(env, record\)/.test(dailySrc))
+  ok('dailySourcesStale 里取签名走 env.DB，不是外部塞进来的东西',
+    /lastSourcesSig\(env && env\.DB\)/.test(dailySrc))
+  ok('⚠ lastSourcesSig 的调用只有两种合法形态：env 自取、或 generateDaily 自己的句柄参数',
+    (dailySrc.match(/lastSourcesSig\(/g) || []).length
+    === (dailySrc.match(/lastSourcesSig\((?:env && env\.DB|db)\)/g) || []).length)
+
+  /* 4i. api.js 必须真的把这两处接上去（helper 写好了没人调 = 白写），
+   *     且必须用「只换源」而不是再跑一遍完整生成 —— 完整生成是 30~90s，
+   *     放 CF 的 waitUntil 里跑到一半就被回收，等于没做。 */
+  const apiSrc = deComment(readFileSync(new URL('../src/server/api.js', import.meta.url), 'utf8'))
   ok('/api/home 的「当天已有记录」分支会做旧源检查',
-    /if \(daily && daily\.songs\.length\)[\s\S]{0,500}?regenDailyIfStale\(/.test(apiSrc))
+    /if \(daily && daily\.songs\.length\)[\s\S]{0,600}?regenDailyIfStale\(/.test(apiSrc))
   ok('/api/daily 也做同一件事（否则从「每日推荐」页进来还是看不到效果）',
-    /path === '\/daily' && method === 'GET'[\s\S]{0,300}?regenDailyIfStale\(/.test(apiSrc))
-  ok('重算走 waitUntil 后台做（绝不为了换源把首页卡 30~90 秒）',
-    /env\.waitUntil\(generateDaily\([\s\S]{0,200}?force: true/.test(apiSrc) === false
-    && /env\.waitUntil\(generateDaily\(env, env\.DB, \{ userId, toWeb \}\)/.test(apiSrc))
-  ok('有节流（连点首页不该把同一份算好几遍）',
-    /dailyRegenAt = now[\s\S]{0,80}?60000/.test(apiSrc) || /now - dailyRegenAt < 60000/.test(apiSrc))
-  ok('没有 waitUntil 的环境不重算（同步等 30~90s 会卡死页面）',
+    /path === '\/daily' && method === 'GET'[\s\S]{0,400}?regenDailyIfStale\(/.test(apiSrc))
+  ok('换源走 requeryDailySources（只换源、不重跑 AI）',
+    /function regenDailyIfStale\(env, record, toWeb/.test(apiSrc)
+    && /requeryDailySources\(env, record/.test(apiSrc))
+  ok('默认同步等结果（不然用户改完设置第一眼还是旧源，得刷第二遍）',
+    /\{ sync = true, budgetMs \} = \{\}/.test(apiSrc)
+    && /regenDailyIfStale\(env, daily, songForWeb, \{ sync: true/.test(apiSrc))
+  ok('换完重读一次再返回（本次响应给的就是新内容）',
+    /if \(dstale\)[\s\S]{0,220}?getDaily\(env\.DB\)/.test(apiSrc))
+  ok('⚠ 调用点不许再传 db（模块当句柄 → TypeError 被 catch 吞掉 → 永远 false）',
+    /regenDailyIfStale\(\s*env\s*,\s*db\b/.test(apiSrc) === false
+    && /dailySourcesStale\(\s*env\s*,\s*db\b/.test(apiSrc) === false)
+  ok('同步路径也有去重（同一 isolate 复用任务 + 冷却），连点首页不会反复等',
+    /dailyRegenTask/.test(apiSrc) && /now - dailyRegenAt < 20000/.test(apiSrc))
+  ok('没有 waitUntil 的环境不硬等（sync=false 分支仍守着这条）',
     /if \(!env\.waitUntil\) return true/.test(apiSrc))
+  ok('generateDaily 的调用点传的是 env.DB（句柄），不是 db 模块',
+    /generateDaily\(env, env\.DB,/.test(apiSrc)
+    && /generateDaily\(\s*env\s*,\s*db\b/.test(apiSrc) === false)
+
+  /* 4j. requeryDailySources：「改了音源设置」时只换源
+   *
+   * 关键认识：AI 只决定「推哪 24 首」，跟音源无关。改了音源设置，歌单本身不用变，
+   * 只要把每首换到新源上取一次 —— 省掉 AI 的 10~30 秒，才有可能在请求生命周期内跑完。
+   */
+  {
+    const db7 = withHistory(fakeDb(), [], [])
+    const env7 = fakeEnv({ DB: db7 })
+    await db7.prepare('INSERT OR REPLACE INTO settings (k, v) VALUES (?,?)').bind('search.sources', 'wy,kg').run()
+    const hitWy = async (q) => ({ list: [{ source: 'wy', id: 'wy_' + q, name: q, singer: '' }] })
+
+    const recA = {
+      date: '2026-10-09', title: '每日推荐', generator: 'ai', generatedAt: 1,
+      songs: [
+        { name: '同桌的你', singer: '老狼', source: 'kg', id: 'kg_1' },
+        { name: '海阔天空', singer: 'Beyond', source: 'kg', id: 'kg_2' },
+      ],
+    }
+    const ra = await requeryDailySources(env7, recA, { toWeb: (s) => s, searchFn: hitWy })
+    ok('换源：每首都换到新源', ra.replaced === 2 && ra.total === 2 && ra.completed === true, JSON.stringify(ra))
+    ok('换源：换到了就落库', ra.saved === true)
+    ok('换源：记下这次用的源签名（下次不再判旧）', db7._settings.get('daily.sources') === 'wy,kg')
+
+    const back = await getDaily(db7, '2026-10-09')
+    ok('换源：读回来的歌已经是新源',
+      !!back && back.songs.length === 2 && back.songs.every((s) => s.source === 'wy'),
+      back ? JSON.stringify(back.songs.map((s) => s.source)) : 'null')
+
+    // 已经在目标源上的歌不再替换：同一源重复搜到的不动，免得把 id / 封面抖坏
+    const recB = { date: '2026-10-10', songs: [{ name: 'C', singer: 'c', source: 'wy', id: 'wy_9' }] }
+    const rb = await requeryDailySources(env7, recB, { toWeb: (s) => s, searchFn: hitWy })
+    ok('已经在目标源上 → 不算替换（避免把 id/封面抖坏）', rb.replaced === 0 && rb.completed === true)
+
+    // 预算用尽：没跑完就不记签名，下次访问继续换，逐步收敛
+    const db8 = withHistory(fakeDb(), [], [])
+    const env8 = fakeEnv({ DB: db8 })
+    await db8.prepare('INSERT OR REPLACE INTO settings (k, v) VALUES (?,?)').bind('search.sources', 'wy').run()
+    const slow = async (q) => { await new Promise((r) => setTimeout(r, 40)); return hitWy(q) }
+    const many = {
+      date: '2026-10-11',
+      songs: Array.from({ length: 48 }, (_, i) => ({ name: 'S' + i, singer: '', source: 'kg', id: 'kg_' + i })),
+    }
+    const rc = await requeryDailySources(env8, many, { toWeb: (s) => s, budgetMs: 100, searchFn: slow })
+    ok('预算用尽：未跑完 → 不记签名，下次继续（逐步收敛，不会假装已完成）',
+      rc.completed === false && db8._settings.get('daily.sources') === undefined, JSON.stringify(rc))
+  }
 }
 
 /* ---------- 5. resolveAiSongs ---------- */

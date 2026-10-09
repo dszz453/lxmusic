@@ -13,7 +13,7 @@
  * 所以统一读这里，谁也别再各写各的。
  *
  * ── 两条版本线，别混 ──────────────────────────────────────────
- *   APP_VERSION      产品版本，人看的。改功能才动它。当前 V2.0
+ *   APP_VERSION      产品版本，人看的。改功能才动它。当前 V2.1
  *   APP_VERSION_CODE 整数构建号，Android 靠它判断「能不能覆盖安装」。
  *                    每次要发新版就 +1，**不能倒退、不能重复**，
  *                    否则手机上会报「应用未安装」（签名相同也装不上）。
@@ -39,10 +39,10 @@
  */
 
 /** 产品版本（对外展示用）。每发一版升 0.1。 */
-export const APP_VERSION = 'V2.0'
+export const APP_VERSION = 'V2.1'
 
 /** Android versionCode：整数、单调递增、跨次发布不可重复。每发一版 +1。 */
-export const APP_VERSION_CODE = 110
+export const APP_VERSION_CODE = 111
 
 /** 人类可读的完整标识，日志/关于页用。 */
 export const APP_ID = 'lxmusic'

@@ -10,10 +10,13 @@
  *   5. 兜底：AI 未配置 / 生成失败 / 有效歌不足时，退回旧的关键词轮换搜索，
  *      保证「每日推荐」任何时候都有歌可放 —— 坏了也只是退回旧行为，不能白屏。
  *
- * 触发入口三个（都在 CF 端）：
+ * 触发入口四个（都在 CF 端）：
  *   · cron   —— wrangler.toml [triggers]，UTC 22:00 = 北京 06:00，见 index.js 的 scheduled
  *   · lazy   —— /api/home 发现当天还没有记录时，waitUntil 后台生成（明天就有了）
  *   · manual —— POST /api/daily/refresh，前端「换一批」按钮，强制重生成
+ *   · requery—— 改了「默认搜索源」时，把当天那份**只换源**重算（见 requeryDailySources）。
+ *               与上面三个不同：它不重新选曲、不跑 AI，因此能在请求生命周期内跑完。
+ *               少了这条，「设置改了当天不生效」会一直是老板的报障常客。
  */
 
 import { generatePlaylist } from '../lib/ai.js'
@@ -216,19 +219,118 @@ async function rememberSourcesSig(db, sig) {
  * 这件事在**当天**永远不生效，用户只能等第二天早上 6 点的 cron 重算，
  * 表现依旧是「设置不起作用」（老板 2026-10-09 报的就是这个）。
  *
- * 所以这两处读接口顺手问一句「这份是不是旧音源生成的」；是的话由调用方
- * **在后台重算**（`env.waitUntil`）—— 仍然先把旧的交出去，绝不让用户等 30~90 秒。
+ * 所以这两处读接口顺手问一句「这份是不是旧音源生成的」；是的话由调用方重算。
  *
  * 返回 false 的两种情况：没有记录；或**读不到**签名（替身 / 没有 settings 表），
  * 那种情况按老行为办，别拿一个猜出来的结论去触发重算。
  * 注意空串（老库从没记过签名）**算变了** —— 那正是升级后该立刻生效的第一次。
+ *
+ * ══════════════ ⚠ 这里踩过一个「静默失效」的坑，别再犯 ══════════════
+ * 这个函数原先的签名是 `dailySourcesStale(env, db, record)`，api.js 照直传了自己作用域里
+ * 的 `db` —— 可那个 `db` 是 `import * as db from '../db.js'` 的**模块**，不是 D1 句柄！
+ * 于是 `lastSourcesSig` → `getSetting` → `db.prepare(...)` 抛 `TypeError: db.prepare
+ * is not a function`，又被 `lastSourcesSig` 的 `catch { return null }` 吞成 null，
+ * 这一层再 `if (prev === null) return false` —— **整条链路安静地永远返回 false**。
+ *
+ * 后果：2026-10-09 老板报「CF 端今日推荐还是酷狗」，而线上数据完全对得上这个 bug ——
+ * `settings` 里始终没有 `daily.sources`（重算从没跑过）、`daily_recommend` 的
+ * `generated_at` 停在当天 06:00 的 cron、13 首全是 kg。修完当天换上真正的句柄后
+ * 立刻变成按设置的 wy 优先。
+ *
+ * 教训不是「调用点写错了」，而是**这个参数本来就不该存在**：同一个名字 `db`
+ * 在 api.js 里是模块、在 daily.js 里是句柄，两处含义相反（`getSetting(db, …)` 要句柄，
+ * `searchSources(env, settingsDb)` 要模块）—— 只要它还接受外部传进来的「db」，
+ * 就迟早有人传错，而且错了不报错、只静默失效。所以现在**只收 env**，句柄自己从
+ * `env.DB` 取，签名上就没有可传错的地方。
  */
-export async function dailySourcesStale(env, db, record) {
+export async function dailySourcesStale(env, record) {
   if (!record || !record.songs || !record.songs.length) return false
-  const prev = await lastSourcesSig(db)
+  // ⚠ 必须是 D1 句柄：从 env 自己取，绝不由调用方传（见上面的坑）
+  const prev = await lastSourcesSig(env && env.DB)
   if (prev === null) return false
   const now = (await searchSources(env, dbmod)).join(',')
   return prev !== now
+}
+
+/**
+ * 总预算与并发（「只换源」用）。
+ *
+ * 为什么单独一套而不是复用 `SEARCH_CONCURRENCY`：那条是 AI 解析用的（6）。
+ * 换源是「24 首都要过一遍」的批处理，且必须在**请求生命周期内**跑完，
+ * 并发给足才有机会收敛；而 AI 解析不急于一次跑完，并发低一点少惹上游限流。
+ */
+const REQUERY_CONCURRENCY = 8
+const REQUERY_BUDGET_MS = 12000
+
+/**
+ * 「只换源」的重算：保留当天已经选好的曲目，按**当前的音源设置**把每一首重新解析一遍。
+ *
+ * ══════════════ 为什么不直接重跑 generateDaily ══════════════
+ * 上一版就是那么做的（在 `env.waitUntil` 里跑完整生成），但它注定不生效：
+ * 完整生成 = AI 出题 + 24 首逐首跨源搜索，daily.js 自己的注释都写着「30~90s」——
+ * 而 CF Worker 在响应返回后给 `waitUntil` 的预算只有约 30 秒，任务跑到一半就被
+ * 回收，`saveDaily` 和 `rememberSourcesSig` 都没执行。表现就是「怎么修都不生效」。
+ *
+ * 关键认识：**AI 只决定「推哪 24 首」，跟音源没关系**。改了音源设置，歌单本身不用变，
+ * 只需要把每首换到新源上取一次 —— 省掉 AI 那 10~30 秒，才有可能跑完。
+ *
+ * ══════════════ 预算与部分成功 ══════════════
+ * `budgetMs` 用尽就停止发起新的搜索，**已经换好的照常写回**：宁可只换一部分，
+ * 也不要整份丢弃 —— 用户至少能立刻看到一部分新源的结果。
+ * 只有**全部处理完**（`completed`）才记签名；没跑完就不记，等下次访问继续换，
+ * 逐步收敛（已换过的歌再搜一次仍命中同一个源，不会来回抖）。
+ *
+ * 返回 `{ replaced, total, completed, saved }`，方便调试与断言。
+ */
+export async function requeryDailySources(env, record, { toWeb = null, budgetMs = REQUERY_BUDGET_MS, searchFn = searchOnline } = {}) {
+  const songs = (record && record.songs) || []
+  if (!songs.length) return { replaced: 0, total: 0, completed: true, saved: false }
+
+  const sources = await searchSources(env, dbmod)
+  const sig = sources.join(',')
+  const parsed = parseQuery('', sources)
+  // 预算由调用方定（首页 9s / 今日推荐页 14s，见 api.js）。不再设下限：
+  // 早先写成 Math.max(1000, budgetMs)，看着是防呆，实际把调用方的小预算悄悄抬成 1 秒，
+  // 于是「预算用尽」这条分支在测试里永远进不去 —— 护栏形同虚设。
+  const deadline = Date.now() + budgetMs
+
+  const out = songs.slice()
+  let cursor = 0
+  let replaced = 0
+
+  async function worker() {
+    for (;;) {
+      const i = cursor++
+      if (i >= songs.length) return
+      if (Date.now() > deadline) return // 预算用尽：剩下的原样保留，交给下一次
+      const s = songs[i] || {}
+      const q = ((s.name || '') + ' ' + (s.singer || '')).trim()
+      if (!q) continue
+      try {
+        const res = await searchFn(q, { sources: parsed.sources, limit: 3, pluginPool: env.PLUGIN_POOL })
+        const hit = res && Array.isArray(res.list) ? res.list[0] : null
+        // 只在**换到了别的源**时才替换：同一源重复搜到的不动，免得把 id/封面抖坏
+        if (hit && hit.source && hit.source !== s.source) {
+          out[i] = toWeb ? toWeb(hit) : hit
+          replaced++
+        }
+      } catch { /* 单首失败保留原样，不影响整体 */ }
+    }
+  }
+  await Promise.all(Array.from({ length: Math.min(REQUERY_CONCURRENCY, songs.length) }, worker))
+
+  const completed = cursor >= songs.length
+  if (replaced > 0) {
+    try {
+      // generatedAt 一并更新：它是「这份内容的时间」，换源后内容确实变了，
+      // 前端/缓存只要看它就知道该重渲染（沿用旧值会让「没变化」的假象一直挂着）。
+      await saveDaily(env.DB, { ...record, songs: out, generatedAt: Date.now() })
+    } catch { /* 写失败只是这次白换，不影响返回 */ }
+  }
+  if (completed) {
+    try { await rememberSourcesSig(env.DB, sig) } catch { /* 记不上就下次多重算一次 */ }
+  }
+  return { replaced, total: songs.length, completed, saved: replaced > 0 }
 }
 
 /** 读某天的推荐。没有返回 null。 */

@@ -37,6 +37,19 @@ W() { cygpath -w "$1"; }                          # MSYS 路径 → Windows 路�
 LIST_WIN() { find "$@" | while read -r f; do cygpath -w "$f"; done; }
 
 APP_NAME="music-edge"
+# 2.1：修「2.0 那版让改设置当天生效的机制**其实根本没生效**」—— CF 端今日推荐仍是酷狗。
+#  根因不是逻辑写错，而是**参数传错后被 catch 吞掉**：dailySourcesStale 原签名是
+#  (env, db, record)，api.js 传的 db 是 `import * as db from '../db.js'` 那个**模块**，
+#  函数内部却按 D1 句柄用 → `db.prepare is not a function` → 被 lastSourcesSig 的
+#  catch 吞成 null → `if (prev === null) return false` → 整条链路安静地永远返回 false。
+#  线上证据完全吻合：settings 里始终没有 daily.sources（重算从没跑过）、daily_recommend
+#  的 generated_at 停在当天 06:00 那次 cron、13 首仍然是 kg。修法：dailySourcesStale
+#  只收 env、句柄自己从 env.DB 取，从签名上消除「模块 vs 句柄」传错的可能（加测试钉住）。
+#  第二处：换源不再走「waitUntil 里重跑完整生成」—— 那是 AI + 24 首跨源搜索（30~90s），
+#  超出 CF 给 waitUntil 的预算，跑到一半就被回收，saveDaily / rememberSourcesSig 都没执行。
+#  新增 requeryDailySources：**只换源、不重跑 AI**（AI 只决定推哪几首，跟音源无关），
+#  带预算（首页 9s / 今日推荐页 14s）与部分成功写回（没跑完就不记签名，下次继续换）。
+#  两个读接口改成同步等结果再返回，用户改完设置打开 App 第一眼就是新源，不必刷第二遍。
 # 2.0：让「改了默认搜索源」**当天**就生效 —— 补上 1.9 漏掉的那条读取路径。
 #  1.9 把 daily.js 里写死的 ['kg','wy','kw'] 换成读 src/server/sources.js 的唯一口径，
 #  但那只修了**生成**那一步。`/api/home` 与 `/daily` 一看到当天已有记录就**直接返回**
