@@ -215,6 +215,20 @@ public final class BridgeHub {
         act.setChromeVisible(visible);
     }
 
+    /**
+     * 显示 / 收起原生**顶栏**。
+     *
+     * 二级页（搜索 / 榜单 / 歌单详情 / 设置…）自己就有 `.searchbar` 头部，
+     * 全局顶栏再叠一层就是「上下两个搜索框」，而上面那个胶囊点了只是跳 #/search ——
+     * 在搜索页等于不管用（老板 2026-10-09 报障：「两个搜索框，上面的不能用」）。
+     * 网页端早就靠 CSS `#app.is-subpage .topbar{display:none}` 处理了同一件事，
+     * 客户端顶栏是 Java 画的、CSS 管不到，所以由跨端层把结论报过来。
+     */
+    @JavascriptInterface
+    public void setTopbar(boolean visible) {
+        act.setTopbarVisible(visible);
+    }
+
     /* ══════════════════ 小工具 ══════════════════ */
 
     @JavascriptInterface

@@ -54,6 +54,21 @@
       LX.call('setChrome', [visible !== false])
     },
 
+    /**
+     * 显示 / 收起原生**顶栏**。
+     *
+     * 二级页（搜索 / 榜单 / 歌单详情 / 设置…）自带 `.searchbar` 头部，全局顶栏再叠一层
+     * 就会出现「上下两个搜索框」，而上面那个胶囊点了只是跳 #/search —— 在搜索页等于
+     * 原地不动（老板 2026-10-09 报障）。网页端靠 `#app.is-subpage .topbar` 隐藏，
+     * 客户端顶栏是 Java 画的，只能这样同步过去。判据见 30-nav.js 的 isSubpage。
+     *
+     * 名字是 setTopbar 而不是 setSubpage：原生只需要知道「顶栏该不该露」，
+     * 「什么算二级页」是页面层的事，不该让原生也维护一份路由表。
+     */
+    setTopbar: function (visible) {
+      LX.call('setTopbar', [visible !== false])
+    },
+
     toast: function (msg) {
       LX.call('toast', [String(msg == null ? '' : msg)])
     },

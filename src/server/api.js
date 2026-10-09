@@ -17,19 +17,16 @@ import { generatePlaylist, loadAiConfig, chatOnce, AI_PROVIDERS } from '../lib/a
 import { PLUGIN_SCORES } from '../generated/plugin-scores.js'
 import { BUNDLED_PLUGINS } from '../generated/plugins.js'
 import * as db from '../db.js'
+// 「生效的搜索源」只有一个口径来源（搜索 / 每日推荐 / 榜单都读它）。
+// 早先它在本文件里私有，daily.js 只能另写一份写死的清单 —— 那正是
+// 「默认搜索源改了不起作用」的根因，见 sources.js 顶部说明。
+import { searchSources, DEFAULT_SOURCES_SETTING } from './sources.js'
 import { importPlugin, removeImportedPlugin } from './plugin-import.mjs'
 import { generateDaily, getDaily, pickPrimaryUser, todayBJ } from './daily.js'
 import { HOME_KEYWORDS } from './keywords.js'
 import { versionInfo } from '../version.js'
 
 const SESSION_TTL = 30 * 24 * 3600 * 1000
-
-/**
- * 读取「默认搜索源」配置（逗号分隔，如 "kg,wy,kw"），过滤出合法源。
- * 优先级：D1 settings `search.sources` > env `DEFAULT_SOURCES` > 全部平台。
- * 用户没选（空值）时返回 ALL_SOURCES，行为与旧版一致。
- */
-const DEFAULT_SOURCES_SETTING = 'search.sources'
 
 /**
  * 后台「默认搜索源」列表的**展示顺序**（含未被勾选的平台）。
@@ -63,15 +60,6 @@ async function sourceOrder(env, db) {
     return normalizeSourceOrder(seed)
   }
   return normalizeSourceOrder(raw)
-}
-
-async function searchSources(env, db) {
-  const raw = ((await db.getSetting(env.DB, DEFAULT_SOURCES_SETTING, '')) || '').trim()
-    || (env && env.DEFAULT_SOURCES ? String(env.DEFAULT_SOURCES) : '')
-  if (!raw) return ALL_SOURCES.slice()
-  const keys = raw.split(/[,，\s]+/).map(s => s.trim().toLowerCase()).filter(Boolean)
-  const valid = keys.filter(k => ALL_SOURCES.includes(k))
-  return valid.length ? valid : ALL_SOURCES.slice()
 }
 
 /**

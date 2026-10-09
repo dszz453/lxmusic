@@ -63,7 +63,29 @@
   const CRED_KEY = 'lx.app.cred'    // 本机自动登录用的凭据
   const SEED_KEY = 'lx.app.seeded'  // 内置插件预置版本
   const SEED_VER = '1'
+  /**
+   * 每条请求在**原生侧**的读超时（随请求发给 Java，用作 connect / read timeout）。
+   * 它同时是原生侧「整条请求含全部重定向跳」的总预算。
+   */
   const HTTP_TIMEOUT = 30000
+
+  /**
+   * 页面侧的等待上限 —— 必须**比原生侧晚到**，两者别再合成一个常量。
+   *
+   * 早先两者都是 30000，而这里的计时是「请求发出」那一刻就开始跑的
+   * （下面 entry.timer 在塞进 pendingHttp 之前就装好了），**排队时间照样算进去**。
+   * 于是几乎总是页面先到点，抛出一句
+   *
+   *     桥请求超时: /api/playlists
+   *
+   * 把原生侧真正的原因（连接超时 / 读超时 / 连不上 / 重定向过多 / 桥太忙）全盖住了。
+   * 老板 2026-10-09 截图报的就是这句 —— 而那个接口在服务端只是一条 SQLite 查询，
+   * 慢的根本不是接口。
+   *
+   * 现在页面侧留 5 秒余量：正常情况原生侧会带着明确文案先回投；
+   * 只有原生侧整个没动静（进程被杀、线程池真卡死）才由这里兜底。
+   */
+  const HTTP_GUARD = HTTP_TIMEOUT + 5000
   const SERVER_KEY = 'lx.serverBase'  // 非空 = 远程模式（见第 8 节）
   // 远程模式判定要在 fetch 劫持之前就定下来（劫持层每次请求现读它），
   // 所以放在常量区；readServerBase 是函数声明，会提升，这里能直接调。
@@ -155,8 +177,11 @@
       entry.timer = setTimeout(() => {
         if (!pendingHttp.has(id)) return
         pendingHttp.delete(id)
+        // 走到这里说明原生侧整个没回话（进程被杀 / 线程池真卡死）——
+        // 正常的超时、连不上、重定向过多、桥忙，都由 Java 带着明确文案先回投，
+        // 见 HTTP_GUARD 上方那段说明。
         reject(new Error('桥请求超时: ' + url))
-      }, HTTP_TIMEOUT)
+      }, HTTP_GUARD)
       pendingHttp.set(id, entry)
 
       // 接住 AbortSignal：api.js 给每个请求套了 40s 超时（AbortController），

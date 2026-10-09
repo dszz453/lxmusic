@@ -148,6 +148,13 @@ public class ClientActivity extends Activity {
     /** 顶栏下方那条细状态条：显示当前连的是哪条线、通没通过信、地址（不含版本号） */
     private TextView statusText;
     private View statusDot;
+    /**
+     * 原生顶栏整块（☰ + 搜索胶囊 + ⚙）。
+     * 二级页要把它收起来 —— 那些页面自带 .searchbar 头部，叠起来就是两个搜索框。
+     * 见 ClientActivity.setTopbarVisible 与 client/rn/src/30-nav.js 的 isSubpage。
+     */
+    private View topBar;
+    private boolean topBarVisible = true;
     /** 原生底栏整块（含上边框），跨端层在整屏状态（登录页）时要把它收起来 */
     private View navRoot;
     private boolean navBarVisible = true;
@@ -171,7 +178,8 @@ public class ClientActivity extends Activity {
         root.setOrientation(LinearLayout.VERTICAL);
         root.setBackgroundColor(Ui.color(this, R.color.bg));
 
-        root.addView(buildTopBar());
+        topBar = buildTopBar();
+        root.addView(topBar);
         root.addView(buildStatusStrip());
 
         /**
@@ -269,6 +277,10 @@ public class ClientActivity extends Activity {
      *
      * 搜索胶囊点了走跨端层的 #/search —— 位置、形状、点击行为都跟网页版一致，
      * 用户从浏览器换到 App 不会找不到搜索在哪。
+     *
+     * ⚠ 这整块**只在主 tab 上显示**：二级页（搜索 / 榜单 / 歌单详情 / 设置…）自己带着
+     * `.searchbar` 头部，再叠一条全局顶栏就是「上下两个搜索框」，而上面那个胶囊在搜索页
+     * 点了等于原地不动（老板 2026-10-09 报障）。收起的动作由跨端层上报，见 setTopbarVisible。
      *
      * ── 高度（老板反馈「顶部空白太多」）──────────────────────────
      * 高 = Ui.TOPBAR_H（46dp，比网页版的 52px 收一档），按钮 Ui.TOPBAR_BTN。
@@ -630,6 +642,9 @@ public class ClientActivity extends Activity {
                 // 底栏高亮按当前 hash 对一次。整页重载后 hash 会保留（跨端层是本页重载），
                 // 而原生这边默认是「全未选中」，不校正的话高亮会与页面内容不符。
                 syncRouteFromWeb();
+                // 新外壳上顶栏/底栏默认都是显示的，二级页（搜索/详情…）上要把顶栏收掉 ——
+                // 整页重载时页面层的去重状态是新的，所以这一条主要防「复用 WebView 重建外壳」。
+                syncChromeFromWeb();
             }
 
             @Override
@@ -1122,6 +1137,9 @@ public class ClientActivity extends Activity {
         // 从原生页（设置 / 服务器 / 本地音乐）回来时，跨端页面可能已经被翻到了别的路由
         // （比如用户在设置里点了某个入口），回来对一次高亮。
         syncRouteFromWeb();
+        // 顺带把顶栏/底栏的可见性也对一次：Activity 被系统回收后再打开时 WebView 是
+        // 复用的（页面不重载），新外壳默认「都显示」，不重报就会在二级页上多出一条顶栏。
+        syncChromeFromWeb();
     }
 
     @Override
@@ -1229,6 +1247,52 @@ public class ClientActivity extends Activity {
                 }
             }
         });
+    }
+
+    /**
+     * 显示 / 收起原生**顶栏**。
+     *
+     * 二级页（搜索 / 榜单 / 歌单详情 / 设置…）自带 `.searchbar` 头部，全局顶栏叠上去
+     * 就是「上下两个搜索框」，而上面那个胶囊点了只是跳 #/search —— 在搜索页原地不动
+     * （老板 2026-10-09：「两个搜索框，上面的搜索框不能用」）。
+     * 网页端早就用 CSS 处理了同一件事（`#app.is-subpage .topbar{display:none}`），
+     * 客户端顶栏是原生的，CSS 管不到，所以由跨端层把结论报过来（判据只在页面层一处：
+     * client/rn/src/30-nav.js 的 isSubpage —— 原生不自己维护一份路由表，免得两处漂）。
+     *
+     * 与 setChromeVisible 同样的两条纪律：**回主线程**（桥调用跑在 JavaBridge 线程上，
+     * 直接碰 View 会抛「Only the original thread that created a view hierarchy can touch
+     * its views」）+ **变化才动 View**（避免每次 hashchange 都白重排一遍）。
+     *
+     * 注意连接状态条（LX-MUSIC · 已连接 · 地址）**不跟着收**：它回答的是「我现在看的
+     * 数据是谁的」，在二级页上同样需要，而且它只有 24dp。
+     */
+    void setTopbarVisible(final boolean visible) {
+        if (topBar == null) return;
+        if (visible == topBarVisible) return;
+        topBarVisible = visible;
+        runOnUiThread(new Runnable() {
+            @Override
+            public void run() {
+                try {
+                    topBar.setVisibility(visible ? View.VISIBLE : View.GONE);
+                } catch (Throwable t) {
+                    Log.w(TAG, "切换顶栏可见性失败: " + t.getMessage());
+                }
+            }
+        });
+    }
+
+    /**
+     * 让跨端层把顶栏 / 底栏的可见性**重新上报一次**。
+     *
+     * 为什么需要（与 syncRouteFromWeb 同一类问题，但那个管的是底栏高亮）：
+     * Activity 被系统回收再打开时，WebView 是**复用**的（页面不重新加载），
+     * 而新外壳上顶栏/底栏的默认状态是「都显示」；跨端层那边「变化才上报」的去重
+     * 状态还是旧的，它会以为已经对齐、于是不再上报 —— 二级页上顶栏就会自己冒回来，
+     * 两个搜索框又出现了。让它把去重状态清掉、重报一次即可（见 30-nav.js 的 reset）。
+     */
+    private void syncChromeFromWeb() {
+        eval("(function(){try{var L=window.LXClientLayer;if(L&&L.nav&&L.nav.reset)L.nav.reset()}catch(e){}})()");
     }
 
     /** 页面侧请求重载（切换服务器、清空缓存后） */

@@ -428,6 +428,98 @@ console.log('\n== 9. 原生外壳版式：顶栏高度与系统栏内距 ══�
     && /public static final int TOPBAR_BTN = 40/.test(UI_JAVA))
 }
 
+/* ══════════════ 10. 出站 HTTP 桥：不许静默排队，错误文案必须是真的 ══════════════ */
+
+console.log('\n== 10. 出站 HTTP 桥（「桥请求超时: /api/playlists」那类报障） ══════════════')
+{
+  /**
+   * 老板 2026-10-09：Docker 版客户端点「我的歌单」弹出「桥请求超时: /api/playlists」。
+   *
+   * 那个接口在服务端只是一条 SQLite 查询（毫秒级），慢的是**在桥的线程池里排队**：
+   * 桥是全部出站请求的唯一出口（远程模式下连 /api/* 也走这里），原来固定 6 个线程，
+   * 长请求占满之后新请求只能干等；而页面侧的计时是「请求发出」就开始跑的，排队时间
+   * 照样算进去 —— 于是到点抛出一句指向接口的假原因。
+   *
+   * 下面这些断言钉的是「写法」，因为这几个坑一旦被改回去，现象会原样复现，
+   * 而且复现出来的文案仍然是误导性的。
+   */
+  const HB_CLI = read('client/src/com/zyplnn/lxclient/HttpBridge.java')
+  const HB_SHELL = read('android/src/com/zyplnn/musicedge/HttpBridge.java')
+
+  /**
+   * ⚠ 结构类断言必须**先剔注释**。
+   * 理由：上面那段「为什么不用 LinkedBlockingQueue」的注释里，反面写法是**按名字**
+   * 点出来的（否则下一个人照样会踩）—— 于是注释里必然出现那些字面量，
+   * 拿整个文件做「不包含 XXX」的断言会永远红。这是本项目反复踩过的坑：
+   * 护栏断的是「写法」，就得先把说明文字剔干净。
+   */
+  const deComment = (s) => s.replace(/\/\*[\s\S]*?\*\//g, '').replace(/\/\/[^\n]*/g, '')
+  const HB_CLI_C = deComment(HB_CLI)
+  const HB_SHELL_C = deComment(HB_SHELL)
+
+  const noFixed = (s) => !/newFixedThreadPool\s*\(/.test(s)
+  ok('两个 HttpBridge 都不再用固定线程池（固定 6 个 = 长请求占满后全体排队）',
+    noFixed(HB_CLI_C) && noFixed(HB_SHELL_C))
+  ok('线程池改成弹性 ThreadPoolExecutor，且有明确上限（手机上不许无界起线程）',
+    /new\s+ThreadPoolExecutor\(/.test(HB_CLI_C)
+    && /MAX_THREADS\s*=\s*\d+/.test(HB_CLI_C)
+    && /MaximumPoolSize|MAX_THREADS/.test(HB_CLI_C))
+  // 无界队列会让 maximumPoolSize 形同虚设（线程只在队列满时扩容）——这个坑极隐蔽
+  ok('队列容量为 0（SynchronousQueue）：满员立刻拒掉，而不是默默排队到页面超时',
+    /new\s+SynchronousQueue</.test(HB_CLI_C)
+    && !/LinkedBlockingQueue/.test(HB_CLI_C) && !/ArrayBlockingQueue/.test(HB_CLI_C))
+  ok('核心线程允许空闲回收（不然后台挂一整晚也常驻 6 个线程）',
+    /allowCoreThreadTimeOut\(true\)/.test(HB_CLI_C))
+  ok('满员时如实回投「桥太忙」，不让异常冒出去变成一句无意义的系统文案',
+    /catch\s*\(\s*RejectedExecutionException/.test(HB_CLI_C)
+    && /桥太忙/.test(HB_CLI))
+
+  // 总预算：原来每跳各自用满 timeout，5 跳最坏 150 秒，页面侧早就到点了
+  const exe = HB_CLI.slice(HB_CLI.indexOf('private String execute('),
+    HB_CLI.indexOf('private HttpURLConnection open('))
+  ok('execute() 切出来了（否则下面几条是空断言）', exe.length > 600, String(exe.length))
+  ok('一条请求（含全部重定向跳）共享一份总预算，不再每跳各给满 timeout',
+    /deadline\s*=/.test(exe) && /Math\.min\(\s*remain\s*,\s*timeout\s*\)/.test(exe))
+  ok('超预算时返回「已重定向几次」这种可查的文案，而不是笼统超时',
+    /请求超时（已重定向/.test(exe))
+  ok('连不上 / 读断了的错误文案带上地址（否则不知道是哪个音源挂了）',
+    /网络错误：[\s\S]{0,60}currentUrl/.test(exe))
+  ok('单跳超时被单独接住（SocketTimeoutException 必须在 IOException 之前）',
+    exe.indexOf('catch (SocketTimeoutException') >= 0
+    && exe.indexOf('catch (SocketTimeoutException') < exe.indexOf('catch (IOException'))
+
+  // 页面侧守卫必须**晚于**原生侧，否则真实原因永远传不回来
+  ok('页面侧等待上限比原生侧晚到（HTTP_GUARD = HTTP_TIMEOUT + 余量）',
+    /HTTP_GUARD\s*=\s*HTTP_TIMEOUT\s*\+/.test(NATIVEJS))
+  ok('装进 pendingHttp 的那个定时器用的是 HTTP_GUARD（改回 HTTP_TIMEOUT 就白改了）',
+    /\}\s*,\s*HTTP_GUARD\)/.test(NATIVEJS)
+    && /setTimeout\([\s\S]{0,400}?HTTP_GUARD\)/.test(NATIVEJS))
+  ok('发给原生侧的读超时仍是 HTTP_TIMEOUT（两者是两件事，别合成一个常量）',
+    /timeout:\s*HTTP_TIMEOUT/.test(NATIVEJS))
+
+  /**
+   * 两份 HttpBridge 是同一个类的两个副本，最怕「只改了一份」——
+   * 上面刚踩过：连接复用的修复只落在 client/ 那份，壳里那份还在 disconnect()。
+   * 这里做**去注释后逐行比对**：以后新增任何一处差异都会在这里红掉。
+   */
+  const stripForCmp = (s) => s
+    .replace(/\/\*[\s\S]*?\*\//g, '')
+    .replace(/\/\/[^\n]*/g, '')
+    .replace(/\b(?:Main|Client)Activity\b/g, 'XActivity')
+    .replace(/\b(?:musicedge|lxclient)\b/g, 'X')
+    .split('\n').map((l) => l.trim()).filter(Boolean).join('\n')
+  ok('两份 HttpBridge 除注释外逐行一致（改一份就必须改另一份）',
+    stripForCmp(HB_CLI) === stripForCmp(HB_SHELL))
+
+  // 失败要给出路：早先只画一句错误文案，「新建 / 导入」跟着消失
+  const libCatch = (/async function pageLibrary\(\)[\s\S]*?catch \(e\) \{([\s\S]*?)\n    \}/.exec(APPJS) || ['', ''])[1]
+  ok('pageLibrary 的失败分支切出来了（否则下面两条是空断言）', libCatch.length > 60, String(libCatch.length))
+  ok('「我的歌单」加载失败时保留标题栏（新建 / 导入 不会跟着一起消失）',
+    /libraryHead\(\)/.test(libCatch))
+  ok('「我的歌单」加载失败时给出「重试」，且事件分支存在',
+    /data-act="reload-library"/.test(libCatch) && /case 'reload-library':/.test(APPJS))
+}
+
 /* ══════════════ 收尾 ══════════════ */
 
 console.log('\n' + '='.repeat(62))

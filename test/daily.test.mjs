@@ -13,17 +13,25 @@ function ok(name, cond, extra = '') {
 /* ---------- fake 基建 ---------- */
 
 // 内存 D1 替身：只实现 daily.js 用到的 prepare().bind().first()/run()/all()
+//
+// settings 表也要有：每日推荐要读「生效的搜索源」（src/server/sources.js），
+// 还要把自己这次用的音源签名记下来（daily.sources）。替身缺这张表时
+// lastSourcesSig 会返回 null（= 读不到），于是「音源没变就不重算」这条就测不出来了。
 function fakeDb() {
   const daily = new Map()   // date -> row
+  const settings = new Map() // k -> v
   const tables = { playlists: [], play_progress: [], search_history: [] }
   return {
-    _tables: tables, _daily: daily,
+    _tables: tables, _daily: daily, _settings: settings,
     prepare(sql) {
       const s = sql.toUpperCase()
       const chain = {
         _args: [],
         bind(...a) { this._args = a; return this },
         async first() {
+          if (s.includes('FROM SETTINGS')) {
+            return settings.has(this._args[0]) ? { v: settings.get(this._args[0]) } : null
+          }
           if (s.includes('FROM DAILY_RECOMMEND')) return daily.get(this._args[0]) || null
           if (s.includes('FROM PLAY_PROGRESS') && s.includes('GROUP BY')) {
             const rows = tables.play_progress
@@ -40,6 +48,10 @@ function fakeDb() {
           return { results: [] }
         },
         async run() {
+          if (s.includes('INTO SETTINGS')) {
+            settings.set(this._args[0], this._args[1])
+            return { success: true }
+          }
           if (s.includes('INSERT INTO DAILY_RECOMMEND')) {
             const [date, title, songs, generatedAt, generator] = this._args
             daily.set(date, { date, title, songs, generated_at: generatedAt, generator })
@@ -182,6 +194,39 @@ const searchEmpty = async () => ({ list: [] })
     })
   } catch { threw = true }
   ok('兜底也搜不到时向上抛错', threw)
+
+  /* 4g. 音源必须来自「默认搜索源」设置 —— 2026-10-09 报障的根因
+   *
+   * 原来这里写死 ['kg','wy','kw']（酷狗排第一），于是管理后台把默认搜索源改成
+   * 只用网易云之后，搜索听话、每日推荐照样推酷狗。下面两条把「读设置」这件事钉死：
+   *   · 传给搜索的 sources 就是设置里那一份（不是写死的清单）；
+   *   · 设置变了，当天那份要重算（否则改完设置得等到第二天）。
+   */
+  const db6 = withHistory(fakeDb(), [], [])
+  const env6 = fakeEnv({ DB: db6 })
+  const seen = []
+  const spy = async (q, opts) => { seen.push((opts && opts.sources || []).join(',')); return searchOk(q) }
+  await db6.prepare('INSERT OR REPLACE INTO settings (k, v) VALUES (?,?)').bind('search.sources', 'wy').run()
+  const rec6 = await generateDaily(env6, db6, { force: true, toWeb: (s) => s, aiFn: aiOk(aiSongs), searchFn: spy })
+  ok('每日推荐传下去的源 = 设置里那一份（这里只勾了网易云）',
+    seen.length > 0 && seen.every((s) => s === 'wy'), seen.join(' / '))
+  ok('用了设置的源也能正常出结果', rec6.songs.length === 12)
+
+  // 设置没变 → 当天不重算（老行为不能丢）
+  let again = 0
+  const rec7 = await generateDaily(env6, db6, {
+    force: false, aiFn: async () => { again++; return { title: 'x', songs: [] } }, searchFn: spy,
+  })
+  ok('音源没变 → 当天那份直接复用，不重算', again === 0 && rec7.title === rec6.title)
+
+  // 设置变了 → 重算（不然「改了设置不生效」要一直挂到第二天）
+  await db6.prepare('INSERT OR REPLACE INTO settings (k, v) VALUES (?,?)').bind('search.sources', 'kw').run()
+  let called6 = 0
+  const rec8 = await generateDaily(env6, db6, {
+    force: false, toWeb: (s) => s, aiFn: async () => { called6++; return { title: '换源之后', songs: aiSongs } }, searchFn: spy,
+  })
+  ok('音源设置变了 → 当天那份立刻重算', called6 === 1 && rec8.title === '换源之后')
+  ok('重算时用的是新设置（酷我）', seen[seen.length - 1] === 'kw', seen.join(' / '))
 }
 
 /* ---------- 5. resolveAiSongs ---------- */

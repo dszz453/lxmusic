@@ -18,8 +18,25 @@
 
 import { generatePlaylist } from '../lib/ai.js'
 import { searchOnline, parseQuery } from '../providers/index.js'
-import { listPlayHistory, listSearchHistory } from '../db.js'
+import { listPlayHistory, listSearchHistory, getSetting, setSetting } from '../db.js'
+// searchSources 的第二个参数要的是**这个 db 模块**（它带 getSetting），不是 D1 句柄 ——
+// 本文件里 `db` 这个名字到处都是句柄，所以显式再 import 一次模块，避免看错。
+import * as dbmod from '../db.js'
 import { HOME_KEYWORDS } from './keywords.js'
+// 「用哪些音源」读的是**和搜索同一份**设置（见 sources.js）。
+// 早先这里写死了 ['kg','wy','kw']，于是「默认搜索源」改成只用网易云之后，
+// 每日推荐照样推酷狗 —— 两处口径不一致是 2026-10-09 老板报障的根因。
+import { searchSources } from './sources.js'
+
+/**
+ * 生成当日推荐时用的是哪份音源（逗号分隔的签名）。
+ *
+ * 为什么要把签名存下来：daily_recommend 是按「北京时间日期」一行缓存的，
+ * 当天生成过就不再重算。可音源设置是随时能改的 —— 不记签名的话，
+ * 用户改完设置要**等到第二天**才生效，表现还是「设置不起作用」。
+ * 存了签名就能在设置变化时把当天那份重算一次（代价是几十秒的后台请求，一天最多一次）。
+ */
+const DAILY_SOURCES_SETTING = 'daily.sources'
 
 /** 一天生成多少首（AI 生成数）。搜索后可能少几首，所以目标比展示略多。 */
 const TARGET_COUNT = 24
@@ -91,7 +108,9 @@ async function fallbackSongs(env, db, searchFn = searchOnline) {
   // 随机起点 + 每次手动刷新 +1，让兜底路径的「换一批」也有变化
   const idx = (day + Math.floor(Math.random() * HOME_KEYWORDS.length)) % HOME_KEYWORDS.length
   const keyword = HOME_KEYWORDS[idx]
-  const parsed = parseQuery(keyword, ['kg', 'wy', 'kw'])
+  // 音源走全站设置（与「搜索」同一份），不再写死
+  const sources = await searchSources(env, dbmod)
+  const parsed = parseQuery(keyword, sources)
   const res = await searchFn(parsed.keyword, { sources: parsed.sources, limit: TARGET_COUNT, pluginPool: env.PLUGIN_POOL })
   return { title: '今日精选 · ' + keyword, songs: res.list, generator: 'fallback', keyword }
 }
@@ -103,7 +122,8 @@ async function fallbackSongs(env, db, searchFn = searchOnline) {
  * searchFn 可注入（单测用），默认真搜索。
  */
 export async function resolveAiSongs(env, db, aiSongs, searchFn = searchOnline) {
-  const parsed = parseQuery('', ['kg', 'wy', 'kw'])
+  // 同上：音源跟「搜索」共用一份设置，别在这里另立一套
+  const parsed = parseQuery('', await searchSources(env, dbmod))
   const out = []
   let cursor = 0
   async function worker() {
@@ -130,9 +150,15 @@ export async function resolveAiSongs(env, db, aiSongs, searchFn = searchOnline) 
  */
 export async function generateDaily(env, db, { userId = null, force = false, toWeb = null, aiFn = generatePlaylist, searchFn = searchOnline } = {}) {
   const date = todayBJ()
+  // 这一轮该用哪些音源 —— 与「搜索」读同一份设置（见 sources.js）
+  const sig = (await searchSources(env, dbmod)).join(',')
   if (!force) {
     const existing = await getDaily(db, date)
-    if (existing) return existing
+    const prev = await lastSourcesSig(db)
+    // prev === null 表示「读不到签名」（替身/异常），那种情况按老行为直接用当天那份；
+    // prev 是空串则说明是**老库**、从没记过签名 —— 当作变了，重算一次，
+    // 这正是「升级后才第一次生效」的那一次（否则老板今天还得继续听酷狗）。
+    if (existing && (prev === null || prev === sig)) return existing
   }
 
   const web = (s) => (toWeb ? toWeb(s) : s)
@@ -160,7 +186,26 @@ export async function generateDaily(env, db, { userId = null, force = false, toW
   if (!record.songs.length) throw new Error('每日推荐生成失败：搜索源无返回')
 
   await saveDaily(db, record)
+  // 记下这次用的音源：下次改了设置才知道该不该重算
+  await rememberSourcesSig(db, sig)
   return record
+}
+
+/**
+ * 上次生成时用的音源签名。
+ * 返回 null = **读不出来**（没有 settings 表 / 查询失败），调用方据此退化成老行为；
+ * 返回空串 = 读得到但没记过（老库、本次升级后的第一轮）。
+ */
+async function lastSourcesSig(db) {
+  try {
+    const v = await getSetting(db, DAILY_SOURCES_SETTING, null)
+    return v == null ? '' : String(v)
+  } catch { return null }
+}
+
+/** 记下音源签名。记不上不影响推荐本身 —— 只是下次会多重算一次。 */
+async function rememberSourcesSig(db, sig) {
+  try { await setSetting(db, DAILY_SOURCES_SETTING, sig) } catch { /* 下次再记 */ }
 }
 
 /** 读某天的推荐。没有返回 null。 */

@@ -1110,7 +1110,15 @@
             // 空状态里再放一遍，同一屏会出现两个一模一样功能的按钮。
             '<div style="margin-top:16px"><a class="btn btn--sm" href="#/ai">' + ICON.sparkle + 'AI 生成歌单</a></div>'))
     } catch (e) {
-      view.innerHTML = emptyState('加载失败', esc((e && e.message) || ''))
+      /**
+       * 失败时**保留标题栏**：早先这里只画一句错误文案，于是「新建」「导入」两个
+       * 入口跟着一起消失，用户连自救的余地都没有。再加一个「重试」——
+       * 桥忙、网络抖一下这类失败重来一次就好了（客户端里那句
+       * 「桥请求超时: /api/playlists」正是这类，见 native.js 的 HTTP_GUARD）。
+       */
+      view.innerHTML = '<section class="section">' + libraryHead() + '</section>'
+        + emptyState('加载失败', esc((e && e.message) || '请检查网络后重试'),
+          '<button class="btn btn--sm" data-act="reload-library" style="margin-top:14px">重试</button>')
     }
   }
 
@@ -2717,6 +2725,8 @@
       case 'back': back(); break
       case 'nav': closeSheet(drawer); go(node.dataset.href); break
       case 'reload-home': App.home = null; pageHome(); break
+      // 只重画当前页，不清任何缓存 —— 「我的歌单」本来就是每次现取，没有可清的缓存
+      case 'reload-library': pageLibrary(); break
       case 'do-search': doSearch(); break
       case 'switch-source': {
         const src = node.dataset.source
@@ -3168,6 +3178,35 @@
 
   /* ================= 启动 ================= */
 
+  /**
+   * 「身份没问到」之后的补确认（见 boot() 里 tokenRejected / offline 的分法）。
+   *
+   * 为什么要补：网络类失败几乎都是瞬时的 —— 服务器正在重启（Docker 里 `docker pull`
+   * 之后那几十秒）、手机刚从电梯里出来、切了一次基站。这种情况下用户什么都没做错，
+   * 界面却停在「未登录」上，唯一的自救是退出登录再登回来，纯属折磨。
+   * 悄悄补一次就能自愈。
+   *
+   * 为什么要退避、要限次数：失败时说明服务端确实够不着，密集重试只会更糟；
+   * 而且这只是**兜底**，不是主路径（正常情况一次就够）。
+   *
+   * 补到了为什么**不重新路由**：那会把用户正在看的页面整个重画一遍（歌单详情回到
+   * 顶部、首页重新滚）。身份本来就是同一个人，只是 isAdmin 之类的细节变准了，
+   * 下次切换页面自然就对了 —— 这里只把内存里的身份修正掉。
+   */
+  let identityRetry = 0
+  function confirmIdentityLater() {
+    if (identityRetry >= 2) return
+    identityRetry++
+    setTimeout(() => {
+      API.me().then((r) => {
+        if (!r || !r.user) return
+        App.user = r.user
+        App.offline = false
+        rememberUser(r.user.username)
+      }).catch(() => { /* 还是够不着：交给用户下次操作时自然重试 */ })
+    }, 3000 * identityRetry)
+  }
+
   async function boot() {
     // 品牌名要在**最早**就确认，而且与登录状态无关 —— 放在这里而不是下面
     // 「已登录」之后，是因为未登录时走的是两个提前 return 的分支
@@ -3231,7 +3270,31 @@
       return
     }
 
-    if (meRes.error || !meRes.user) {
+    /**
+     * 身份没确认成 —— 先分清是「**哪种**没确认成」，这是 2026-10-09 报障的根因。
+     *
+     * 老板原话：「首页因为有缓存展示很快，但我的歌单很慢、发现显示一直是未登录状态，
+     * 登录之后就正常了」。这条链路串起来看只有一个解释：
+     *
+     *   这里原来写的是 `if (meRes.error || !meRes.user) { 清令牌 → 跳登录页 }`，
+     *   而 `meRes.error` 里装的是**任何**失败 —— 包括网络超时、桥请求超时、
+     *   服务器重启中、手机切基站。于是「服务器重启了一下」被当成「你被登出了」：
+     *   令牌被当场擦掉，身份变 null，用户必须重新输密码。
+     *   而首页因为有磁盘缓存照旧渲染得很快 —— 于是现象看起来就只是「登录状态不对」。
+     *
+     * 正确的分法：
+     *   · 服务端**明确**回 401/403 = 「这个令牌我不认」→ 这才是换人了/过期了，
+     *     清令牌、清身份、回登录页（否则会拿着一个死令牌一直转圈）；
+     *   · 其余（超时/断网/5xx/没连上）= **只是没问到**，令牌多半还好好的 →
+     *     保留令牌与上一次的身份继续渲染，别把用户踢出去。
+     *     这类失败在各个页面自己会报错，界面该出得来还是出得来。
+     *
+     * 为什么不能图省事「失败就登出」：用户在外面听歌，服务器一重启或信号一抖，
+     * 他就得重新输一次密码 —— 而这是他自己完全无法理解、也无法避免的事。
+     */
+    const meStatus = meRes.error ? meRes.error.status : 0
+    const tokenRejected = meStatus === 401 || meStatus === 403
+    if (tokenRejected) {
       API.setToken('')
       App.user = null
       // 令牌作废 = 换人了，临时身份也要跟着清（否则首帧会读到上一个人的缓存）
@@ -3240,9 +3303,27 @@
       await route()
       return
     }
-    App.user = meRes.user
-    // 记下身份：下一次冷启动的首帧要靠它读磁盘缓存（见 currentUser 的说明）
-    rememberUser(App.user && App.user.username)
+    if (meRes.error) {
+      // 问不到（超时/断网）：保留令牌与上次身份，按「已登录」继续渲染。
+      // 上一次的用户名可能为空（从没在这台设备登录过）—— 那确实是未登录，如实渲染。
+      const who = lastUserName()
+      App.user = who ? { username: who, isAdmin: false, unconfirmed: true } : null
+      App.offline = true
+      // 网络抖动多半是瞬时的：过几秒自己补确认一次，用户不用「退出再登进来」
+      confirmIdentityLater()
+    } else if (!meRes.user) {
+      // 服务端认了令牌却没给出用户 —— 理论上不该发生，按未登录处理，别让它悬着
+      API.setToken('')
+      App.user = null
+      rememberUser('')
+      location.hash = '#/login'
+      await route()
+      return
+    } else {
+      App.user = meRes.user
+      // 记下身份：下一次冷启动的首帧要靠它读磁盘缓存（见 currentUser 的说明）
+      rememberUser(App.user && App.user.username)
+    }
 
     App.ready = true
     /**

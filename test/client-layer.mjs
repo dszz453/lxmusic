@@ -269,7 +269,7 @@ console.log('\n== C. 有桥时的完整行为 ==')
   // 原生侧「当前底栏状态」——断言看它，而不是看调用次数。
   // 本层对 setRoute / setChrome 都做了**变化才上报**的去重（原生每收到一次就要
   // 重绘一遍底栏），所以「没有调用」和「归属正确」是两件事，混在一起断言必然写错。
-  const state = { route: null, chrome: null }
+  const state = { route: null, chrome: null, topbar: null }
   const native = {
     info: () => JSON.stringify({
       client: 'LX-MUSIC', version: '1.1', versionLine: 'V1.1',
@@ -284,6 +284,7 @@ console.log('\n== C. 有桥时的完整行为 ==')
     selectProfile: () => true,
     setRoute: (h) => { state.route = h; calls.push(['setRoute', h]) },
     setChrome: (v) => { state.chrome = v; calls.push(['setChrome', v]) },
+    setTopbar: (v) => { state.topbar = v; calls.push(['setTopbar', v]) },
     toast: (m) => calls.push(['toast', m]),
     copy: () => true,
     reload: () => calls.push(['reload']),
@@ -307,18 +308,34 @@ console.log('\n== C. 有桥时的完整行为 ==')
   ok('启动即把外壳置为显示（主 tab 上底栏要在）',
     chromes.length >= 1 && chromes[0] === true, JSON.stringify(chromes))
 
-  // 路由变化 → 归属跟着走
+  /**
+   * 顶栏与底栏是**两条独立的可见性**：主 tab 上顶栏要露（它是搜索/菜单/设置的入口），
+   * 二级页上要收（页面自带 .searchbar 头部，叠起来就是「两个搜索框」，而上面那个胶囊
+   * 在搜索页点了原地不动 —— 老板 2026-10-09 报障）。
+   */
+  ok('启动在主 tab → 顶栏显示', state.topbar === true, String(state.topbar))
+
+  // 路由变化 → 归属跟着走；底栏归属没变，但**顶栏必须收**
   calls.length = 0
   env.setHash('#/search')
-  ok('进搜索页（归属仍是「发现」）→ 不重复上报（底栏不必重绘）',
-    calls.length === 0, JSON.stringify(calls))
+  const navCalls = calls.filter((c) => c[0] === 'setRoute' || c[0] === 'setChrome')
+  ok('进搜索页（归属仍是「发现」）→ 底栏不重复上报（不必重绘）',
+    navCalls.length === 0, JSON.stringify(navCalls))
   ok('而且归属确实还停在「发现」', state.route === '#/', String(state.route))
+  ok('进搜索页 → 收起原生顶栏（否则页面上会同时有两个搜索框）',
+    state.topbar === false && calls.some((c) => c[0] === 'setTopbar' && c[1] === false),
+    JSON.stringify(calls))
 
-  // 换到另一个主 tab → 必须上报
+  // 换到另一个主 tab → 必须上报，且顶栏要回来
   calls.length = 0
   env.setHash('#/library')
   ok('进「我的歌单」→ 归属跟着切过去',
     state.route === '#/library' && calls.some((c) => c[0] === 'setRoute'), JSON.stringify(calls))
+  ok('回到主 tab → 顶栏重新显示', state.topbar === true, String(state.topbar))
+
+  // 详情页（带参数的二级页）同样收顶栏
+  env.setHash('#/playlist/abc')
+  ok('歌单详情页（#/playlist/abc）→ 也收顶栏', state.topbar === false, String(state.topbar))
 
   // 登录页 → 收起底栏
   calls.length = 0
@@ -335,6 +352,23 @@ console.log('\n== C. 有桥时的完整行为 ==')
   ok('回到我的页 → 重新显示底栏并高亮「我的」',
     state.chrome === true && state.route === '#/mine',
     JSON.stringify([state.route, state.chrome, calls]))
+  ok('我的页是主 tab → 顶栏也回来', state.topbar === true, String(state.topbar))
+
+  /**
+   * reset()：原生外壳重建后（WebView 复用、页面不重载）要把去重状态清掉重报一次，
+   * 否则新外壳上顶栏默认是显示的，二级页就会多出一条来。
+   */
+  const before = calls.length
+  env.setHash('#/charts')
+  ok('进榜单页 → 收顶栏', state.topbar === false, String(state.topbar))
+  calls.length = 0
+  LX.nav.reset()
+  ok('reset() 会把当前可见性重新上报一次（原生重建外壳后靠它对齐）',
+    calls.some((c) => c[0] === 'setTopbar') && calls.some((c) => c[0] === 'setRoute')
+    && calls.some((c) => c[0] === 'setChrome'),
+    JSON.stringify(calls))
+  ok('reset() 上报的仍是「二级页 → 顶栏收起」', state.topbar === false, String(state.topbar))
+  ok('reset() 不是空转（确实补了上报）', calls.length >= 3 && before >= 0, String(calls.length))
 
   // 带参数的详情页 → 按前缀归属到对应主 tab
   env.setHash('#/playlist/abc')

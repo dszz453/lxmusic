@@ -95,6 +95,25 @@
 
   var last = null
   var lastChrome = null
+  var lastTopbar = null
+
+  /**
+   * 当前页面算不算「二级页」（主 tab 之外的那些）。
+   *
+   * 判据与 app.js 的 TAB_PATHS 完全一致：只有这四个主 tab 保留全局顶栏。
+   * 为什么必须有这条：二级页（搜索 / 榜单 / 歌单详情 / 设置…）自己就有
+   * `.searchbar` 头部（返回箭头 + 输入框），网页端靠
+   * `#app.is-subpage .topbar{display:none}` 把全局顶栏藏掉了；
+   * 但客户端那个顶栏是 **Java 画的**，CSS 管不到它 ——
+   * 于是搜索页上会同时出现「原生搜索胶囊」和「页面自己的搜索框」两个框，
+   * 而上面那个胶囊点了只是 `openRoute('#/search')`，在搜索页等于原地不动。
+   * 老板 2026-10-09 报障的原话就是「两个搜索框，上面的搜索框不能用」。
+   */
+  function isSubpage(path) {
+    var p = String(path || '')
+    if (p === '#' || p === '') p = '#/'
+    return MAIN.indexOf(p) < 0
+  }
 
   /** 上报当前路由（变化时才上报，避免每次滚动都惊动原生） */
   function report() {
@@ -115,6 +134,32 @@
       lastChrome = chrome
       LX.api.setChrome(chrome)
     }
+
+    // 二级页收起原生顶栏（与网页的 #app.is-subpage 同一条判据）
+    var topbar = !isSubpage(path)
+    if (topbar !== lastTopbar) {
+      lastTopbar = topbar
+      LX.api.setTopbar(topbar)
+    }
+  }
+
+  /**
+   * 清掉「变化才上报」的去重状态，然后重报一次。**由原生主动喊**。
+   *
+   * 为什么需要：原生外壳会被重建 —— 用户在播放中把 App 从「最近任务」划掉、
+   * Activity 被系统回收，重新点开时 WebView 是**复用**的（页面不会重新加载，
+   * 见 ClientActivity.onCreate 的说明），而新外壳上顶栏/底栏的默认状态是「都显示」。
+   * 此时本模块的去重状态还是旧的，它会以为原生那边已经对齐了，于是不再上报 ——
+   * 结果就是「明明在搜索页，顶栏又冒出来、两个搜索框又回来了」。
+   *
+   * 调用点：ClientActivity 的 onResume / onPageFinished（两条路都要，
+   * 一条管「复用 WebView 重建的外壳」，一条管「整页重载后的新页面」）。
+   */
+  function reset() {
+    last = null
+    lastChrome = null
+    lastTopbar = null
+    report()
   }
 
   function install() {
@@ -128,8 +173,10 @@
   LX.nav = {
     install: install,
     report: report,
+    reset: reset,
     resolve: resolve,
     isFullscreen: isFullscreen,
+    isSubpage: isSubpage,
     MAIN: MAIN,
     BELONG: BELONG,
     FULLSCREEN: FULLSCREEN,

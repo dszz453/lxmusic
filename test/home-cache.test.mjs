@@ -257,8 +257,30 @@ console.log('\n== 4c. 首帧不等网络：身份还没确认时也读得到自�
   ok('登录成功就记下身份（别只依赖 /api/me 那一趟）',
     (APPJS.match(/rememberUser\(res\.user && res\.user\.username\)/g) || []).length >= 2)
   ok('退出登录清掉临时身份', /case 'logout'[\s\S]{0,500}rememberUser\(''\)/.test(APPJS))
-  ok('令牌失效也清掉（那是换人了，不是断网）',
-    /meRes\.error[\s\S]{0,300}rememberUser\(''\)/.test(APPJS))
+  /**
+   * 「登出」的判据必须是服务端**明确拒绝**（401/403），不能是「这一趟没问到」。
+   *
+   * 2026-10-09 报障：手机上「发现页一直显示未登录，重新登录后才正常」。
+   * 根因就是这里把 meRes.error（超时 / 断网 / 服务器重启中）也当成了登出，
+   * 令牌被当场擦掉。下面几条把两个方向都钉住：
+   *   · 判据里有 401/403；
+   *   · 「被明确拒绝」分支确实清令牌、清身份、回登录页（否则拿着死令牌一直转圈）；
+   *   · 「只是没问到」分支**绝不**清令牌、绝不跳登录页（那等于把用户踢出去）。
+   */
+  ok('登出判据只看服务端明确拒绝（401/403），不是「没问到」',
+    /tokenRejected\s*=\s*[\s\S]{0,60}401[\s\S]{0,40}403/.test(APPJS))
+  const rejectedBranch = (/if \(tokenRejected\) \{([\s\S]*?)\n    \}/.exec(APPJS) || ['', ''])[1]
+  ok('被明确拒绝 → 清令牌 + 清身份 + 回登录页',
+    rejectedBranch.length > 40 && /API\.setToken\(''\)/.test(rejectedBranch)
+    && /rememberUser\(''\)/.test(rejectedBranch) && /#\/login/.test(rejectedBranch),
+    'len=' + rejectedBranch.length)
+  const offlineBranch = (/if \(meRes\.error\) \{([\s\S]*?)\n    \} else if \(!meRes\.user\)/.exec(APPJS) || ['', ''])[1]
+  ok('「没问到」那段切得出来（切不出来下面就是空断言）', offlineBranch.length > 80, 'len=' + offlineBranch.length)
+  ok('超时/断网**不**清令牌、**不**跳登录页（否则服务器重启一下用户就被登出了）',
+    offlineBranch.length > 80 && !/setToken/.test(offlineBranch)
+    && !/rememberUser\(''\)/.test(offlineBranch) && !/#\/login/.test(offlineBranch))
+  ok('断网时退回上一次的身份继续渲染（发现页才不会显示成未登录）',
+    /if \(meRes\.error\)[\s\S]{0,220}lastUserName\(\)/.test(APPJS))
   ok('身份确认后写入临时身份（下一次冷启动的首帧靠它）',
     /App\.user = meRes\.user[\s\S]{0,200}rememberUser\(App\.user/.test(APPJS))
 }

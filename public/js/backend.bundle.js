@@ -1,6 +1,6 @@
 /* 由 tools/build-app.mjs 自动生成，请勿手动修改。
- * 源摘要: 6043e2fad07f89d9
- * 模块数: 24
+ * 源摘要: 953529d1ab1e632f
+ * 模块数: 25
  *
  * 这是给安卓壳用的后端展平版：把 src/ 的 ESM 后端打成单个 IIFE，
  * 让 WebView 用普通 <script> 就能加载（file:// 下 ESM 会被同源策略拒绝）。
@@ -36,19 +36,16 @@ const { generatePlaylist, loadAiConfig, chatOnce, AI_PROVIDERS } = __require("sr
 const { PLUGIN_SCORES } = __require("src/generated/plugin-scores.js");
 const { BUNDLED_PLUGINS } = __require("src/generated/plugins.js");
 const db = __require("src/db.js");
+// 「生效的搜索源」只有一个口径来源（搜索 / 每日推荐 / 榜单都读它）。
+// 早先它在本文件里私有，daily.js 只能另写一份写死的清单 —— 那正是
+// 「默认搜索源改了不起作用」的根因，见 sources.js 顶部说明。
+const { searchSources, DEFAULT_SOURCES_SETTING } = __require("src/server/sources.js");
 const { importPlugin, removeImportedPlugin } = __require("src/server/plugin-import.mjs");
 const { generateDaily, getDaily, pickPrimaryUser, todayBJ } = __require("src/server/daily.js");
 const { HOME_KEYWORDS } = __require("src/server/keywords.js");
 const { versionInfo } = __require("src/version.js");
 
 const SESSION_TTL = 30 * 24 * 3600 * 1000
-
-/**
- * 读取「默认搜索源」配置（逗号分隔，如 "kg,wy,kw"），过滤出合法源。
- * 优先级：D1 settings `search.sources` > env `DEFAULT_SOURCES` > 全部平台。
- * 用户没选（空值）时返回 ALL_SOURCES，行为与旧版一致。
- */
-const DEFAULT_SOURCES_SETTING = 'search.sources'
 
 /**
  * 后台「默认搜索源」列表的**展示顺序**（含未被勾选的平台）。
@@ -82,15 +79,6 @@ async function sourceOrder(env, db) {
     return normalizeSourceOrder(seed)
   }
   return normalizeSourceOrder(raw)
-}
-
-async function searchSources(env, db) {
-  const raw = ((await db.getSetting(env.DB, DEFAULT_SOURCES_SETTING, '')) || '').trim()
-    || (env && env.DEFAULT_SOURCES ? String(env.DEFAULT_SOURCES) : '')
-  if (!raw) return ALL_SOURCES.slice()
-  const keys = raw.split(/[,，\s]+/).map(s => s.trim().toLowerCase()).filter(Boolean)
-  const valid = keys.filter(k => ALL_SOURCES.includes(k))
-  return valid.length ? valid : ALL_SOURCES.slice()
 }
 
 /**
@@ -7246,6 +7234,72 @@ async function listAllPlayHistory(db, limit = 200) {
   __exports.listAllPlayHistory = listAllPlayHistory;
 };
 
+__modules["src/server/sources.js"] = function (__exports, __require) {
+/**
+ * 「生效的搜索源」的**唯一口径**。
+ *
+ * ══════════════ 为什么值得单独一个文件 ══════════════
+ * 这份口径原来私有在 api.js 里（`searchSources`），而 daily.js 也要用它 ——
+ * 可 api.js 已经 `import { generateDaily } from './daily.js'`，反向再 import 就成环了。
+ * 当初图省事，daily.js 里直接写死了 `['kg', 'wy', 'kw']`（酷狗还排在第一位），
+ * 于是出现一个很隐蔽的不一致（2026-10-09 老板报障）：
+ *
+ *   · 「搜索」读 D1 设置 search.sources（管理后台的「默认搜索源」）—— 用户改了它生效；
+ *   · 「每日推荐」读那份写死的清单 —— 用户改成只用网易云，推来的还是酷狗的歌。
+ *
+ * 两处口径不一致的 bug 最难查：界面上改的东西在 A 处生效、在 B 处不生效，
+ * 用户只会说「设置不管用」，而代码里根本找不到那个设置被读了几次、各读的哪一份。
+ * 所以现在把它抽出来，谁要「这个实例现在该用哪些音源」都读这里，**不许再写第二份**。
+ *
+ * 优先级：D1 settings `search.sources` > env `DEFAULT_SOURCES` > 全部平台。
+ */
+const { ALL_SOURCES } = __require("src/providers/index.js");
+
+/** D1 settings 里的键：逗号分隔的平台 key，如 "wy,kw" */
+const DEFAULT_SOURCES_SETTING = 'search.sources'
+
+/**
+ * 读出当前生效的搜索源（有序：谁排在前面谁的结果更靠前）。
+ *
+ * ⚠ 第二个参数是 **src/db.js 那个模块本身**（它带 `getSetting`），不是 D1 句柄。
+ *   之所以容易看错：api.js 里 `import * as db from '../db.js'`，于是调用点写着
+ *   `searchSources(env, db)` —— 那个 `db` 是模块。参数名因此写成 settingsDb，
+ *   并且下面显式挡住「传成了句柄」的写法（句柄上没有 getSetting）：
+ *   传错时退化成「用默认源」而不是抛异常，**但这是写法错误，不是运行期可容忍的分支**。
+ *
+ * 为什么要吞异常：三个宿主的「设置表」并不是永远可用 ——
+ * 壳内 SQLite 替身、单元测试的内存替身都可能没有 settings 表。
+ * 那种情况下退回 `env.DEFAULT_SOURCES`，再退回全部平台，**绝不能让调用方因为
+ * 「读不到一个配置」而整个失败**（每日推荐、搜索都在这条路径上）。
+ */
+async function searchSources(env, settingsDb) {
+  let raw = ''
+  try {
+    if (settingsDb && typeof settingsDb.getSetting === 'function' && env && env.DB) {
+      raw = String((await settingsDb.getSetting(env.DB, DEFAULT_SOURCES_SETTING, '')) || '').trim()
+    }
+  } catch {
+    // 读不到设置（替身/老库）：交给 env 默认值兜底，别把上层一起拖挂
+    raw = ''
+  }
+  if (!raw) {
+    try {
+      raw = env && env.DEFAULT_SOURCES ? String(env.DEFAULT_SOURCES).trim() : ''
+    } catch {
+      raw = ''
+    }
+  }
+  if (!raw) return ALL_SOURCES.slice()
+  const keys = raw.split(/[,，\s]+/).map(s => s.trim().toLowerCase()).filter(Boolean)
+  const valid = keys.filter(k => ALL_SOURCES.includes(k))
+  return valid.length ? valid : ALL_SOURCES.slice()
+}
+
+  /* 导出挂载 */
+  __exports.DEFAULT_SOURCES_SETTING = DEFAULT_SOURCES_SETTING;
+  __exports.searchSources = searchSources;
+};
+
 __modules["src/server/plugin-import.mjs"] = function (__exports, __require) {
 /**
  * 服务端「手动导入插件」。
@@ -7634,8 +7688,25 @@ __modules["src/server/daily.js"] = function (__exports, __require) {
 
 const { generatePlaylist } = __require("src/lib/ai.js");
 const { searchOnline, parseQuery } = __require("src/providers/index.js");
-const { listPlayHistory, listSearchHistory } = __require("src/db.js");
+const { listPlayHistory, listSearchHistory, getSetting, setSetting } = __require("src/db.js");
+// searchSources 的第二个参数要的是**这个 db 模块**（它带 getSetting），不是 D1 句柄 ——
+// 本文件里 `db` 这个名字到处都是句柄，所以显式再 import 一次模块，避免看错。
+const dbmod = __require("src/db.js");
 const { HOME_KEYWORDS } = __require("src/server/keywords.js");
+// 「用哪些音源」读的是**和搜索同一份**设置（见 sources.js）。
+// 早先这里写死了 ['kg','wy','kw']，于是「默认搜索源」改成只用网易云之后，
+// 每日推荐照样推酷狗 —— 两处口径不一致是 2026-10-09 老板报障的根因。
+const { searchSources } = __require("src/server/sources.js");
+
+/**
+ * 生成当日推荐时用的是哪份音源（逗号分隔的签名）。
+ *
+ * 为什么要把签名存下来：daily_recommend 是按「北京时间日期」一行缓存的，
+ * 当天生成过就不再重算。可音源设置是随时能改的 —— 不记签名的话，
+ * 用户改完设置要**等到第二天**才生效，表现还是「设置不起作用」。
+ * 存了签名就能在设置变化时把当天那份重算一次（代价是几十秒的后台请求，一天最多一次）。
+ */
+const DAILY_SOURCES_SETTING = 'daily.sources'
 
 /** 一天生成多少首（AI 生成数）。搜索后可能少几首，所以目标比展示略多。 */
 const TARGET_COUNT = 24
@@ -7707,7 +7778,9 @@ async function fallbackSongs(env, db, searchFn = searchOnline) {
   // 随机起点 + 每次手动刷新 +1，让兜底路径的「换一批」也有变化
   const idx = (day + Math.floor(Math.random() * HOME_KEYWORDS.length)) % HOME_KEYWORDS.length
   const keyword = HOME_KEYWORDS[idx]
-  const parsed = parseQuery(keyword, ['kg', 'wy', 'kw'])
+  // 音源走全站设置（与「搜索」同一份），不再写死
+  const sources = await searchSources(env, dbmod)
+  const parsed = parseQuery(keyword, sources)
   const res = await searchFn(parsed.keyword, { sources: parsed.sources, limit: TARGET_COUNT, pluginPool: env.PLUGIN_POOL })
   return { title: '今日精选 · ' + keyword, songs: res.list, generator: 'fallback', keyword }
 }
@@ -7719,7 +7792,8 @@ async function fallbackSongs(env, db, searchFn = searchOnline) {
  * searchFn 可注入（单测用），默认真搜索。
  */
 async function resolveAiSongs(env, db, aiSongs, searchFn = searchOnline) {
-  const parsed = parseQuery('', ['kg', 'wy', 'kw'])
+  // 同上：音源跟「搜索」共用一份设置，别在这里另立一套
+  const parsed = parseQuery('', await searchSources(env, dbmod))
   const out = []
   let cursor = 0
   async function worker() {
@@ -7746,9 +7820,15 @@ async function resolveAiSongs(env, db, aiSongs, searchFn = searchOnline) {
  */
 async function generateDaily(env, db, { userId = null, force = false, toWeb = null, aiFn = generatePlaylist, searchFn = searchOnline } = {}) {
   const date = todayBJ()
+  // 这一轮该用哪些音源 —— 与「搜索」读同一份设置（见 sources.js）
+  const sig = (await searchSources(env, dbmod)).join(',')
   if (!force) {
     const existing = await getDaily(db, date)
-    if (existing) return existing
+    const prev = await lastSourcesSig(db)
+    // prev === null 表示「读不到签名」（替身/异常），那种情况按老行为直接用当天那份；
+    // prev 是空串则说明是**老库**、从没记过签名 —— 当作变了，重算一次，
+    // 这正是「升级后才第一次生效」的那一次（否则老板今天还得继续听酷狗）。
+    if (existing && (prev === null || prev === sig)) return existing
   }
 
   const web = (s) => (toWeb ? toWeb(s) : s)
@@ -7776,7 +7856,26 @@ async function generateDaily(env, db, { userId = null, force = false, toWeb = nu
   if (!record.songs.length) throw new Error('每日推荐生成失败：搜索源无返回')
 
   await saveDaily(db, record)
+  // 记下这次用的音源：下次改了设置才知道该不该重算
+  await rememberSourcesSig(db, sig)
   return record
+}
+
+/**
+ * 上次生成时用的音源签名。
+ * 返回 null = **读不出来**（没有 settings 表 / 查询失败），调用方据此退化成老行为；
+ * 返回空串 = 读得到但没记过（老库、本次升级后的第一轮）。
+ */
+async function lastSourcesSig(db) {
+  try {
+    const v = await getSetting(db, DAILY_SOURCES_SETTING, null)
+    return v == null ? '' : String(v)
+  } catch { return null }
+}
+
+/** 记下音源签名。记不上不影响推荐本身 —— 只是下次会多重算一次。 */
+async function rememberSourcesSig(db, sig) {
+  try { await setSetting(db, DAILY_SOURCES_SETTING, sig) } catch { /* 下次再记 */ }
 }
 
 /** 读某天的推荐。没有返回 null。 */
@@ -7854,7 +7953,7 @@ __modules["src/version.js"] = function (__exports, __require) {
  * 所以统一读这里，谁也别再各写各的。
  *
  * ── 两条版本线，别混 ──────────────────────────────────────────
- *   APP_VERSION      产品版本，人看的。改功能才动它。当前 V1.8
+ *   APP_VERSION      产品版本，人看的。改功能才动它。当前 V1.9
  *   APP_VERSION_CODE 整数构建号，Android 靠它判断「能不能覆盖安装」。
  *                    每次要发新版就 +1，**不能倒退、不能重复**，
  *                    否则手机上会报「应用未安装」（签名相同也装不上）。
@@ -7880,10 +7979,10 @@ __modules["src/version.js"] = function (__exports, __require) {
  */
 
 /** 产品版本（对外展示用）。每发一版升 0.1。 */
-const APP_VERSION = 'V1.8'
+const APP_VERSION = 'V1.9'
 
 /** Android versionCode：整数、单调递增、跨次发布不可重复。每发一版 +1。 */
-const APP_VERSION_CODE = 108
+const APP_VERSION_CODE = 109
 
 /** 人类可读的完整标识，日志/关于页用。 */
 const APP_ID = 'lxmusic'
