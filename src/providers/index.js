@@ -31,14 +31,26 @@ export function getProvider(source) {
   return PROVIDERS[source] || null
 }
 
-/** 解析 `wy:周杰伦` 这类前缀写法；无前缀时选第一个可用平台 */
-export function parseQuery(input, fallbackSources = ALL_SOURCES) {
+/**
+ * 解析 `wy:周杰伦` 这类前缀写法；无前缀时选第一个可用平台。
+ *
+ * `extraSources` 是**插件专有源**的 key 清单（如 `qsvip` 汽水VIP）——
+ * 它们不在 PROVIDERS 里，但同样该能用 `qsvip:xxx` 指定。
+ *
+ * ⚠ 前缀**必须靠名单校验**，不能只看形状：早先这里写的是 `[a-z]{2}`，
+ * 若直接放宽成「任意字母数字」，`us:xxx`、`mv:xxx` 这种歌名就会被误当成源前缀，
+ * 把真正的关键词吃掉一半。
+ */
+export function parseQuery(input, fallbackSources = ALL_SOURCES, extraSources = []) {
   const raw = String(input || '').trim()
-  const m = raw.match(/^(all|online|local|[a-z]{2})\s*[:：]\s*(.*)$/i)
+  const m = raw.match(/^(all|online|local|[a-z0-9_]{2,16})\s*[:：]\s*(.*)$/i)
   if (m) {
     const key = m[1].toLowerCase()
     if (PROVIDERS[key]) return { sources: [key], keyword: m[2].trim() }
     if (key === 'all' || key === 'online') return { sources: fallbackSources, keyword: m[2].trim() }
+    if (extraSources.some(s => String(s).toLowerCase() === key)) {
+      return { sources: [key], keyword: m[2].trim() }
+    }
   }
   return { sources: fallbackSources, keyword: raw }
 }
@@ -54,23 +66,89 @@ export function parseQuery(input, fallbackSources = ALL_SOURCES) {
  */
 export const SOURCE_TIMEOUT = 7000
 
+/**
+ * 插件搜索条目 → 本服务端统一的歌曲形状（对齐原生 provider 的 search 输出）。
+ *
+ * 各插件返回的字段名不统一（LX 规范用 interval/img，聚合源常见 duration/pic/cover），
+ * 这里一次收齐。id 优先 songmid —— 取流时插件拿到的就是它。
+ *
+ * interval 只信「秒」。插件若给毫秒，算出来的时长会离谱，
+ * 而 stream.js 的**试听片段**判据要吃这个值（体积÷时长）—— 一个 20 万秒的时长
+ * 会让任何正常曲目都看起来像片段。所以超过 3 小时的直接当没给。
+ */
+function normalizePluginSong(source, raw, from) {
+  if (!raw || typeof raw !== 'object') return null
+  const id = String(raw.songmid || raw.id || raw.hash || raw.rid || '').trim()
+  const name = String(raw.name || raw.title || '').trim()
+  if (!id || !name) return null
+  let interval = safeInt(raw.interval || raw.duration || 0)
+  if (interval > 10800) interval = 0
+  return {
+    source,
+    id,
+    songmid: id,
+    hash: raw.hash || (source === 'kg' ? id : ''),
+    albumId: raw.albumId || '',
+    mediaMid: raw.mediaMid || '',
+    name,
+    singer: String(raw.singer || raw.artist || ''),
+    albumName: String(raw.albumName || raw.album || ''),
+    interval,
+    img: String(raw.img || raw.pic || raw.cover || ''),
+    types: Array.isArray(raw.types) ? raw.types : [],
+    _plugin: from || '',
+  }
+}
+
 export async function searchOnline(keyword, { sources = ALL_SOURCES, page = 1, limit = 30, pluginPool = null, timeout = SOURCE_TIMEOUT } = {}) {
-  const targets = sources.filter(s => PROVIDERS[s])
+  /**
+   * 除内置平台外，**插件专有源**也在这里被接纳。
+   *
+   * 早先这里只认 `PROVIDERS[s]`，于是插件注册的 qsvip（汽水VIP）虽然声明了
+   * musicSearch，却永远不会被搜到 —— 插件等于废物。现在按「插件是否声明了
+   * musicSearch」判定，谁有能力谁参与，不必往 PROVIDERS 里塞假 provider。
+   */
+  const canPluginSearch = (s) => !!(pluginPool
+    && typeof pluginPool.supports === 'function'
+    && pluginPool.supports(s, 'musicSearch'))
+  const targets = sources.filter(s => PROVIDERS[s] || canPluginSearch(s))
   if (!targets.length || !keyword) return { list: [], total: 0, source: 'all', errors: [] }
 
   const perSource = Math.max(5, Math.ceil(limit / targets.length) + 5)
   const errors = []
   const settled = await Promise.all(targets.map(async src => {
-    const short = SOURCE_META[src] ? SOURCE_META[src].short : src
+    const short = SOURCE_META[src]
+      ? SOURCE_META[src].short
+      : (pluginPool && typeof pluginPool.sourceName === 'function' ? pluginPool.sourceName(src) : src)
     let timer = null
-    const result = await Promise.race([
+    const raceWith = (p) => Promise.race([
+      p,
+      new Promise(resolve => { timer = setTimeout(() => resolve({ ok: false, timeout: true }), timeout) }),
+    ])
+
+    if (!PROVIDERS[src]) {
+      const result = await raceWith(
+        pluginPool.invoke(src, 'musicSearch', { keyword, page, pagesize: perSource }, { timeout })
+          .then(r => ({ ok: !!r.value, value: r.value, plugin: r.plugin, errors: r.errors || [] }))
+          .catch(e => ({ ok: false, error: (e && e.message) || String(e) }))
+      )
+      if (timer) clearTimeout(timer)
+      if (result.ok) {
+        const raw = result.value
+        const items = Array.isArray(raw) ? raw : (raw && Array.isArray(raw.list) ? raw.list : [])
+        return items.map(x => normalizePluginSong(src, x, result.plugin)).filter(Boolean)
+      }
+      errors.push(result.timeout
+        ? `${short}: 响应超时（${timeout}ms 内未返回，已跳过）`
+        : `${short}: ${result.error || result.errors.join('; ') || '无结果'}`)
+      return []
+    }
+
+    const result = await raceWith(
       PROVIDERS[src].search(keyword, page, perSource)
         .then(r => ({ ok: true, list: r.list || [] }))
-        .catch(e => ({ ok: false, error: (e && e.message) || String(e) })),
-      new Promise(resolve => {
-        timer = setTimeout(() => resolve({ ok: false, timeout: true }), timeout)
-      }),
-    ])
+        .catch(e => ({ ok: false, error: (e && e.message) || String(e) }))
+    )
     if (timer) clearTimeout(timer)
     if (result.ok) return result.list
     errors.push(result.timeout

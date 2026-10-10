@@ -37,6 +37,41 @@ W() { cygpath -w "$1"; }                          # MSYS 路径 → Windows 路�
 LIST_WIN() { find "$@" | while read -r f; do cygpath -w "$f"; done; }
 
 APP_NAME="music-edge"
+# 2.6：给插件**专有源**开通道 —— 插件自己注册的源（汽水 `qsvip`「汽水VIP」）终于能被
+#      列出来 / 勾选 / 搜索取流，不再只是取流后端。
+#
+#  背景：插件池早就按插件声明的源 id 建好了索引（`pdone-qdy` / `wsl-quandou` 都注册了
+#  `qsvip`，声明 musicSearch/musicUrl/lyric），但服务端只把插件当**取流后端**用 ——
+#  searchOnline 里 `sources.filter(s => PROVIDERS[s])` 只认内置六平台、`/sources` 只回
+#  ALL_SOURCES、写入校验也是 `ALL_SOURCES.includes(k)`。结果是：装了插件、源也在，
+#  但**管理端勾不到、搜索不会路由过去**，等于「加了插件什么都没发生」。
+#
+#  ① **列出来**：PluginPool 新增 listSources() / sourceName()，把插件声明的源汇总成
+#     { key, name, actions, qualitys, plugins }。同一源被多个插件注册 → actions 取并集、
+#     插件都记上（取流时互为备份）；插件被删光则该源从清单里消失；加载失败的插件
+#     不进 bySource，也就列不出来。
+#  ② **口径唯一**：新增 `pluginSearchSourceKeys(env)`（src/server/sources.js，只定义这一处）
+#     = 非内置平台 ∩ 声明了 `musicSearch`。`local`（取流/歌词/封面）与 `git`（ikun 取流）
+#     都没有 musicSearch，因此**不会**被当成可搜源 —— 勾一个搜不了的源就是假开关。
+#     searchSources 的读取校验、`/admin/search-sources` 的写入校验、`/search`、subsonic
+#     搜索全部共用它（读写同一口径，避免「设置了不生效」那类最隐蔽的 bug）。
+#  ③ **真的路由过去**：searchOnline 的目标集改成 `PROVIDERS[s] || canPluginSearch(s)`；
+#     非内置源走 pluginPool.invoke(src,'musicSearch',{keyword,page,pagesize},{timeout})；
+#     返回值经 normalizePluginSong 归一成统一歌曲形状（id 优先 songmid、必须有 id+name、
+#     `interval > 10800` 当没给 —— 插件若给毫秒，试听片段的体积判据会被带偏）；
+#     插件失败记进 errors、不影响其它平台（既不抛、也不把结果清零）。
+#  ④ **前缀识别靠名单**：parseQuery 加第三参 extraSources。原来 `[a-z]{2}` 只够内置平台，
+#     放宽成 `[a-z0-9_]{2,16}` 后**必须**用 extraSources.some(...) 校验，否则 `us:xxx`、
+#     `mv:xxx` 这类歌名会被当成源前缀吃掉。内置平台仍优先认。
+#  ⑤ **顺序归一化**：normalizeSourceOrder(raw, extra) 只在 order 里**存过**时才保留插件源，
+#     不自动追加到末尾 —— 否则新源永远垫在队尾，用户排了也不算数。
+#  ⑥ **前端**：`/sources` 多回 pluginSources（带 searchable）；管理页「默认搜索源」那一列
+#     合并进去并给出缩短名；搜索页给插件源单独一行 chip（不挤进等分 nowrap 的七个）。
+#     ⚠「导入歌单」的来源下拉**仍只用内置 PLATFORMS** —— 那张表读的是 App.platformNames
+#     （现在含插件源），选了必然报「不支持的平台」。
+#
+#  护栏：test/plugin-sources.test.mjs（54 项）全绿。
+#
 # 2.5：修「播到一半就没了 —— 进度条只走 30~40 秒，音源标记 native · 直连」。CF 与 Docker 都有。
 #
 #  根因不在播放器，在**取流时的选优**：网易云 eapi 对**没有播放权限**的曲子并不报错，

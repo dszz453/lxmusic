@@ -791,6 +791,15 @@
       PLATFORMS.map(p => ({ key: p.key, name: p.short }))
     )
 
+    /*
+      显式指定了**插件专有源**（如 #/search?source=qsvip&q=…）时，单独补一个 chip
+      标出当前源。不并进上面那一行：那个 chips--fit 是等分 nowrap 的，正好容得下七个，
+      第八个会把整行挤变形（这正是当初把它们排成一行的原因）。
+    */
+    const extraChips = (source && !PLATFORMS.some(p => p.key === source))
+      ? [{ key: source, name: App.platformShort[source] || source }]
+      : []
+
     const bar = '<div class="searchbar">'
       + '<button class="icon-btn searchbar__back" data-act="back" aria-label="返回">' + ICON.back + '</button>'
       + '<input class="searchbar__input" id="searchInput" type="search" enterkeyhint="search" placeholder="'
@@ -803,6 +812,11 @@
       + '<div class="chips chips--fit">' + platformChips.map(c =>
         '<button class="chip' + (c.key === source ? ' is-active' : '') + '" data-act="switch-source" data-source="' + c.key + '">' + c.name + '</button>'
       ).join('') + '</div>'
+      + (extraChips.length
+        ? '<div class="chips">' + extraChips.map(c =>
+          '<button class="chip is-active" data-act="switch-source" data-source="' + esc(c.key) + '">' + esc(c.name) + '</button>'
+        ).join('') + '</div>'
+        : '')
 
     if (!q) {
       let history = []
@@ -1382,7 +1396,10 @@
       + '<div class="field"><div class="field__label">来源平台</div>'
       + '<select class="select" id="importSource">'
       + '<option value="">自动识别</option>'
-      + Object.keys(App.platformNames).map(k => '<option value="' + k + '">' + App.platformNames[k] + '</option>').join('')
+      // 只列**内置平台**，不要复用 App.platformNames —— 那张表现在也含插件专有源
+      // （qsvip 汽水VIP），而导入歌单只认平台 key（网易/汽水分享链、酷狗/酷我/QQ 歌单），
+      // 选中插件源必然报「不支持的平台」。这里是**导入**，不是搜索。
+      + PLATFORMS.map(p => '<option value="' + p.key + '">' + esc(p.name) + '</option>').join('')
       + '</select></div>'
       + '<button class="btn btn--block" id="btnImport">开始导入</button>'
       + '<div class="note" style="margin-top:12px">也可以直接填数字 ID，例如网易云热歌榜 <b>3778678</b>；或在前面加平台前缀，如 <b>kg:519669</b>。</div>'
@@ -3487,7 +3504,18 @@
      * 早先在这里 await，等于为了一个首屏用不上的东西白等一个来回。
      * 失败静默 —— 与原来 try/catch 吞掉的行为一致。
      */
-    API.sources().then((s) => { App.sources = (s && s.platforms) || [] }).catch(() => {})
+    API.sources().then((s) => {
+      App.sources = (s && s.platforms) || []
+      // 插件专有源（如 qsvip 汽水VIP）：补进名字表，否则搜索结果里的来源标签
+      // 会原样印出 `qsvip`，用户看不出那是汽水。
+      // 搜索页那一行 chips 仍只画内置六平台 —— 它是等分 nowrap、正好放得下七个的，
+      // 插件源靠显式 source 参数（#/search?source=qsvip&q=…）进入，见 pageSearch。
+      for (const p of ((s && s.pluginSources) || [])) {
+        if (!p || !p.key) continue
+        App.platformNames[p.key] = p.name || p.key
+        App.platformShort[p.key] = p.short || p.name || p.key
+      }
+    }).catch(() => {})
     Player.loadFavorites().catch(() => {})
     // 远程模式下音源插件在服务器那一侧跑，本机不加载插件池 ——
     // 少一批 Worker 的启动开销，也免得本机那套空池子被误当成「候选源」

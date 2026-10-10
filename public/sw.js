@@ -23,7 +23,13 @@
  *      同 v41 的道理：它走「同源静态资源 SWR」分支，不抬 VERSION 用户会先跑一版
  *      旧后端（还会把 30 秒片段当完整曲目交出去），要再刷一次才生效。
  */
-const VERSION = 'v42'
+ * v43：`js/backend.bundle.js` 又变了 —— 这一版给插件**专有源**开了通道：插件自己注册的源
+ *      （汽水 `qsvip`）现在能被列出 / 勾选 / 搜索取流；`js/admin.js` 与 `js/app.js` 也跟着改
+ *      （管理页把插件源并进「默认搜索源」那一列、搜索页给插件源单独一行 chip、
+ *      「导入歌单」下拉仍只用内置平台）。同 v41/v42 的道理：bundle 走「同源静态资源 SWR」
+ *      分支、admin/app 在 PRECACHE 里，不抬 VERSION 用户会先吃到一整轮旧前端。
+ */
+const VERSION = 'v43'
 const STATIC_CACHE = 'lxmusic-static-' + VERSION
 const SHELL_CACHE = 'lxmusic-shell-' + VERSION
 

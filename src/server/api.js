@@ -20,7 +20,7 @@ import * as db from '../db.js'
 // 「生效的搜索源」只有一个口径来源（搜索 / 每日推荐 / 榜单都读它）。
 // 早先它在本文件里私有，daily.js 只能另写一份写死的清单 —— 那正是
 // 「默认搜索源改了不起作用」的根因，见 sources.js 顶部说明。
-import { searchSources, DEFAULT_SOURCES_SETTING } from './sources.js'
+import { searchSources, pluginSearchSourceKeys, DEFAULT_SOURCES_SETTING } from './sources.js'
 import { importPlugin, removeImportedPlugin } from './plugin-import.mjs'
 import { generateDaily, getDaily, pickPrimaryUser, todayBJ, dailySourcesStale, requeryDailySources } from './daily.js'
 import { HOME_KEYWORDS } from './keywords.js'
@@ -40,15 +40,48 @@ const SESSION_TTL = 30 * 24 * 3600 * 1000
  */
 const SOURCES_ORDER_SETTING = 'search.sources.order'
 
-/** 把一串平台 key 归一化成 ALL_SOURCES 的完整排列（过滤非法值、补上缺失的新平台） */
-function normalizeSourceOrder(raw) {
+/**
+ * 把一串平台 key 归一化成完整排列（过滤非法值、补上缺失的新平台）。
+ *
+ * `extra` 是**插件专有源**（如 qsvip 汽水VIP）—— 它们不在 ALL_SOURCES 里，
+ * 但管理页那一列要能排它们，所以校验名单必须带上。不自动追加到末尾：
+ * 界面上是否渲染由调用方按插件清单决定，这里只负责「别把合法值当非法丢掉」。
+ */
+function normalizeSourceOrder(raw, extra = []) {
+  const known = ALL_SOURCES.concat(extra)
   const keys = String(raw || '').split(/[,，\s]+/).map(s => s.trim().toLowerCase()).filter(Boolean)
   const out = []
   for (const k of keys) {
-    if (ALL_SOURCES.includes(k) && !out.includes(k)) out.push(k)
+    if (known.includes(k) && !out.includes(k)) out.push(k)
   }
   for (const k of ALL_SOURCES) if (!out.includes(k)) out.push(k)
   return out
+}
+
+/**
+ * 插件专有源清单（不含内置平台）—— `/sources` 与 `/admin/search-sources` 共用一份。
+ *
+ * 只在这里定义一次：管理页画开关用的是它，前端显示来源名用的也是它，
+ * 两处各写一遍就会重演本项目最隐蔽的那类 bug（「后台能勾、搜索不认」）。
+ */
+function pluginSourceList(env) {
+  try {
+    const pool = env && env.PLUGIN_POOL
+    if (!pool || typeof pool.listSources !== 'function') return []
+    return pool.listSources()
+      .filter(s => !ALL_SOURCES.includes(s.key))
+      .map(s => ({
+        key: s.key,
+        name: s.name,
+        short: s.name,
+        actions: s.actions,
+        qualities: s.qualitys,
+        plugins: s.plugins,
+        searchable: s.actions.includes('musicSearch'),
+      }))
+  } catch {
+    return []
+  }
 }
 
 async function sourceOrder(env, db) {
@@ -57,9 +90,9 @@ async function sourceOrder(env, db) {
   if (!String(raw).trim()) {
     const fromActive = (await db.getSetting(env.DB, DEFAULT_SOURCES_SETTING, '')) || ''
     const seed = fromActive || (env && env.DEFAULT_SOURCES ? String(env.DEFAULT_SOURCES) : '')
-    return normalizeSourceOrder(seed)
+    return normalizeSourceOrder(seed, pluginSearchSourceKeys(env))
   }
-  return normalizeSourceOrder(raw)
+  return normalizeSourceOrder(raw, pluginSearchSourceKeys(env))
 }
 
 /**
@@ -519,7 +552,7 @@ async function cachedHomeFallbackByKey(env, keyword, sources, key) {
     const errors = []
     const [charts, parsed] = await Promise.all([
       cachedToplists(),
-      Promise.resolve(parseQuery(keyword, sources)),
+      Promise.resolve(parseQuery(keyword, sources, pluginSearchSourceKeys(env))),
     ])
 
     let hot = []
@@ -960,7 +993,8 @@ export async function handleApi(request, env, url) {
       const page = safeInt(url.searchParams.get('page'), 1) || 1
       const limit = Math.min(safeInt(url.searchParams.get('limit'), 30) || 30, 100)
 
-      const parsed = parseQuery(source ? `${source}:${q}` : q, await searchSources(env, db))
+      // 第三个参数是「插件专有源」名单：`qsvip:xxx` 这种前缀也要能认出来（见 parseQuery）
+      const parsed = parseQuery(source ? `${source}:${q}` : q, await searchSources(env, db), pluginSearchSourceKeys(env))
       const res = await searchOnline(parsed.keyword, {
         sources: parsed.sources, page, limit, pluginPool: env.PLUGIN_POOL,
       })
@@ -1458,6 +1492,14 @@ export async function handleApi(request, env, url) {
           for (const item of q) if (!bySource[s].qualities.includes(item)) bySource[s].qualities.push(item)
         }
       }
+      /**
+       * 插件专有源 —— 不在 ALL_SOURCES 里、由插件自己注册的源（如 qsvip 汽水VIP）。
+       *
+       * 管理页的「默认搜索源」要把它们画出来，否则用户根本没法把汽水勾上；
+       * 前端也靠这份名单把 `qsvip` 显示成「汽水VIP」，而不是一串字母 id。
+       * `searchable` 只说「能不能被搜」；取流能力看 actions 里有没有 musicUrl。
+       */
+      const pluginSources = pluginSourceList(env)
       return json({
         ok: true,
         active: await searchSources(env, db),
@@ -1477,6 +1519,7 @@ export async function handleApi(request, env, url) {
           plugins: (bySource[k] && bySource[k].plugins) || [],
           qualities: (bySource[k] && bySource[k].qualities) || [],
         })),
+        pluginSources,
       })
     }
 
@@ -1606,12 +1649,13 @@ export async function handleApi(request, env, url) {
         const keys = raw ? raw.split(/[,，\s]+/).map(s => s.trim().toLowerCase()).filter(Boolean) : []
         // 去重：重复的 key 会让同一个平台被搜两次（结果里出现两份去重前的重复项），
         // 界面上正常点不出来，但手工调接口 / 旧数据里是有的。
+        const known = ALL_SOURCES.concat(pluginSearchSourceKeys(env))
         const valid = []
-        for (const k of keys) if (ALL_SOURCES.includes(k) && !valid.includes(k)) valid.push(k)
-        if (keys.length && !valid.length) return bad(`未识别到有效音源（可用：${ALL_SOURCES.join('/')}）`)
+        for (const k of keys) if (known.includes(k) && !valid.includes(k)) valid.push(k)
+        if (keys.length && !valid.length) return bad(`未识别到有效音源（可用：${known.join('/')}）`)
         await db.setSetting(env.DB, DEFAULT_SOURCES_SETTING, valid.join(','))
         if (body.order != null) {
-          await db.setSetting(env.DB, SOURCES_ORDER_SETTING, normalizeSourceOrder(body.order).join(','))
+          await db.setSetting(env.DB, SOURCES_ORDER_SETTING, normalizeSourceOrder(body.order, pluginSearchSourceKeys(env)).join(','))
         }
         return json({
           ok: true,
@@ -1624,6 +1668,7 @@ export async function handleApi(request, env, url) {
         active: await searchSources(env, db),
         order: await sourceOrder(env, db),
         all: ALL_SOURCES,
+        pluginSources: pluginSourceList(env),
       })
     }
 

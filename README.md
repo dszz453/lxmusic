@@ -1,6 +1,6 @@
 # music-edge · 安卓 APP（自包含） + Cloudflare Workers 源码包
 
-> **当前版本：V2.5**
+> **当前版本：V2.6**
 >
 > 同一份 `src/` 同时服务三个宿主，靠**运行时宿主能力判定**分支，不做编译期分叉：
 > Cloudflare Workers（线上）、安卓壳（APK 内自带）、Docker（你自己的服务器）。
@@ -162,9 +162,9 @@ GH_TOKEN=ghp_xxx node tools/publish-github.mjs --dry    # 只看清单
 |---|---|---|
 | 后端 | 永远在设备内 | 跟着「服务器档案」走：**CF / Docker / 自建 / 内置**四选一 |
 | 名字 | 固定 `music-edge` | 由所连服务端自报（`music-edge` 或 `LX-MUSIC`） |
-| 版本 | 与服务端同号 V2.5 | **客户端独立版本线 V2.2**（服务端是 V2.5） |
+| 版本 | 与服务端同号 V2.6 | **客户端独立版本线 V2.3**（服务端是 V2.6） |
 | 包名 | `com.zyplnn.musicedge` | `com.zyplnn.lxclient`（可同时安装） |
-| 产物 | `dist/music-edge-2.5.apk` | `dist/lx-music-client-2.2.apk` |
+| 产物 | `dist/music-edge-2.6.apk` | `dist/lx-music-client-2.3.apk` |
 
 首启会问你连哪条线，之后随时可以从**顶栏的连接状态条**或设置里换。
 连上后品牌与版本按服务端自报显示 —— 连 CF 显示 `music-edge`，连 Docker 显示 `LX-MUSIC`。
@@ -768,13 +768,13 @@ body { overflow: hidden; }
 
 ## 一、安卓 APP（先看这个）
 
-**`dist/music-edge-2.5.apk`** —— 直接装到手机上即可，**装完不需要联网到本项目的服务器**。
+**`dist/music-edge-2.6.apk`** —— 直接装到手机上即可，**装完不需要联网到本项目的服务器**。
 
-- 包名 `com.zyplnn.musicedge`，versionCode 115 / versionName 2.5，最低 Android 5.0（API 21），目标 API 34
+- 包名 `com.zyplnn.musicedge`，versionCode 116 / versionName 2.6，最低 Android 5.0（API 21），目标 API 34
 - 桌面名称 **music-edge**
 - 已用 v1 + v2 + v3 三种方案签名，校验通过（`apksigner verify -v`）
 - 大小 900,058 字节，sha256 `6d4a6fb65c270981612e7df5eea3d9aa426f5247e26930f6640ceb2962824f80`
-- 通用客户端 `dist/lx-music-client-2.2.apk`（包名 `com.zyplnn.lxclient`，versionCode 112 / 2.2）
+- 通用客户端 `dist/lx-music-client-2.3.apk`（包名 `com.zyplnn.lxclient`，versionCode 113 / 2.3）
   954,044 字节，sha256 `2b0e8ac7ea97634f5156c4838f26f309d915a618174f7dd82d3ee9146181d989`；
   两个包的签名证书与在线资源**逐文件 sha256 均已核对一致**（26 个文件、0 处不一致；
   客户端包多出的 `js/client-layer.js` 与 `client-build.txt` 是构建期生成物，不在 `public/` 内）。

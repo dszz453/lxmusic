@@ -9,6 +9,7 @@
 import { md5 } from '../lib/crypto.js'
 import { encodeSongId, decodeSongId, encodeAlbumId, decodeAlbumId } from '../lib/songid.js'
 import { searchOnline, resolveLyric, resolvePic, parseQuery, SOURCE_META, ALL_SOURCES, getProvider } from '../providers/index.js'
+import { pluginSearchSourceKeys } from './sources.js'
 import { audioMime, guessAudioFormat, safeInt, decodeName } from '../lib/util.js'
 import { openAudioStream } from '../lib/stream.js'
 import { outboundFetch } from '../lib/http.js'
@@ -484,7 +485,8 @@ async function search(env, user, params, ctx, method) {
   const albumCount = Math.min(safeInt(params.get('albumCount'), 20) || 0, 100)
   const songOffset = safeInt(params.get('songOffset'), 0)
 
-  const { sources, keyword } = parseQuery(rawQuery, ALL_SOURCES)
+  // 第三参是插件专有源（如 qsvip），Subsonic 客户端同样可以 `qsvip:关键词` 指定
+  const { sources, keyword } = parseQuery(rawQuery, ALL_SOURCES, pluginSearchSourceKeys(env))
   if (!keyword) {
     return respond({ [method === 'search3' ? 'searchResult3' : 'searchResult2']: { song: [] } }, ctx)
   }

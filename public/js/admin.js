@@ -312,6 +312,15 @@
   // 以服务端返回的平台为准，不在前端写死列表 —— 写死的话加个平台就要改两处
   const scoreState = { platforms: [], tab: '', data: null, prefs: null, busy: false, err: null, rescoring: false }
 
+  /**
+   * 源 key → 展示名。内置平台与**插件专有源**都进这份表。
+   *
+   * 为什么单独一份：`shortOf` 原来只认 `/admin/plugin-scores` 的 platforms（纯内置六平台），
+   * 于是插件源在「默认搜索源」那一列里只能印成 `qsvip` 这种 id，用户根本认不出是汽水。
+   * 由 renderSources 每次重画时填充（它已经拿到了 /sources 的完整清单）。
+   */
+  const shortByKey = new Map()
+
   /*
     「默认搜索源」是否有没提交的改动。
 
@@ -364,11 +373,17 @@
       这一列现在是**可拖动排序**的 —— 顺序不是装饰，它就是搜索的尝试优先级。
       所以列表要按服务端的 order 渲染（含未勾选的平台），而不是按平台清单的固定顺序：
       否则拖完一刷新位置就回去了。见 saveSourceList 的注释。
+
+      **插件专有源**（如 qsvip 汽水VIP）与内置平台一起进这一列：它们是插件自己注册的源，
+      不在内置六平台里，但同样能被搜 —— 用户想把汽水勾上，前提是这里看得见它。
+      只列**声明了 musicSearch** 的：勾上一个不能搜的源，点了搜索没反应才是真的坑。
     */
-    const platformByKey = new Map((server.platforms || []).map(p => [p.key, p]))
-    const orderKeys = ((server.order && server.order.length ? server.order : (server.platforms || []).map(p => p.key)) || [])
+    const pluginSrc = (server.pluginSources || []).filter(p => p && p.searchable)
+    const platformByKey = new Map((server.platforms || []).concat(pluginSrc).map(p => [p.key, p]))
+    for (const p of platformByKey.values()) shortByKey.set(p.key, p.short || p.name || p.key)
+    const orderKeys = ((server.order && server.order.length ? server.order : Array.from(platformByKey.keys())) || [])
       .filter(k => platformByKey.has(k))
-    for (const p of (server.platforms || [])) if (orderKeys.indexOf(p.key) < 0) orderKeys.push(p.key)
+    for (const p of platformByKey.values()) if (orderKeys.indexOf(p.key) < 0) orderKeys.push(p.key)
 
     const srcRows = orderKeys.map((k, i) =>
       '<div class="srcrow" data-key="' + esc(k) + '">'
@@ -673,6 +688,7 @@
   }
 
   function shortOf(key) {
+    if (shortByKey.has(key)) return shortByKey.get(key)
     const p = ((scoreState.data && scoreState.data.platforms) || []).find(x => x.key === key)
     return (p && p.short) || key
   }

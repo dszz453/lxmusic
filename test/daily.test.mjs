@@ -8,9 +8,31 @@ import { readFileSync } from 'node:fs'
  * 去掉注释再做「不包含 / 签名」断言。
  * 注释里必然写着那条规则的**反面写法**（本文件就写了 `db.prepare is not a function`），
  * 直接拿整文件匹配会永远红。
+ *
+ * ⚠ 必须**字符串感知**：一条「块注释正则」一把梭会被字符串里的块注释起始符骗到。
+ *   `src/server/api.js` 里有一句普通字符串（`Accept` 请求头的通配写法），其中的
+ *   起始符会和后面真正的结束符配成一对，把中间的真代码连着吞掉 —— 今天恰好只吞到
+ *   相邻那个行内块注释、只丢 116 字符，属于运气；改成扫描式对字符串/转义原样搬运。
  */
 function deComment(src) {
-  return String(src).replace(/\/\*[\s\S]*?\*\//g, '').replace(/^\s*\/\/.*$/gm, '')
+  const s = String(src)
+  let out = '', i = 0
+  while (i < s.length) {
+    const c = s[i]
+    if (c === "'" || c === '"' || c === '`') {
+      let j = i + 1
+      while (j < s.length) {
+        if (s[j] === '\\') { j += 2; continue }
+        if (s[j] === c) { j++; break }
+        j++
+      }
+      out += s.slice(i, j); i = j; continue
+    }
+    if (c === '/' && s[i + 1] === '/') { const j = s.indexOf('\n', i); i = j < 0 ? s.length : j; continue }
+    if (c === '/' && s[i + 1] === '*') { const j = s.indexOf('*/', i + 2); i = j < 0 ? s.length : j + 2; continue }
+    out += c; i++
+  }
+  return out
 }
 
 let pass = 0, fail = 0

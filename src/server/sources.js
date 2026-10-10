@@ -54,6 +54,38 @@ export async function searchSources(env, settingsDb) {
   }
   if (!raw) return ALL_SOURCES.slice()
   const keys = raw.split(/[,，\s]+/).map(s => s.trim().toLowerCase()).filter(Boolean)
-  const valid = keys.filter(k => ALL_SOURCES.includes(k))
+  const known = ALL_SOURCES.concat(pluginSearchSourceKeys(env))
+  const valid = keys.filter(k => known.includes(k))
   return valid.length ? valid : ALL_SOURCES.slice()
+}
+
+/**
+ * 「可被搜索的插件专有源」的 key 清单 —— 不在 ALL_SOURCES 里、插件注册过、
+ * 且**声明了 musicSearch** 的那些（例如 pdone-qdy 的 `qsvip`「汽水VIP」）。
+ * 没有插件池 / 池子为空时回 []。
+ *
+ * 为什么只收 `musicSearch`：插件池里还有 `local`、`git` 这类只做取流/歌词的源，
+ * 它们**搜不了**。放开它们只会造出「后台能勾上、搜索却没反应」的假开关。
+ * 能搜才配进「搜索源」这一列，与 /sources 给前端的 `searchable` 是同一个判据。
+ *
+ * 为什么单独抽一个函数：`search.sources` 的**写入校验**（api.js 的
+ * /admin/search-sources）与**读取校验**（这里的 searchSources）必须同一口径。
+ * 两边各写一份的后果是最难查的那种不一致 —— 管理端能勾上、搜索却不认它，
+ * 用户看到的只有「我明明开了汽水，怎么搜不到」。本项目已经为「同一件事两份口径」
+ * 栽过至少两次（搜索源名单、D1 句柄），所以这里只留一处。
+ *
+ * 全程吞异常：三个宿主的插件池可用性不同（壳内延迟求值、测试替身可能没有池子），
+ * 「读不到插件清单」绝不能把搜索整条链路带挂。
+ */
+export function pluginSearchSourceKeys(env) {
+  try {
+    const pool = env && env.PLUGIN_POOL
+    if (!pool || typeof pool.listSources !== 'function') return []
+    return pool.listSources()
+      .filter(s => s.key && !ALL_SOURCES.includes(s.key))
+      .filter(s => Array.isArray(s.actions) && s.actions.includes('musicSearch'))
+      .map(s => s.key)
+  } catch {
+    return []
+  }
 }

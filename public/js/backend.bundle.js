@@ -1,5 +1,5 @@
 /* 由 tools/build-app.mjs 自动生成，请勿手动修改。
- * 源摘要: 1a510e35900bc481
+ * 源摘要: cfbc50702d9cc878
  * 模块数: 25
  *
  * 这是给安卓壳用的后端展平版：把 src/ 的 ESM 后端打成单个 IIFE，
@@ -39,7 +39,7 @@ const db = __require("src/db.js");
 // 「生效的搜索源」只有一个口径来源（搜索 / 每日推荐 / 榜单都读它）。
 // 早先它在本文件里私有，daily.js 只能另写一份写死的清单 —— 那正是
 // 「默认搜索源改了不起作用」的根因，见 sources.js 顶部说明。
-const { searchSources, DEFAULT_SOURCES_SETTING } = __require("src/server/sources.js");
+const { searchSources, pluginSearchSourceKeys, DEFAULT_SOURCES_SETTING } = __require("src/server/sources.js");
 const { importPlugin, removeImportedPlugin } = __require("src/server/plugin-import.mjs");
 const { generateDaily, getDaily, pickPrimaryUser, todayBJ, dailySourcesStale, requeryDailySources } = __require("src/server/daily.js");
 const { HOME_KEYWORDS } = __require("src/server/keywords.js");
@@ -59,15 +59,48 @@ const SESSION_TTL = 30 * 24 * 3600 * 1000
  */
 const SOURCES_ORDER_SETTING = 'search.sources.order'
 
-/** 把一串平台 key 归一化成 ALL_SOURCES 的完整排列（过滤非法值、补上缺失的新平台） */
-function normalizeSourceOrder(raw) {
+/**
+ * 把一串平台 key 归一化成完整排列（过滤非法值、补上缺失的新平台）。
+ *
+ * `extra` 是**插件专有源**（如 qsvip 汽水VIP）—— 它们不在 ALL_SOURCES 里，
+ * 但管理页那一列要能排它们，所以校验名单必须带上。不自动追加到末尾：
+ * 界面上是否渲染由调用方按插件清单决定，这里只负责「别把合法值当非法丢掉」。
+ */
+function normalizeSourceOrder(raw, extra = []) {
+  const known = ALL_SOURCES.concat(extra)
   const keys = String(raw || '').split(/[,，\s]+/).map(s => s.trim().toLowerCase()).filter(Boolean)
   const out = []
   for (const k of keys) {
-    if (ALL_SOURCES.includes(k) && !out.includes(k)) out.push(k)
+    if (known.includes(k) && !out.includes(k)) out.push(k)
   }
   for (const k of ALL_SOURCES) if (!out.includes(k)) out.push(k)
   return out
+}
+
+/**
+ * 插件专有源清单（不含内置平台）—— `/sources` 与 `/admin/search-sources` 共用一份。
+ *
+ * 只在这里定义一次：管理页画开关用的是它，前端显示来源名用的也是它，
+ * 两处各写一遍就会重演本项目最隐蔽的那类 bug（「后台能勾、搜索不认」）。
+ */
+function pluginSourceList(env) {
+  try {
+    const pool = env && env.PLUGIN_POOL
+    if (!pool || typeof pool.listSources !== 'function') return []
+    return pool.listSources()
+      .filter(s => !ALL_SOURCES.includes(s.key))
+      .map(s => ({
+        key: s.key,
+        name: s.name,
+        short: s.name,
+        actions: s.actions,
+        qualities: s.qualitys,
+        plugins: s.plugins,
+        searchable: s.actions.includes('musicSearch'),
+      }))
+  } catch {
+    return []
+  }
 }
 
 async function sourceOrder(env, db) {
@@ -76,9 +109,9 @@ async function sourceOrder(env, db) {
   if (!String(raw).trim()) {
     const fromActive = (await db.getSetting(env.DB, DEFAULT_SOURCES_SETTING, '')) || ''
     const seed = fromActive || (env && env.DEFAULT_SOURCES ? String(env.DEFAULT_SOURCES) : '')
-    return normalizeSourceOrder(seed)
+    return normalizeSourceOrder(seed, pluginSearchSourceKeys(env))
   }
-  return normalizeSourceOrder(raw)
+  return normalizeSourceOrder(raw, pluginSearchSourceKeys(env))
 }
 
 /**
@@ -538,7 +571,7 @@ async function cachedHomeFallbackByKey(env, keyword, sources, key) {
     const errors = []
     const [charts, parsed] = await Promise.all([
       cachedToplists(),
-      Promise.resolve(parseQuery(keyword, sources)),
+      Promise.resolve(parseQuery(keyword, sources, pluginSearchSourceKeys(env))),
     ])
 
     let hot = []
@@ -979,7 +1012,8 @@ async function handleApi(request, env, url) {
       const page = safeInt(url.searchParams.get('page'), 1) || 1
       const limit = Math.min(safeInt(url.searchParams.get('limit'), 30) || 30, 100)
 
-      const parsed = parseQuery(source ? `${source}:${q}` : q, await searchSources(env, db))
+      // 第三个参数是「插件专有源」名单：`qsvip:xxx` 这种前缀也要能认出来（见 parseQuery）
+      const parsed = parseQuery(source ? `${source}:${q}` : q, await searchSources(env, db), pluginSearchSourceKeys(env))
       const res = await searchOnline(parsed.keyword, {
         sources: parsed.sources, page, limit, pluginPool: env.PLUGIN_POOL,
       })
@@ -1477,6 +1511,14 @@ async function handleApi(request, env, url) {
           for (const item of q) if (!bySource[s].qualities.includes(item)) bySource[s].qualities.push(item)
         }
       }
+      /**
+       * 插件专有源 —— 不在 ALL_SOURCES 里、由插件自己注册的源（如 qsvip 汽水VIP）。
+       *
+       * 管理页的「默认搜索源」要把它们画出来，否则用户根本没法把汽水勾上；
+       * 前端也靠这份名单把 `qsvip` 显示成「汽水VIP」，而不是一串字母 id。
+       * `searchable` 只说「能不能被搜」；取流能力看 actions 里有没有 musicUrl。
+       */
+      const pluginSources = pluginSourceList(env)
       return json({
         ok: true,
         active: await searchSources(env, db),
@@ -1496,6 +1538,7 @@ async function handleApi(request, env, url) {
           plugins: (bySource[k] && bySource[k].plugins) || [],
           qualities: (bySource[k] && bySource[k].qualities) || [],
         })),
+        pluginSources,
       })
     }
 
@@ -1625,12 +1668,13 @@ async function handleApi(request, env, url) {
         const keys = raw ? raw.split(/[,，\s]+/).map(s => s.trim().toLowerCase()).filter(Boolean) : []
         // 去重：重复的 key 会让同一个平台被搜两次（结果里出现两份去重前的重复项），
         // 界面上正常点不出来，但手工调接口 / 旧数据里是有的。
+        const known = ALL_SOURCES.concat(pluginSearchSourceKeys(env))
         const valid = []
-        for (const k of keys) if (ALL_SOURCES.includes(k) && !valid.includes(k)) valid.push(k)
-        if (keys.length && !valid.length) return bad(`未识别到有效音源（可用：${ALL_SOURCES.join('/')}）`)
+        for (const k of keys) if (known.includes(k) && !valid.includes(k)) valid.push(k)
+        if (keys.length && !valid.length) return bad(`未识别到有效音源（可用：${known.join('/')}）`)
         await db.setSetting(env.DB, DEFAULT_SOURCES_SETTING, valid.join(','))
         if (body.order != null) {
-          await db.setSetting(env.DB, SOURCES_ORDER_SETTING, normalizeSourceOrder(body.order).join(','))
+          await db.setSetting(env.DB, SOURCES_ORDER_SETTING, normalizeSourceOrder(body.order, pluginSearchSourceKeys(env)).join(','))
         }
         return json({
           ok: true,
@@ -1643,6 +1687,7 @@ async function handleApi(request, env, url) {
         active: await searchSources(env, db),
         order: await sourceOrder(env, db),
         all: ALL_SOURCES,
+        pluginSources: pluginSourceList(env),
       })
     }
 
@@ -2575,14 +2620,26 @@ function getProvider(source) {
   return PROVIDERS[source] || null
 }
 
-/** 解析 `wy:周杰伦` 这类前缀写法；无前缀时选第一个可用平台 */
-function parseQuery(input, fallbackSources = ALL_SOURCES) {
+/**
+ * 解析 `wy:周杰伦` 这类前缀写法；无前缀时选第一个可用平台。
+ *
+ * `extraSources` 是**插件专有源**的 key 清单（如 `qsvip` 汽水VIP）——
+ * 它们不在 PROVIDERS 里，但同样该能用 `qsvip:xxx` 指定。
+ *
+ * ⚠ 前缀**必须靠名单校验**，不能只看形状：早先这里写的是 `[a-z]{2}`，
+ * 若直接放宽成「任意字母数字」，`us:xxx`、`mv:xxx` 这种歌名就会被误当成源前缀，
+ * 把真正的关键词吃掉一半。
+ */
+function parseQuery(input, fallbackSources = ALL_SOURCES, extraSources = []) {
   const raw = String(input || '').trim()
-  const m = raw.match(/^(all|online|local|[a-z]{2})\s*[:：]\s*(.*)$/i)
+  const m = raw.match(/^(all|online|local|[a-z0-9_]{2,16})\s*[:：]\s*(.*)$/i)
   if (m) {
     const key = m[1].toLowerCase()
     if (PROVIDERS[key]) return { sources: [key], keyword: m[2].trim() }
     if (key === 'all' || key === 'online') return { sources: fallbackSources, keyword: m[2].trim() }
+    if (extraSources.some(s => String(s).toLowerCase() === key)) {
+      return { sources: [key], keyword: m[2].trim() }
+    }
   }
   return { sources: fallbackSources, keyword: raw }
 }
@@ -2598,23 +2655,89 @@ function parseQuery(input, fallbackSources = ALL_SOURCES) {
  */
 const SOURCE_TIMEOUT = 7000
 
+/**
+ * 插件搜索条目 → 本服务端统一的歌曲形状（对齐原生 provider 的 search 输出）。
+ *
+ * 各插件返回的字段名不统一（LX 规范用 interval/img，聚合源常见 duration/pic/cover），
+ * 这里一次收齐。id 优先 songmid —— 取流时插件拿到的就是它。
+ *
+ * interval 只信「秒」。插件若给毫秒，算出来的时长会离谱，
+ * 而 stream.js 的**试听片段**判据要吃这个值（体积÷时长）—— 一个 20 万秒的时长
+ * 会让任何正常曲目都看起来像片段。所以超过 3 小时的直接当没给。
+ */
+function normalizePluginSong(source, raw, from) {
+  if (!raw || typeof raw !== 'object') return null
+  const id = String(raw.songmid || raw.id || raw.hash || raw.rid || '').trim()
+  const name = String(raw.name || raw.title || '').trim()
+  if (!id || !name) return null
+  let interval = safeInt(raw.interval || raw.duration || 0)
+  if (interval > 10800) interval = 0
+  return {
+    source,
+    id,
+    songmid: id,
+    hash: raw.hash || (source === 'kg' ? id : ''),
+    albumId: raw.albumId || '',
+    mediaMid: raw.mediaMid || '',
+    name,
+    singer: String(raw.singer || raw.artist || ''),
+    albumName: String(raw.albumName || raw.album || ''),
+    interval,
+    img: String(raw.img || raw.pic || raw.cover || ''),
+    types: Array.isArray(raw.types) ? raw.types : [],
+    _plugin: from || '',
+  }
+}
+
 async function searchOnline(keyword, { sources = ALL_SOURCES, page = 1, limit = 30, pluginPool = null, timeout = SOURCE_TIMEOUT } = {}) {
-  const targets = sources.filter(s => PROVIDERS[s])
+  /**
+   * 除内置平台外，**插件专有源**也在这里被接纳。
+   *
+   * 早先这里只认 `PROVIDERS[s]`，于是插件注册的 qsvip（汽水VIP）虽然声明了
+   * musicSearch，却永远不会被搜到 —— 插件等于废物。现在按「插件是否声明了
+   * musicSearch」判定，谁有能力谁参与，不必往 PROVIDERS 里塞假 provider。
+   */
+  const canPluginSearch = (s) => !!(pluginPool
+    && typeof pluginPool.supports === 'function'
+    && pluginPool.supports(s, 'musicSearch'))
+  const targets = sources.filter(s => PROVIDERS[s] || canPluginSearch(s))
   if (!targets.length || !keyword) return { list: [], total: 0, source: 'all', errors: [] }
 
   const perSource = Math.max(5, Math.ceil(limit / targets.length) + 5)
   const errors = []
   const settled = await Promise.all(targets.map(async src => {
-    const short = SOURCE_META[src] ? SOURCE_META[src].short : src
+    const short = SOURCE_META[src]
+      ? SOURCE_META[src].short
+      : (pluginPool && typeof pluginPool.sourceName === 'function' ? pluginPool.sourceName(src) : src)
     let timer = null
-    const result = await Promise.race([
+    const raceWith = (p) => Promise.race([
+      p,
+      new Promise(resolve => { timer = setTimeout(() => resolve({ ok: false, timeout: true }), timeout) }),
+    ])
+
+    if (!PROVIDERS[src]) {
+      const result = await raceWith(
+        pluginPool.invoke(src, 'musicSearch', { keyword, page, pagesize: perSource }, { timeout })
+          .then(r => ({ ok: !!r.value, value: r.value, plugin: r.plugin, errors: r.errors || [] }))
+          .catch(e => ({ ok: false, error: (e && e.message) || String(e) }))
+      )
+      if (timer) clearTimeout(timer)
+      if (result.ok) {
+        const raw = result.value
+        const items = Array.isArray(raw) ? raw : (raw && Array.isArray(raw.list) ? raw.list : [])
+        return items.map(x => normalizePluginSong(src, x, result.plugin)).filter(Boolean)
+      }
+      errors.push(result.timeout
+        ? `${short}: 响应超时（${timeout}ms 内未返回，已跳过）`
+        : `${short}: ${result.error || result.errors.join('; ') || '无结果'}`)
+      return []
+    }
+
+    const result = await raceWith(
       PROVIDERS[src].search(keyword, page, perSource)
         .then(r => ({ ok: true, list: r.list || [] }))
-        .catch(e => ({ ok: false, error: (e && e.message) || String(e) })),
-      new Promise(resolve => {
-        timer = setTimeout(() => resolve({ ok: false, timeout: true }), timeout)
-      }),
-    ])
+        .catch(e => ({ ok: false, error: (e && e.message) || String(e) }))
+    )
     if (timer) clearTimeout(timer)
     if (result.ok) return result.list
     errors.push(result.timeout
@@ -3089,6 +3212,7 @@ __modules["src/server/subsonic.js"] = function (__exports, __require) {
 const { md5 } = __require("src/lib/crypto.js");
 const { encodeSongId, decodeSongId, encodeAlbumId, decodeAlbumId } = __require("src/lib/songid.js");
 const { searchOnline, resolveLyric, resolvePic, parseQuery, SOURCE_META, ALL_SOURCES, getProvider } = __require("src/providers/index.js");
+const { pluginSearchSourceKeys } = __require("src/server/sources.js");
 const { audioMime, guessAudioFormat, safeInt, decodeName } = __require("src/lib/util.js");
 const { openAudioStream } = __require("src/lib/stream.js");
 const { outboundFetch } = __require("src/lib/http.js");
@@ -3564,7 +3688,8 @@ async function search(env, user, params, ctx, method) {
   const albumCount = Math.min(safeInt(params.get('albumCount'), 20) || 0, 100)
   const songOffset = safeInt(params.get('songOffset'), 0)
 
-  const { sources, keyword } = parseQuery(rawQuery, ALL_SOURCES)
+  // 第三参是插件专有源（如 qsvip），Subsonic 客户端同样可以 `qsvip:关键词` 指定
+  const { sources, keyword } = parseQuery(rawQuery, ALL_SOURCES, pluginSearchSourceKeys(env))
   if (!keyword) {
     return respond({ [method === 'search3' ? 'searchResult3' : 'searchResult2']: { song: [] } }, ctx)
   }
@@ -7573,13 +7698,46 @@ async function searchSources(env, settingsDb) {
   }
   if (!raw) return ALL_SOURCES.slice()
   const keys = raw.split(/[,，\s]+/).map(s => s.trim().toLowerCase()).filter(Boolean)
-  const valid = keys.filter(k => ALL_SOURCES.includes(k))
+  const known = ALL_SOURCES.concat(pluginSearchSourceKeys(env))
+  const valid = keys.filter(k => known.includes(k))
   return valid.length ? valid : ALL_SOURCES.slice()
+}
+
+/**
+ * 「可被搜索的插件专有源」的 key 清单 —— 不在 ALL_SOURCES 里、插件注册过、
+ * 且**声明了 musicSearch** 的那些（例如 pdone-qdy 的 `qsvip`「汽水VIP」）。
+ * 没有插件池 / 池子为空时回 []。
+ *
+ * 为什么只收 `musicSearch`：插件池里还有 `local`、`git` 这类只做取流/歌词的源，
+ * 它们**搜不了**。放开它们只会造出「后台能勾上、搜索却没反应」的假开关。
+ * 能搜才配进「搜索源」这一列，与 /sources 给前端的 `searchable` 是同一个判据。
+ *
+ * 为什么单独抽一个函数：`search.sources` 的**写入校验**（api.js 的
+ * /admin/search-sources）与**读取校验**（这里的 searchSources）必须同一口径。
+ * 两边各写一份的后果是最难查的那种不一致 —— 管理端能勾上、搜索却不认它，
+ * 用户看到的只有「我明明开了汽水，怎么搜不到」。本项目已经为「同一件事两份口径」
+ * 栽过至少两次（搜索源名单、D1 句柄），所以这里只留一处。
+ *
+ * 全程吞异常：三个宿主的插件池可用性不同（壳内延迟求值、测试替身可能没有池子），
+ * 「读不到插件清单」绝不能把搜索整条链路带挂。
+ */
+function pluginSearchSourceKeys(env) {
+  try {
+    const pool = env && env.PLUGIN_POOL
+    if (!pool || typeof pool.listSources !== 'function') return []
+    return pool.listSources()
+      .filter(s => s.key && !ALL_SOURCES.includes(s.key))
+      .filter(s => Array.isArray(s.actions) && s.actions.includes('musicSearch'))
+      .map(s => s.key)
+  } catch {
+    return []
+  }
 }
 
   /* 导出挂载 */
   __exports.DEFAULT_SOURCES_SETTING = DEFAULT_SOURCES_SETTING;
   __exports.searchSources = searchSources;
+  __exports.pluginSearchSourceKeys = pluginSearchSourceKeys;
 };
 
 __modules["src/server/plugin-import.mjs"] = function (__exports, __require) {
@@ -8383,7 +8541,7 @@ __modules["src/version.js"] = function (__exports, __require) {
  * 所以统一读这里，谁也别再各写各的。
  *
  * ── 两条版本线，别混 ──────────────────────────────────────────
- *   APP_VERSION      产品版本，人看的。改功能才动它。当前 V2.5
+ *   APP_VERSION      产品版本，人看的。改功能才动它。当前 V2.6
  *   APP_VERSION_CODE 整数构建号，Android 靠它判断「能不能覆盖安装」。
  *                    每次要发新版就 +1，**不能倒退、不能重复**，
  *                    否则手机上会报「应用未安装」（签名相同也装不上）。
@@ -8409,10 +8567,10 @@ __modules["src/version.js"] = function (__exports, __require) {
  */
 
 /** 产品版本（对外展示用）。每发一版升 0.1。 */
-const APP_VERSION = 'V2.5'
+const APP_VERSION = 'V2.6'
 
 /** Android versionCode：整数、单调递增、跨次发布不可重复。每发一版 +1。 */
-const APP_VERSION_CODE = 115
+const APP_VERSION_CODE = 116
 
 /** 人类可读的完整标识，日志/关于页用。 */
 const APP_ID = 'lxmusic'
@@ -10829,6 +10987,53 @@ class PluginPool {
       if (info && Array.isArray(info.qualitys)) info.qualitys.forEach(q => qualities.add(q))
     }
     return Array.from(qualities)
+  }
+
+  /**
+   * 列出池子里出现过的**全部源**，含「插件专有源」—— 不在内置平台清单里、
+   * 由插件自己注册的源（例如 pdone-qdy 的 `qsvip`「汽水VIP」）。
+   *
+   * 为什么需要这个方法：`ALL_SOURCES` 只是内置六平台。在补上这条通道之前，
+   * 插件专有源**没有任何地方列得出来** —— 插件明明注册了 qsvip、也声明了
+   * musicSearch/musicUrl，但服务端从没用 `qsvip` 去问过它一次：管理端勾不到它，
+   * 搜索也不会路由到它。等于一份死代码（加了个汽水插件却什么都没发生）。
+   *
+   * 排序无关紧要（调用方一般按 key 找），但保持 bySource 的插入顺序。
+   *
+   * @returns {Array<{key:string,name:string,actions:string[],qualitys:string[],plugins:string[]}>}
+   */
+  listSources() {
+    const out = []
+    for (const [key, list] of this.bySource) {
+      const alive = list.filter(p => p.enabled !== false)
+      if (!alive.length) continue
+      const actions = new Set()
+      const qualitys = new Set()
+      const plugins = []
+      let name = ''
+      for (const p of alive) {
+        const info = p.sources && p.sources[key]
+        if (!info) continue
+        if (!name && info.name) name = String(info.name)
+        const acts = Array.isArray(info.actions) ? info.actions : ['musicUrl']
+        acts.forEach(a => actions.add(a))
+        if (Array.isArray(info.qualitys)) info.qualitys.forEach(q => qualitys.add(q))
+        plugins.push((p.meta && p.meta.name) || p.id)
+      }
+      if (!plugins.length) continue
+      out.push({ key, name: name || key, actions: Array.from(actions), qualitys: Array.from(qualitys), plugins })
+    }
+    return out
+  }
+
+  /** 某个源的展示名（取自插件自己声明的 name）；没声明就回 key */
+  sourceName(source) {
+    const list = this.bySource.get(source) || []
+    for (const p of list) {
+      const info = p.sources && p.sources[source]
+      if (info && info.name) return String(info.name)
+    }
+    return source
   }
 
   summary() {

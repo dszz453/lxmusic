@@ -455,6 +455,53 @@ export class PluginPool {
     return Array.from(qualities)
   }
 
+  /**
+   * 列出池子里出现过的**全部源**，含「插件专有源」—— 不在内置平台清单里、
+   * 由插件自己注册的源（例如 pdone-qdy 的 `qsvip`「汽水VIP」）。
+   *
+   * 为什么需要这个方法：`ALL_SOURCES` 只是内置六平台。在补上这条通道之前，
+   * 插件专有源**没有任何地方列得出来** —— 插件明明注册了 qsvip、也声明了
+   * musicSearch/musicUrl，但服务端从没用 `qsvip` 去问过它一次：管理端勾不到它，
+   * 搜索也不会路由到它。等于一份死代码（加了个汽水插件却什么都没发生）。
+   *
+   * 排序无关紧要（调用方一般按 key 找），但保持 bySource 的插入顺序。
+   *
+   * @returns {Array<{key:string,name:string,actions:string[],qualitys:string[],plugins:string[]}>}
+   */
+  listSources() {
+    const out = []
+    for (const [key, list] of this.bySource) {
+      const alive = list.filter(p => p.enabled !== false)
+      if (!alive.length) continue
+      const actions = new Set()
+      const qualitys = new Set()
+      const plugins = []
+      let name = ''
+      for (const p of alive) {
+        const info = p.sources && p.sources[key]
+        if (!info) continue
+        if (!name && info.name) name = String(info.name)
+        const acts = Array.isArray(info.actions) ? info.actions : ['musicUrl']
+        acts.forEach(a => actions.add(a))
+        if (Array.isArray(info.qualitys)) info.qualitys.forEach(q => qualitys.add(q))
+        plugins.push((p.meta && p.meta.name) || p.id)
+      }
+      if (!plugins.length) continue
+      out.push({ key, name: name || key, actions: Array.from(actions), qualitys: Array.from(qualitys), plugins })
+    }
+    return out
+  }
+
+  /** 某个源的展示名（取自插件自己声明的 name）；没声明就回 key */
+  sourceName(source) {
+    const list = this.bySource.get(source) || []
+    for (const p of list) {
+      const info = p.sources && p.sources[source]
+      if (info && info.name) return String(info.name)
+    }
+    return source
+  }
+
   summary() {
     return this.plugins.map(p => ({
       id: p.id,
