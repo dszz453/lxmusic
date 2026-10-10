@@ -1,6 +1,6 @@
 {
   "name": "lxmusic-cf",
-  "version": "2.4.0",
+  "version": "2.5.0",
   "private": true,
   "description": "Cloudflare Workers 上的 LX 插件兼容音乐服务器（Subsonic 协议 + PWA）",
   "scripts": {

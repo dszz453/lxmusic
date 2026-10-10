@@ -202,8 +202,13 @@ export function musicUrlCandidateList(song, quality = '320k', pluginPool = null,
     } else if (provider && typeof provider.getMusicUrl === 'function') {
       out.push(async () => {
         try {
-          const url = await provider.getMusicUrl(song, quality)
-          return url ? { url, from: 'native' } : null
+          const r = await provider.getMusicUrl(song, quality)
+          if (!r) return null
+          // 兼容两种返回：字符串（只有地址）或 { url, from?, trial? }。
+          // trial 是「这条只是试听片段」的**源侧声明**（网易 eapi 的 freeTrialInfo）——
+          // 声明时长未知时，它是唯一能判定片段的依据，必须原样带上去给 stream.js。
+          if (typeof r === 'string') return { url: r, from: 'native' }
+          return { url: r.url, from: r.from || 'native', trial: r.trial === true }
         } catch { return null }
       })
     }

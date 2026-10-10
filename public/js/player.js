@@ -280,6 +280,18 @@
   let advancing = false      // 降级重入锁：error 事件可能连发
 
   /**
+   * 「实播时长不到声明时长的多少」才算「音源给的是片段」。
+   *
+   * **只有这一处口径** —— 元数据一到位（提前告诉用户）与整首播完（兜底再说一次）
+   * 用的是同一个值，免得出现「提前提示说没事、播完又跳出来说有事」这种自相矛盾。
+   * 取 0.6 与下面 warnIfSnippet 的保守判据（声明时长必须 > 60 秒）配合，
+   * 正常短歌、纯音乐里的长静音都不会被误报。
+   */
+  const SNIPPET_PLAYED_RATIO = 0.6
+  /** 本次加载已经就「片段」提示过没有 —— 提示过就别在播完时再说一遍 */
+  let snippetWarned = false
+
+  /**
    * 客户端侧的 http→https 升级（与服务端 stream.js 的白名单保持一致）。
    * 插件源给的地址常是 http，在 https 页面会被浏览器拦成混合内容。
    */
@@ -327,21 +339,32 @@
         if (!r || !r.ok) { directCache = []; return directCache }
         const raw = (r.urls && r.urls.length) ? r.urls : [{ url: r.url, from: r.from }]
         const list = raw
-          .map(x => ({ url: upgradeHttps(x.url), from: x.from || r.from || '直链', size: Number(x.size) || 0 }))
+          .map(x => ({
+            url: upgradeHttps(x.url),
+            from: x.from || r.from || '直链',
+            size: Number(x.size) || 0,
+            trial: x.trial === true,
+          }))
           // 本宿主播不了的地址不必浪费一次尝试（网页里是 http，壳里没有这种限制）
           .filter(x => x.url && isPlayable(x.url))
-          .map(x => ({ url: x.url, from: x.from + ' · 直连', size: x.size }))
+          .map(x => ({ url: x.url, from: x.from + ' · 直连', size: x.size, trial: x.trial }))
         /**
-         * 体积大优先 —— 这条排序是为了「别放到一半就没了」。
+         * 「先排除试听片段，再体积大优先」—— 这条排序是为了「别放到一半就没了」。
          *
          * 各源对不同音质给的是**不同来源**：低音质常落到第三方中转的试听片段
-         * （三十多秒），Hi-Res 走正版直链给完整曲目。服务端已经按体积预排过，
+         * （三十多秒），完整曲目往往要插件源给。服务端已经按同一口径预排过，
          * 但它是在自己的出口探的，和手机网络不是一回事；这里再排一次不花什么
          * 代价，却能把「服务端探不出来的那条完整版」顶到前面去。
+         *
+         * ⚠ **`trial` 必须排在体积之前**：30 秒的**无损**片段可能有 5MB，
+         * 比 128k 的完整曲目（4MB）还大 —— 只按体积排会把它选出来。
+         * 服务端那条 `looksLikeTrial` 就是这个字段的来源（网易的 freeTrialInfo
+         * 或「体积 / 声明时长」推出的码率低得离谱），两边档位必须一致。
+         *
          * size 为 0 表示探不出体积（未知），排到已知的后面 —— 未知不等于小，
          * 但「已知的完整版」比「未知的」更值得先试。
          */
-        list.sort((a, b) => (b.size || 0) - (a.size || 0))
+        list.sort((a, b) => (a.trial ? 1 : 0) - (b.trial ? 1 : 0) || (b.size || 0) - (a.size || 0))
         directCache = list
         // 服务端把「全部候选一个都没探通」如实标成 verified=false。
         // 这种直连地址可信度不高 —— 探测是在 Cloudflare 出口做的，和用户手机
@@ -436,6 +459,7 @@
   function applySrc(hit) {
     audio.dataset.stage = String(STAGES.indexOf(curStageName))
     audio.dataset.cached = '0'
+    snippetWarned = false          // 换了一条候选 → 「片段」提示重新计一轮
     audio.src = hit.url
     setFooter('音源：' + hit.from + (curList.length > 1 && curPos > 0 ? '（备选 ' + curPos + '）' : ''))
     armStall()
@@ -445,8 +469,12 @@
   /**
    * 这条候选是不是「疑似试听片段」。
    *
+   * ⚠ 这一条**只决定提示文案的措辞**，不决定任何取舍 —— 真正的判据是
+   * warnIfSnippet 里那个「实播时长 / 声明时长」（时长是地面真相，不会骗人），
+   * 以及上面按 `trial` + 体积的排序。这里之所以还要它，是因为体积对比能区分
+   * 「当前音源只给了片段」和「音源给的内容本身就不完整」——两者给用户的建议不一样。
+   *
    * 不算精确：只有拿得到体积、且比同级里最大的那条小一大截时才算。
-   * 用途只有一个 —— 播放中真的发现放完了但歌明显没结束，好给用户一句解释。
    * 不能靠它拦掉候选：体积小的也可能就是正常短歌（小样、间奏、纯音乐）。
    */
   const SNIPPET_RATIO = 0.5
@@ -505,6 +533,7 @@
       cacheBlobUrl = URL.createObjectURL(b)
       audio.dataset.stage = '-1'
       audio.dataset.cached = '1'
+      snippetWarned = false        // 本地缓存不受「片段」判据约束（见 warnIfSnippet）
       audio.src = cacheBlobUrl
       setFooter('音源：本地缓存（省去重新取流）')
       lastHit = { url: 'cache://' + song.id, from: '本地缓存' }
@@ -1335,7 +1364,13 @@
     syncLyric(audio.currentTime)
   })
   audio.addEventListener('durationchange', paintProgress)
-  audio.addEventListener('loadedmetadata', () => { clearStall(); paintProgress() })
+  audio.addEventListener('loadedmetadata', () => {
+    clearStall()
+    // 元数据一到手就知道总时长了 —— 是片段就**现在**说，别让用户白听 30 秒
+    // 再被告知（判据与播完那次是同一份，重复调用由 snippetWarned 挡住）。
+    warnIfSnippet()
+    paintProgress()
+  })
   audio.addEventListener('loadeddata', clearStall)
   audio.addEventListener('canplay', clearStall)
   audio.addEventListener('play', () => {
@@ -1357,25 +1392,34 @@
   })
 
   /**
-   * 放完了，但这首歌按元数据应该还没结束 —— 说清楚原因。
+   * 这首歌实播出来比它声明的短太多 —— 说清楚原因。
    *
    * 这是「同一首歌选不同音质长度不一样」这个问题的可见部分。真因在源侧：
-   * 低音质常落到第三方中转的**试听片段**，Hi-Res 走正版直链给完整曲目。
-   * 服务端已经会优先挑体积大的候选（见 src/lib/stream.js 的 SETTLE_MS），
-   * 但候选里要是根本没出现过完整版，就只能放到这里 —— 此时**必须让用户知道
+   * 平台对没有播放权限的曲子只给**试听片段**（网易会明说：eapi 的
+   * freeTrialInfo={start:0,end:30}，实测就是 470KB ≈ 30 秒），
+   * 而完整曲目往往要由插件源给出。服务端现在会因此**多等一会儿**、
+   * 优先挑完整版（见 src/lib/stream.js 的 looksLikeTrial / armSettle），
+   * 但候选里要是真没有完整版，就只能放到这里 —— 此时**必须让用户知道
    * 是音源的问题、以及可以怎么绕**，否则他只会以为播放器坏了或者歌就是这样。
    *
-   * 判定要足够保守：只有「歌曲声明时长 > 60 秒」且「实播不到声明的一半」才提示，
-   * 免得把正常短歌、纯音乐里的长静音误報成片段。
+   * **调用时机有两处，判据只有这一份**：
+   *   · `loadedmetadata` —— 元数据一到位就知道时长，**提前**告知（2026-10-10 加）；
+   *     以前只在播完时才提示，用户得先白听 30 秒才发现不对。
+   *   · `ended` —— 兜底（`snippetWarned` 保证不会重复弹）。
+   *
+   * 判定要足够保守：只有「歌曲声明时长 > 60 秒」且「实播不到声明的六成」才提示，
+   * 免得把正常短歌、纯音乐里的长静音误报成片段。
    */
   function warnIfSnippet() {
+    if (snippetWarned) return                            // 同一个候选只提示一次
     const song = current()
     if (!song) return
     const declared = Number(song.interval) || 0          // 秒
     const played = Number(audio.duration) || 0
     if (declared < 60 || !played) return
     if (audio.dataset.cached === '1') return             // 本地缓存不算音源的锅
-    if (played >= declared * 0.6) return
+    if (played >= declared * SNIPPET_PLAYED_RATIO) return
+    snippetWarned = true
     const why = looksLikeSnippet(lastHit)
       ? '当前音源只提供了试听片段'
       : '当前音源提供的内容不完整'

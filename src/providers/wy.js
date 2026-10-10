@@ -164,7 +164,21 @@ export default {
     return { list, total: safeInt(json.result.albumCount), page, limit, source: SOURCE }
   },
 
-  /** 原生取流（兜底）：eapi 播放地址接口 → 老版重定向接口 */
+  /**
+   * 原生取流（兜底）：eapi 播放地址接口 → 老版重定向接口
+   *
+   * ⚠ 返回类型是**字符串或 `{url, trial}`**：
+   *   网易对没有播放权限的曲子只给**试听片段**，而且是**明说的** ——
+   *   eapi 里 `freeTrialInfo = {fragmentType:-1, start:0, end:30}`，
+   *   同时 `size` 只有 481115（≈30 秒 128k），请求 lossless 也只回落 `level=standard`。
+   *   实测「想你的夜 / 关喆」有两个 id：88926 是片段（481115 字节 × 各音质都一样），
+   *   25639286 是完整曲目（10.7MB，freeTrialInfo=null）。
+   *
+   *   以前这里只返回地址字符串，于是**片段和完整版在调用方眼里长得一模一样** ——
+   *   取流链按体积排序时它排在最后面是运气，而「谁先探通」那条路径会把它直接选中，
+   *   用户听到的就是「进度条只到 30 秒、音源显示 native · 直连」。
+   *   所以现在把它标出来（`trial: true`），交给 stream.js 的 looksLikeTrial 排序。
+   */
   async getMusicUrl(song, quality = '320k') {
     const id = song && (song.id || song.songmid)
     if (!id) return null
@@ -176,7 +190,10 @@ export default {
           ids: `[${id}]`, level, encodeType: 'flac', br: brMap[quality] || 320000,
         }, { retry: 0, timeout: 12000 })
         const item = json && json.data && json.data[0]
-        if (item && item.url && /^https?:/.test(item.url)) return item.url
+        if (item && item.url && /^https?:/.test(item.url)) {
+          if (item.freeTrialInfo) return { url: item.url, trial: true, from: 'native' }
+          return item.url
+        }
       } catch { /* 试下一个音质 */ }
     }
     try {
@@ -184,11 +201,18 @@ export default {
         ids: `[${id}]`, br: brMap[quality] || 320000,
       }, { retry: 0, timeout: 12000 })
       const item = json && json.data && json.data[0]
-      if (item && item.url && /^https?:/.test(item.url)) return item.url
+      if (item && item.url && /^https?:/.test(item.url)) {
+        if (item.freeTrialInfo) return { url: item.url, trial: true, from: 'native' }
+        return item.url
+      }
     } catch { /* ignore */ }
 
-    // 最终兜底：302 跳转到 CDN（VIP 歌曲会返回非音频内容，交由调用方校验）
-    return `https://music.163.com/song/media/outer/url?id=${id}.mp3`
+    /**
+     * 最终兜底：302 跳转到 CDN。
+     * ⚠ 这条**一律按试听片段处理**：它落在 WEAK_HOSTS（实测 302 → /404），
+     * 而且对 VIP 歌曲给的就是几十秒的试听 —— 没有任何理由把它当成完整版。
+     */
+    return { url: `https://music.163.com/song/media/outer/url?id=${id}.mp3`, trial: true, from: 'native' }
   },
 
   async getLyric(song) {

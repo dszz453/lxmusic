@@ -90,7 +90,7 @@ public final class ClientBrand {
      * 它的用途只有一个：握手后如果服务端回了个**不同的**版本，在服务器页给一句提示。
      * 只提示、不阻断 —— 差一格版本通常仍然可用，硬拦会把用户锁在门外。
      */
-    public static final String SERVICE_EXPECT = "V2.4";
+    public static final String SERVICE_EXPECT = "V2.5";
 
     /** 客户端自己的版本名（形如 "1.0"）。读不到时给兜底，不让界面显示 null */
     public static String versionName(Context ctx) {

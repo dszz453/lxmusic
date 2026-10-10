@@ -68,6 +68,21 @@ function extractCompare() {
 }
 const compareCandidates = extractCompare()
 
+/** 同理抽出 looksLikeTrial 的函数体 —— 抽出来的就是产品里那一份（declaredSec 参数化传入） */
+function extractLooksLikeTrial() {
+  const m = SRC.match(/const looksLikeTrial = \(rec\) => \{([\s\S]*?)\n  \}/)
+  if (!m) throw new Error('没能在 src/lib/stream.js 里找到 looksLikeTrial')
+  const km = SRC.match(/const TRIAL_MAX_KBPS = (\d+)/)
+  if (!km) throw new Error('没能在 src/lib/stream.js 里找到 TRIAL_MAX_KBPS')
+  const fn = new Function('rec', 'declaredSec', 'TRIAL_MAX_KBPS', m[1])
+  return (rec, declaredSec) => fn(rec, declaredSec, Number(km[1]))
+}
+const looksLikeTrial = extractLooksLikeTrial()
+const TRIAL_MAX_KBPS = Number(/const TRIAL_MAX_KBPS = (\d+)/.exec(SRC)[1])
+
+/** 结构类断言必须先去注释 —— 注释里必然写着反面写法的字面量（项目硬规矩，已两次踩） */
+const deComment = (t) => t.replace(/\/\*[\s\S]*?\*\//g, '').replace(/^\s*\/\/.*$/gm, '')
+
 function hostMatches(u, res) {
   try { const h = new URL(u).hostname; return res.some(re => re.test(h)) } catch { return false }
 }
@@ -132,6 +147,43 @@ check('两条都未知时退化为稳定（不抛错、必返回一条）',
 check('未知体积仍然赢过「已知死接口」（weak 那一档压过体积）',
   pickBest([unknown, { url: 'https://music.163.com/song/media/outer/url?id=1.mp3', from: '已知死接口', size: 80 * 1024 * 1024, official: false, weak: true, native: false }]) === unknown)
 
+console.log('\n== 3b. 试听片段判据（2026-10-10 老板报的「进度条只有 30 秒」）==')
+/**
+ * 实测数据（本机直连网易云 eapi 抓的，见 memory 2026-10-10）：
+ *   id=88926 「想你的夜 / 关喆」声明 265s —— 各音质都只回 **481115 字节**，
+ *            且 `freeTrialInfo={fragmentType:-1,start:0,end:30}`：
+ *            481115×8/128000 ≈ **30.1 秒**，和截图里的 00:30 严丝合缝。
+ *   id=25639286 同一首歌声明 268s —— 10.7MB / 4.19MB，freeTrialInfo=null，完整。
+ * 所以判据有两个：源自己标的 `trial`，以及「体积 / 声明时长」推出来的码率太低。
+ */
+check('TRIAL_MAX_KBPS 存在（码率判据的阈值）', TRIAL_MAX_KBPS === 64, 'TRIAL_MAX_KBPS=' + TRIAL_MAX_KBPS)
+check('源明确声明 trial → 判为片段（声明时长未知时唯一可靠）',
+  looksLikeTrial({ url: 'u', trial: true, size: 481115 }, 0) === true)
+check('⚠ 实测那条 native：470KB / 265s ≈ 14kbps → 判为片段（声明时长已知时能算出来）',
+  looksLikeTrial({ url: 'u', trial: false, size: 481115 }, 265) === true)
+check('128k 完整版 4.19MB / 265s ≈ 126kbps → 不是片段',
+  looksLikeTrial({ url: 'u', trial: false, size: 4292065 }, 265) === false)
+check('320k 完整版 10.7MB / 268s ≈ 320kbps → 不是片段',
+  looksLikeTrial({ url: 'u', trial: false, size: 10730100 }, 268) === false)
+check('声明时长未知（极简 ID 没带 t）时算不出来，只能靠源声明',
+  looksLikeTrial({ url: 'u', trial: false, size: 481115 }, 0) === false)
+check('体积未知（size=0）时不硬判',
+  looksLikeTrial({ url: 'u', trial: false, size: 0 }, 265) === false)
+
+console.log('\n== 3c. trial 这一档必须排在**体积之前** ==')
+/**
+ * 这一组是「只按体积排」的正面反例：30 秒的**无损**片段可以有 5MB，
+ * 比 128k 的完整曲目（4MB）还大。没有 trial 这一档，体积排序会把它推上去。
+ */
+const trialBig = { url: 'https://m801.music.126.net/trial.flac', from: 'native（30s 无损片段）', size: 5 * 1024 * 1024, official: true, weak: false, native: true, trial: true }
+const fullSmall = { url: 'https://m801.music.126.net/full128.mp3', from: '完整版 128k', size: 4 * 1024 * 1024, official: true, weak: false, native: false, trial: false }
+check('⚠ 体积更大的试听片段输给体积更小的完整版', pickBest([trialBig, fullSmall]) === fullSmall,
+  pickBest([trialBig, fullSmall]).from)
+check('两路排序在这一组上结论一致', pickBest([trialBig, fullSmall]) === [trialBig, fullSmall].sort(compareCandidates)[0])
+check('promote：完整版标注后，试听片段就算体积大也排最后',
+  [fullSmall, trialBig].sort(compareCandidates)[0] === fullSmall)
+check('只有片段可用时仍然用它（能出声比不出声强）', pickBest([trialBig]) === trialBig)
+
 console.log('\n== 4. 官方标识与弱源标识的判定（用源码里的真名单）==')
 check('网易 CDN（music.126.net）识别为官方',
   hostMatches('https://m801.music.126.net/x.mp3', OFFICIAL) === true)
@@ -152,10 +204,17 @@ check('stream.js 里有 pickBest 挑选函数', /const pickBest = \(list\)/.test
 check('挑选里有「已知死接口排最后」这一档', /if \(!!a\.weak !== !!b\.weak\) return a\.weak \? 1 : -1/.test(src))
 check('挑选里有「官方优先」这一档', /!!a\.official !== !!b\.official/.test(src))
 check('挑选里有「体积大优先」这一档', /if \(as !== bs\) return bs - as/.test(src))
-check('探通后不再立刻收工（armSettle 被调用）', /armSettle\(\)/.test(src))
+check('探通后不再立刻收工（armSettle 被调用）', /armSettle\(/.test(src))
 check('窗口到点后确实用了 pickBest', /pickBest\(probed\)/.test(src))
 check('放弃先探通的那条时会留下说明（可排查）', /疑似试听片段/.test(src))
 check('探通后返回的是多条候选（不只一条）', /const ordered = \[best, \.\.\.probed\.filter/.test(src))
+check('⚠ 探通的那条若是**试听片段**，窗口放到总预算（而不是 450ms 就收工）',
+  /armSettle\(trial \? Math\.max\(SETTLE_MS, totalBudget - \(Date\.now\(\) - t0\)\) : SETTLE_MS, trial\)/.test(src))
+check('已等到完整版时把窗口收回 450ms（别白耗满预算）',
+  /const shortenSettle = \(\) => \{/.test(src) && /shortenSettle\(\)/.test(src))
+check('⚠ 交给客户端的每条候选都带上 trial（客户端会按体积重排，缺了它就会选错）',
+  (src.match(/trial: x\.trial === true/g) || []).length === 2,
+  '出现 ' + ((src.match(/trial: x\.trial === true/g) || []).length) + ' 处')
 
 console.log('\n== 5b. 两份排序必须同档位同顺序（本轮揪出的真 bug） ==')
 /**
@@ -167,10 +226,11 @@ console.log('\n== 5b. 两份排序必须同档位同顺序（本轮揪出的真 
  * 这里直接把两个函数拿来对拍：同一组候选，两边排出来的第一名必须相同。
  */
 const sampleSet = [
-  { url: 'https://m801.music.126.net/a.mp3', from: 'official', size: 2 * 1024 * 1024, official: true, weak: false, native: false },
-  { url: 'https://music.163.com/song/media/outer/url?id=1.mp3', from: 'dead-big', size: 50 * 1024 * 1024, official: false, weak: true, native: false },
-  { url: 'https://cdn3.example.com/b.mp3', from: 'plain-big', size: 9 * 1024 * 1024, official: false, weak: false, native: false },
-  { url: 'https://cdn4.example.com/c.mp3', from: 'plain-small', size: 1 * 1024 * 1024, official: false, weak: false, native: false },
+  { url: 'https://m801.music.126.net/a.mp3', from: 'official', size: 2 * 1024 * 1024, official: true, weak: false, native: false, trial: false },
+  { url: 'https://music.163.com/song/media/outer/url?id=1.mp3', from: 'dead-big', size: 50 * 1024 * 1024, official: false, weak: true, native: false, trial: false },
+  { url: 'https://cdn3.example.com/b.mp3', from: 'plain-big', size: 9 * 1024 * 1024, official: false, weak: false, native: false, trial: false },
+  { url: 'https://cdn4.example.com/c.mp3', from: 'plain-small', size: 1 * 1024 * 1024, official: false, weak: false, native: false, trial: false },
+  { url: 'https://m801.music.126.net/t.flac', from: 'trial-bigger-than-all', size: 60 * 1024 * 1024, official: true, weak: false, native: true, trial: true },
 ]
 for (let i = 0; i < sampleSet.length; i++) {
   for (let j = i + 1; j < sampleSet.length; j++) {
@@ -182,14 +242,50 @@ for (let i = 0; i < sampleSet.length; i++) {
 }
 check('两路都不会把已知死接口排在健康官方直链前面',
   pickBest(sampleSet) === sampleSet[0] && sampleSet.slice().sort(compareCandidates)[0] === sampleSet[0])
+check('⚠ 两个排序函数都有 trial 这一档（同一份文件不许两套口径）',
+  (src.match(/if \(!!a\.trial !== !!b\.trial\) return a\.trial \? 1 : -1/g) || []).length === 2,
+  '出现 ' + ((src.match(/if \(!!a\.trial !== !!b\.trial\) return a\.trial \? 1 : -1/g) || []).length) + ' 处')
+check('trial 那一档排在官方/体积之前（档位顺序：weak → trial → official → size）',
+  /return a\.weak \? 1 : -1\s*\n\s*if \(!!a\.trial !== !!b\.trial\) return a\.trial \? 1 : -1\s*\n\s*if \(!!a\.official/.test(src))
 
-console.log('\n== 6. 播放器侧也按体积排了（两道保险） ==')
+console.log('\n== 6. 播放器侧同口径（两道保险） ==')
 const player = fs.readFileSync(path.join(ROOT, 'public', 'js', 'player.js'), 'utf8')
+const playerCode = deComment(player)
 check('player.js 把 size 带进候选', /size: Number\(x\.size\) \|\| 0/.test(player))
-check('player.js 对候选按体积降序排', /list\.sort\(\(a, b\) => \(b\.size \|\| 0\) - \(a\.size \|\| 0\)\)/.test(player))
+check('player.js 把 trial 也带进候选（少了它，服务端的判定到这就断了）',
+  /trial: x\.trial === true/.test(player))
+check('⚠ player.js 排序里 trial 先于体积（30 秒的无损片段比 128k 完整版还大）',
+  /list\.sort\(\(a, b\) => \(a\.trial \? 1 : 0\) - \(b\.trial \? 1 : 0\) \|\| \(b\.size \|\| 0\) - \(a\.size \|\| 0\)\)/.test(player))
 check('player.js 有「播放长度与声明时长不符」的提示', /function warnIfSnippet/.test(player))
 check('提示足够保守（声明时长要 > 60s）', /declared < 60/.test(player))
 check('本地缓存不算音源的锅', /audio\.dataset\.cached === '1'\) return/.test(player))
+check('⚠ 比例阈值只有一处口径（SNIPPET_PLAYED_RATIO），不许散落成字面量',
+  (playerCode.match(/SNIPPET_PLAYED_RATIO = 0\.6/g) || []).length === 1
+  && /played >= declared \* SNIPPET_PLAYED_RATIO/.test(playerCode)
+  && !/declared \* 0\.6/.test(playerCode),
+  '定义 ' + ((playerCode.match(/SNIPPET_PLAYED_RATIO = 0\.6/g) || []).length) + ' 处')
+check('⚠ 元数据一到位就提示（loadedmetadata 里调了 warnIfSnippet，别等白听 30 秒）',
+  /addEventListener\('loadedmetadata', \(\) => \{[\s\S]{0,220}?warnIfSnippet\(\)/.test(player))
+check('同一候选只提示一次（snippetWarned 去重，且换候选时复位）',
+  /if \(snippetWarned\) return/.test(player) && (player.match(/snippetWarned = false/g) || []).length >= 2,
+  '复位 ' + ((player.match(/snippetWarned = false/g) || []).length) + ' 处')
+
+console.log('\n== 7. 源侧标记：网易自己说的「这是试听」（最可靠的判据） ==')
+/**
+ * 这一节盯的是「判据的源头」。前面几节的 looksLikeTrial 靠体积/时长推算，
+ * 一旦 ID 里没带声明时长就失效（极简 ID `wy:88926`）。而网易 eapi 其实**明说**了：
+ * `freeTrialInfo={fragmentType:-1,start:0,end:30}` —— 把它带出来，才是全天候的判据。
+ */
+const wySrc = fs.readFileSync(path.join(ROOT, 'src', 'providers', 'wy.js'), 'utf8')
+const idxSrc = fs.readFileSync(path.join(ROOT, 'src', 'providers', 'index.js'), 'utf8')
+check('wy.js 用 freeTrialInfo 标记试听片段',
+  (wySrc.match(/if \(item\.freeTrialInfo\) return \{ url: item\.url, trial: true, from: 'native' \}/g) || []).length === 2,
+  '出现 ' + ((wySrc.match(/if \(item\.freeTrialInfo\) return \{ url: item\.url, trial: true, from: 'native' \}/g) || []).length) + ' 处（v1 与老接口各一）')
+check('wy.js 的 outer/url 最终兜底也标 trial（实测 302→/404，VIP 歌只给片段）',
+  /return \{ url: `https:\/\/music\.163\.com\/song\/media\/outer\/url\?id=\$\{id\}\.mp3`, trial: true, from: 'native' \}/.test(wySrc))
+check('providers/index.js 支持 getMusicUrl 返回对象并透传 trial', /trial: r\.trial === true/.test(idxSrc))
+check('providers/index.js 仍兼容字符串返回（别的 provider 没改，别弄坏它们）',
+  /if \(typeof r === 'string'\) return \{ url: r, from: 'native' \}/.test(idxSrc))
 
 console.log('\n===== stream-pick：' + pass + ' 通过 / ' + fail + ' 失败 =====')
 if (failures.length) console.log('失败项：\n  - ' + failures.join('\n  - '))

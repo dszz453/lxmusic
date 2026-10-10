@@ -37,6 +37,37 @@ W() { cygpath -w "$1"; }                          # MSYS 路径 → Windows 路�
 LIST_WIN() { find "$@" | while read -r f; do cygpath -w "$f"; done; }
 
 APP_NAME="music-edge"
+# 2.5：修「播到一半就没了 —— 进度条只走 30~40 秒，音源标记 native · 直连」。CF 与 Docker 都有。
+#
+#  根因不在播放器，在**取流时的选优**：网易云 eapi 对**没有播放权限**的曲子并不报错，
+#  而是**明说这是试听** —— 响应里带 freeTrialInfo={fragmentType:-1,start:0,end:30}，
+#  size≈481115（≈30.1 秒 @128kbps）；请求无损也只回落 level=standard。
+#  实测同一首歌两个 id：88926 三档音质都回 481115 字节（片段），25639286 回 10.7MB 完整曲目。
+#
+#  两条判据（唯一口径在 src/lib/stream.js）：
+#    · 源侧：src/providers/wy.js 的 getMusicUrl 判 freeTrialInfo → 标记 trial:true
+#      （outer/url 兜底一律标 trial —— 那个直链本来就只给试听）；
+#      src/providers/index.js 透传 trial（并兼容插件返回字符串的老写法）。
+#    · 体积侧：TRIAL_MAX_KBPS = 64，即「体积×8/1000/声明时长 < 64」判为片段。
+#      实测片段 ≈14kbps、128k 完整版 ≈126kbps、320k ≈320kbps —— 64 这条线离两边都远。
+#      ⚠ 声明时长未知（极简 ID 没带 t）时该判据失效，只剩源声明。
+#
+#  ① **档位顺序修正**：weak → **trial** → official → size → native。
+#     trial 必须排在**体积之前** —— 30 秒的**无损**片段可以有 5MB，比 128k 完整版（4MB）
+#     还大，只按体积排会挑中片段。pickBest 与 compareCandidates 两处必须同档位同顺序。
+#  ② **SETTLE_MS 收敛窗口的洞**：原逻辑「只要有一条探通就开 450ms 窗口」看不出那条是不是
+#     片段 —— 片段先探通、完整版晚一步到就永远没机会（这就是「偶发」的来源，也解释了
+#     为什么偏偏显示 native · 直连）。现在改成 armSettle(ms, forTrial)：
+#     **探通的是完整版才开 450ms，探到片段则把窗口开到总预算**，让完整候选有机会到齐
+#     （shortenSettle 只在后来者确认完整时才把窗口收回来）。
+#  ③ **接缝处丢字段**：resolveMusicUrlFast 返回的 urls 原先只带 {url, from, size}，
+#     客户端按体积重排时看不到 trial。现在两条 return 都带 trial。
+#  ④ **客户端口径收敛**：public/js/player.js 的 SNIPPET_PLAYED_RATIO = 0.6 只定义一处，
+#     snippetWarned 去重；loadedmetadata 就提示（不再等白听 30 秒），ended 兜底。
+#
+#  护栏：test/stream-pick.mjs 全绿（64 项：试听判据 7 条 / trial 排在体积之前 4 条 /
+#        两个排序函数同档位 / 窗口放到总预算 / 播放器侧同口径 / 源侧标记 4 条）。
+#
 # 2.4：AI 接口兼容 Gemini + 修「AI 生成歌单偶发失败、提示超时」。两件事都在 AI 这一条链上。
 #
 #  ① **兼容 Gemini**：src/lib/ai.js 的 AI_PROVIDERS 增加 gemini，走 Google 官方

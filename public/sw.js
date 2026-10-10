@@ -17,8 +17,13 @@
  *      于是它落在下面那条「同源静态资源 stale-while-revalidate」分支上：
  *      先给缓存里的旧版、后台再更新。不抬 VERSION 的话，用户手机上会先跑一版
  *      旧后端（AI 上限还是 180s），要再刷一次才生效。
+ *
+ * v42：`js/backend.bundle.js` 又变了 —— `src/lib/stream.js` 不再在**试听片段**上收工，
+ *      `src/providers/{index,wy}.js` 开始标记试听，`js/player.js` 拿到 metadata 就提示。
+ *      同 v41 的道理：它走「同源静态资源 SWR」分支，不抬 VERSION 用户会先跑一版
+ *      旧后端（还会把 30 秒片段当完整曲目交出去），要再刷一次才生效。
  */
-const VERSION = 'v41'
+const VERSION = 'v42'
 const STATIC_CACHE = 'lxmusic-static-' + VERSION
 const SHELL_CACHE = 'lxmusic-shell-' + VERSION
 

@@ -1,5 +1,5 @@
 /* 由 tools/build-app.mjs 自动生成，请勿手动修改。
- * 源摘要: f00ec9930582a8bf
+ * 源摘要: 1a510e35900bc481
  * 模块数: 25
  *
  * 这是给安卓壳用的后端展平版：把 src/ 的 ESM 后端打成单个 IIFE，
@@ -2746,8 +2746,13 @@ function musicUrlCandidateList(song, quality = '320k', pluginPool = null, opts =
     } else if (provider && typeof provider.getMusicUrl === 'function') {
       out.push(async () => {
         try {
-          const url = await provider.getMusicUrl(song, quality)
-          return url ? { url, from: 'native' } : null
+          const r = await provider.getMusicUrl(song, quality)
+          if (!r) return null
+          // 兼容两种返回：字符串（只有地址）或 { url, from?, trial? }。
+          // trial 是「这条只是试听片段」的**源侧声明**（网易 eapi 的 freeTrialInfo）——
+          // 声明时长未知时，它是唯一能判定片段的依据，必须原样带上去给 stream.js。
+          if (typeof r === 'string') return { url: r, from: 'native' }
+          return { url: r.url, from: r.from || 'native', trial: r.trial === true }
         } catch { return null }
       })
     }
@@ -4456,16 +4461,60 @@ async function resolveMusicUrlFast(song, quality, pluginPool, options = {}) {
    *
    * 窗口内若收到明显更完整的候选就用它；只有片段可用时仍然用片段
    * （能出声比不出声强），但在 tried 里标明是「疑似试听片段」。
+   *
+   * ⚠ 2026-10-10 补了一个洞：上面这套「等 450ms 收齐再挑」有个前提 ——
+   * **先探通的那条得是个正常候选**。可它是一个**试听片段**时照样会开表，
+   * 450ms 一到就收工；插件那条几 MB 的完整版只晚一步到，就永远没机会看一眼。
+   * 老板报的「播放中进度条只有 30 秒、音源显示 native · 直连」正是这个：
+   * 网易官方那条（eapi 的 freeTrialInfo={start:0,end:30}，470KB）先探通，
+   * 官方的 26.9MB 完整版由插件给出、晚到一步，被窗口关在门外。
+   * 所以现在首条若是**可判定为片段**的候选，窗口直接放到总预算（见 armSettle）。
    */
   const SETTLE_MS = 450
   let settleTimer = null
+  let settleArmedForTrial = false
   let releaseSettle = null
   const settle = new Promise((res) => { releaseSettle = res })
-  const armSettle = () => {
+  const armSettle = (ms, forTrial) => {
     if (settleTimer) return
+    settleArmedForTrial = !!forTrial
+    settleTimer = setTimeout(releaseSettle, Math.max(0, ms))
+  }
+  /**
+   * 已经等到一条**完整版**了 → 不必再为「等完整版」而耗满预算，窗口收回 450ms。
+   * 只在「因为首条是片段而放长的那个窗口」上生效，不打扰原本就短的窗口。
+   */
+  const shortenSettle = () => {
+    if (!settleArmedForTrial || !settleTimer) return
+    clearTimeout(settleTimer)
     settleTimer = setTimeout(releaseSettle, SETTLE_MS)
+    settleArmedForTrial = false
   }
   const probed = []          // 探通且 ok 的候选，供 pickBest 挑
+
+  /**
+   * 「这条候选是不是试听片段」—— 这是本轮那个「偶发只播 30 秒」的判据入口。
+   *
+   * 两个信号，任一成立即算：
+   *   ① 源自己标的 `trial` —— 网易 eapi 的 `freeTrialInfo` 非空（实测
+   *      `{fragmentType:-1,start:0,end:30}`）。这是**声明时长未知时唯一可靠**的判据。
+   *   ② **按体积推算的码率低得离谱**：`体积 × 8 / 声明时长 < TRIAL_MAX_KBPS`。
+   *      实测片段是 470KB / 265s ≈ 14kbps，而 128k 的完整版 ≈ 125kbps、
+   *      320k ≈ 320kbps —— 64 这条线离两边都很远，不会误伤正常短歌。
+   *
+   * ⚠ 没有声明时长（极简 ID 形如 `wy:88926` 没带 `t`）时 ② 判不出来，只剩 ①。
+   * 能判出来时**宁可多等一会儿**，也不能把 30 秒的片段当结果交出去 ——
+   * 这是「起播慢 1 秒」和「放 30 秒就没了」之间的取舍，后者严重得多。
+   */
+  const TRIAL_MAX_KBPS = 64
+  const declaredSec = Number(song && song.interval) || 0
+  const looksLikeTrial = (rec) => {
+    if (!rec) return false
+    if (rec.trial === true) return true
+    if (!rec.size || !declaredSec) return false
+    return (rec.size * 8) / 1000 / declaredSec < TRIAL_MAX_KBPS
+  }
+  const t0 = Date.now()
 
   /**
    * 探通多条时怎么选 —— 与下面的 compareCandidates **必须同档位同顺序**。
@@ -4478,13 +4527,19 @@ async function resolveMusicUrlFast(song, quality, pluginPool, options = {}) {
    * 同一份文件里两个sort 顺序不一致 ⇒ 走哪条路径结果不同 ⇒ 极难复现的偶发。
    *
    * 档位与 compareCandidates 逐条对齐：
-   *   ① weak 最后   ② official 优先   ③ 体积大优先   ④ native 优先
+   *   ① weak 最后   ② trial（试听片段）最后   ③ official 优先
+   *   ④ 体积大优先   ⑤ native 优先
    * 两边改一处就要改另一处；test/stream-pick.mjs 有一条一致性断言盯着它们。
+   *
+   * ⚠ trial 这一档为什么要**排在体积之前**：30 秒的**无损**片段可能有 5MB，
+   * 比 128k 的完整曲目（4MB）还大 —— 只按体积排会把它选出来。所以「已知是片段」
+   * 必须先于体积成立。见 looksLikeTrial。
    */
   const pickBest = (list) => {
     if (!list.length) return null
     return list.slice().sort((a, b) => {
       if (!!a.weak !== !!b.weak) return a.weak ? 1 : -1
+      if (!!a.trial !== !!b.trial) return a.trial ? 1 : -1
       if (!!a.official !== !!b.official) return a.official ? -1 : 1
       const as = a.size || 0
       const bs = b.size || 0
@@ -4515,17 +4570,39 @@ async function resolveMusicUrlFast(song, quality, pluginPool, options = {}) {
       native: r.from === 'native',
       official: hostMatches(url, OFFICIAL_HOSTS),
       weak: hostMatches(url, WEAK_HOSTS),
+      trial: r.trial === true,            // 源自己标的「这是试听片段」（见 wy.js 的 freeTrialInfo）
       size: 0,
     }
     cands.push(rec)                       // 先入列：哪怕探测没赶上预算也要能返回
     const p = await withDeadline(probeAudioBytes(url), probeDeadline)
     Object.assign(rec, p)
+    /**
+     * 探测拿到体积之后**补齐** trial 标记。
+     *
+     * 这一步不能省：`looksLikeTrial` 的两个判据适用面不一样 ——
+     * 源声明只有网易那一条链有，而「体积/声明时长推码率」对**任何**源都成立。
+     * 实测同一首歌的 470KB 片段，`plugin:K×H测试` 也照样回同一个文件，
+     * 只认源声明的话它就不会被标出来，客户端按体积重排时可能把它顶上去
+     * （30 秒的**无损**片段体积可以超过 128k 完整版）。
+     *
+     * ⚠ 判据只此一份，不要再在这里另写一套体积比较。
+     */
+    rec.trial = looksLikeTrial(rec)
     if (rec.ok) {
       probed.push(rec)
       // 探通了：不再立刻收工，而是开一个短窗口多收几条再挑（见上面 SETTLE_MS 说明）。
       // earlyPayload 仍然记第一条 —— 窗口到点时若还没第二条，用的就是它。
       if (!earlyPayload) earlyPayload = rec
-      armSettle()
+      const trial = rec.trial
+      if (!settleTimer) {
+        // 首条探通就开窗口。**但首条若是试听片段，窗口放到总预算** ——
+        // 完整版可能只晚一步到，450ms 就收工等于把它关在门外（这就是
+        // 「偶发只播 30 秒」的来源）。代价只是这一种情况下起播多等最多
+        // 一个 totalBudget（网页 1.8s / 壳内 3.8s），比放 30 秒就没了划算得多。
+        armSettle(trial ? Math.max(SETTLE_MS, totalBudget - (Date.now() - t0)) : SETTLE_MS, trial)
+      } else if (!trial) {
+        shortenSettle()                   // 已经等到完整版了，别再耗满预算
+      }
     }
   }))
 
@@ -4550,8 +4627,12 @@ async function resolveMusicUrlFast(song, quality, pluginPool, options = {}) {
     }
     // 次要候选一并交出去：客户端那条首条失败就往下试的降级链正好用得上，
     // 而且它们已经被探过一遍（verified），比让客户端从零开始试要快。
+    //
+    // ⚠ `trial` 必须一起带上：客户端拿到 urls 后会**再按体积排一次**（第二道保险）。
+    // 它要是不知道哪条是片段，就会把「30 秒的无损片段（5MB）」排在
+    // 「128k 完整版（4MB）」前面 —— 体积大在这一档恰恰是错的信号。
     const ordered = [best, ...probed.filter(x => x !== best)]
-      .map((x) => ({ url: x.url, from: x.from, size: x.size || 0 }))
+      .map((x) => ({ url: x.url, from: x.from, size: x.size || 0, trial: x.trial === true }))
     return {
       urls: ordered,
       url: best.url,
@@ -4583,7 +4664,7 @@ async function resolveMusicUrlFast(song, quality, pluginPool, options = {}) {
   }
   const ordered = cands.slice().sort(compareCandidates)
   return {
-    urls: ordered.map((x) => ({ url: x.url, from: x.from, size: x.size || 0 })),
+    urls: ordered.map((x) => ({ url: x.url, from: x.from, size: x.size || 0, trial: x.trial === true })),
     url: ordered[0].url,
     from: ordered[0].from,
     tried,
@@ -4594,12 +4675,16 @@ async function resolveMusicUrlFast(song, quality, pluginPool, options = {}) {
 /**
  * 候选排序（依次比较，先满足者胜出）：
  *   ① 已知死接口排最后 —— 网易 outer/url 实测 302 到 /404，放前面纯属白等；
- *   ② 官方 CDN 优先 —— 同字节少一跳，且能返回 content-range 算得出体积；
- *   ③ 体积大优先 —— 完整版，酷我 n1 试听片段只有 0.17MB；
- *   ④ 原生优先。
+ *   ② **已知试听片段排最后** —— 30 秒的无损片段可能有 5MB，按体积排会把它选出来；
+ *   ③ 官方 CDN 优先 —— 同字节少一跳，且能返回 content-range 算得出体积；
+ *   ④ 体积大优先 —— 完整版，酷我 n1 试听片段只有 0.17MB；
+ *   ⑤ 原生优先。
+ *
+ * ⚠ 必须与上面的 pickBest 同档位同顺序，改一处就要改另一处。
  */
 function compareCandidates(a, b) {
   if (!!a.weak !== !!b.weak) return a.weak ? 1 : -1
+  if (!!a.trial !== !!b.trial) return a.trial ? 1 : -1
   if (!!a.official !== !!b.official) return a.official ? -1 : 1
   if ((b.size || 0) !== (a.size || 0)) return (b.size || 0) - (a.size || 0)
   return (b.native ? 1 : 0) - (a.native ? 1 : 0)
@@ -8298,7 +8383,7 @@ __modules["src/version.js"] = function (__exports, __require) {
  * 所以统一读这里，谁也别再各写各的。
  *
  * ── 两条版本线，别混 ──────────────────────────────────────────
- *   APP_VERSION      产品版本，人看的。改功能才动它。当前 V2.4
+ *   APP_VERSION      产品版本，人看的。改功能才动它。当前 V2.5
  *   APP_VERSION_CODE 整数构建号，Android 靠它判断「能不能覆盖安装」。
  *                    每次要发新版就 +1，**不能倒退、不能重复**，
  *                    否则手机上会报「应用未安装」（签名相同也装不上）。
@@ -8324,10 +8409,10 @@ __modules["src/version.js"] = function (__exports, __require) {
  */
 
 /** 产品版本（对外展示用）。每发一版升 0.1。 */
-const APP_VERSION = 'V2.4'
+const APP_VERSION = 'V2.5'
 
 /** Android versionCode：整数、单调递增、跨次发布不可重复。每发一版 +1。 */
-const APP_VERSION_CODE = 114
+const APP_VERSION_CODE = 115
 
 /** 人类可读的完整标识，日志/关于页用。 */
 const APP_ID = 'lxmusic'
@@ -8862,7 +8947,21 @@ __exports.default = {
     return { list, total: safeInt(json.result.albumCount), page, limit, source: SOURCE }
   },
 
-  /** 原生取流（兜底）：eapi 播放地址接口 → 老版重定向接口 */
+  /**
+   * 原生取流（兜底）：eapi 播放地址接口 → 老版重定向接口
+   *
+   * ⚠ 返回类型是**字符串或 `{url, trial}`**：
+   *   网易对没有播放权限的曲子只给**试听片段**，而且是**明说的** ——
+   *   eapi 里 `freeTrialInfo = {fragmentType:-1, start:0, end:30}`，
+   *   同时 `size` 只有 481115（≈30 秒 128k），请求 lossless 也只回落 `level=standard`。
+   *   实测「想你的夜 / 关喆」有两个 id：88926 是片段（481115 字节 × 各音质都一样），
+   *   25639286 是完整曲目（10.7MB，freeTrialInfo=null）。
+   *
+   *   以前这里只返回地址字符串，于是**片段和完整版在调用方眼里长得一模一样** ——
+   *   取流链按体积排序时它排在最后面是运气，而「谁先探通」那条路径会把它直接选中，
+   *   用户听到的就是「进度条只到 30 秒、音源显示 native · 直连」。
+   *   所以现在把它标出来（`trial: true`），交给 stream.js 的 looksLikeTrial 排序。
+   */
   async getMusicUrl(song, quality = '320k') {
     const id = song && (song.id || song.songmid)
     if (!id) return null
@@ -8874,7 +8973,10 @@ __exports.default = {
           ids: `[${id}]`, level, encodeType: 'flac', br: brMap[quality] || 320000,
         }, { retry: 0, timeout: 12000 })
         const item = json && json.data && json.data[0]
-        if (item && item.url && /^https?:/.test(item.url)) return item.url
+        if (item && item.url && /^https?:/.test(item.url)) {
+          if (item.freeTrialInfo) return { url: item.url, trial: true, from: 'native' }
+          return item.url
+        }
       } catch { /* 试下一个音质 */ }
     }
     try {
@@ -8882,11 +8984,18 @@ __exports.default = {
         ids: `[${id}]`, br: brMap[quality] || 320000,
       }, { retry: 0, timeout: 12000 })
       const item = json && json.data && json.data[0]
-      if (item && item.url && /^https?:/.test(item.url)) return item.url
+      if (item && item.url && /^https?:/.test(item.url)) {
+        if (item.freeTrialInfo) return { url: item.url, trial: true, from: 'native' }
+        return item.url
+      }
     } catch { /* ignore */ }
 
-    // 最终兜底：302 跳转到 CDN（VIP 歌曲会返回非音频内容，交由调用方校验）
-    return `https://music.163.com/song/media/outer/url?id=${id}.mp3`
+    /**
+     * 最终兜底：302 跳转到 CDN。
+     * ⚠ 这条**一律按试听片段处理**：它落在 WEAK_HOSTS（实测 302 → /404），
+     * 而且对 VIP 歌曲给的就是几十秒的试听 —— 没有任何理由把它当成完整版。
+     */
+    return { url: `https://music.163.com/song/media/outer/url?id=${id}.mp3`, trial: true, from: 'native' }
   },
 
   async getLyric(song) {
