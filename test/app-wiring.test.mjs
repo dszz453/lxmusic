@@ -21,6 +21,7 @@
  */
 import fs from 'node:fs'
 import path from 'node:path'
+import vm from 'node:vm'
 import { fileURLToPath } from 'node:url'
 
 const HERE = path.dirname(fileURLToPath(import.meta.url))
@@ -238,6 +239,30 @@ ok('sw.js 的 VERSION 没被当成产品版本用（两条线要分开）',
 const swVer = /const VERSION = 'v(\d+)'/.exec(read('public/sw.js'))
 ok('sw.js 的 VERSION 存在（改静态资源必须抬它，否则手机吃旧缓存）', !!swVer,
   swVer ? 'v' + swVer[1] : '没有 VERSION')
+
+/**
+ * ⚠ sw.js 必须**语法可解析** —— 2026-10-10 发现的事故，必须钉死。
+ *
+ * V2.6 发版时，顶部那段版本说明在 v43 处**提前写了一个块注释结束标记**，于是 v43 的
+ * 说明段落到了注释外面、成了裸代码 —— 整个 sw.js 是语法错误，浏览器注册 Service
+ * Worker 直接失败（自 2.6 起，直到 10-10 才发现）。
+ *
+ * 为什么一整轮发版验收都没抓到：`verify-cf.mjs` 做的是**逐文件 sha256 对账**，
+ * 它只能证明「线上和我本地这一份一致」，证明不了「这份代码是好的」——
+ * 12 道对账全绿、SW 却根本跑不起来。所以这里改用「能不能被解析」来把门：
+ * 用 vm.Script 只做**语法**检查，不执行（sw.js 用 self/caches，执行会抛）。
+ *
+ * 顺带一提：这个文件里写注释要特别小心 —— 描述这条规则本身就可能再触发它，
+ * 所以上面一律用「块注释结束标记」来指代，不写那个两字符字面量。
+ */
+let swParseErr = ''
+try {
+  new vm.Script(read('public/sw.js'), { filename: 'public/sw.js' })
+} catch (e) {
+  swParseErr = String((e && e.message) || e).split('\n')[0]
+}
+ok('⚠ sw.js 能被解析（注释块别提前闭合 —— 否则整个 SW 注册不上，对账还全绿）',
+  swParseErr === '', swParseErr)
 
 /* --------------------------------------------------------------- 8. 桌面替身要跟得上 */
 console.log('\n== 8. 测试替身与真机形态同步 ==')

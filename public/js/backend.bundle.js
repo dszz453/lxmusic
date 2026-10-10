@@ -1,5 +1,5 @@
 /* 由 tools/build-app.mjs 自动生成，请勿手动修改。
- * 源摘要: cfbc50702d9cc878
+ * 源摘要: 5d31a064408c3d67
  * 模块数: 25
  *
  * 这是给安卓壳用的后端展平版：把 src/ 的 ESM 后端打成单个 IIFE，
@@ -8158,6 +8158,40 @@ const MIN_USABLE = 8
 /** 并发搜索上限 —— 每首一次多源聚合搜索，串行 24 次太慢，全并发又容易触发上游限流。 */
 const SEARCH_CONCURRENCY = 6
 
+/**
+ * ══════════════ AI 解析的「子请求预算」（2026-10-10 报障的根因） ══════════════
+ *
+ * Cloudflare Worker 对**单次请求**的子请求（fetch）数量有硬上限 —— 本账号实测约 **50**。
+ * 超过之后发出的 fetch 一律立即失败（`Too many subrequests`），而这条链路上每一处
+ * 失败都被 `catch` 吞掉，于是**上层看到的现象与真实原因完全不像**：
+ *
+ *   「点击『换一批』→ 每日推荐生成失败：搜索源无返回」
+ *
+ * 而真实原因是：解析阶段把配额吃光了，**兜底那条路也已经没有配额可用**。
+ *
+ * 原来的写法是「每首歌做一次**跨全部搜索源**的搜索」，24 首 × 6 源 = **144 个请求**。
+ * 同账号、同一时刻的实测对照（每次只改「默认搜索源」这一项）：
+ *
+ *   源数   解析请求数   结果
+ *   1      24           ✅ 24 首（全部命中）
+ *   2      48           ✅ 17 首
+ *   5      120          ⚠️ 9 首 —— 45 个请求成功后再也发不出去，被静默截断
+ *   6      144          ❌ 解析出的不足 MIN_USABLE(8) → 退兜底 → 兜底也发不出请求 → 抛错
+ *
+ * 所以解析阶段必须**自己数着请求发**：`RESOLVE_BUDGET` 是解析能用的上限，
+ * 余下的留给兜底（6 个源各一发）以及链路里的其它出站调用。
+ */
+const RESOLVE_BUDGET = 30
+/**
+ * 解析最多分几轮、每轮换一个源。
+ *
+ * 为什么不是「一轮全用所有源」：那样每首的请求数 = 源数，24 首 × 6 源直接把预算打穿。
+ * 分轮之后**每首每轮只花 1 个请求**，且只对**上一轮没搜到的**再花第二轮 ——
+ * 主流源（用户设置里排前面的那几个）能命中绝大多数歌曲，后面的轮次只补漏网之鱼。
+ * 这样既省配额又提高命中率：实测 24 首按 2~3 轮解析，总请求数 ≈ 28，命中 20 首以上。
+ */
+const RESOLVE_ROUNDS = 3
+
 /** 北京时间的 YYYY-MM-DD。CF Workers 的 Date 默认 UTC，偏移 +8 写死即可。 */
 function todayBJ(now = Date.now()) {
   return new Date(now + 8 * 3600 * 1000).toISOString().slice(0, 10)
@@ -8215,7 +8249,15 @@ function buildPrompt(signals) {
   return parts.join('；') || '根据大众口味推荐一些好听、传唱度高的歌曲'
 }
 
-/** 兜底：AI 不可用时退回旧的关键词轮换搜索，保证一定有结果。 */
+/**
+ * 兜底：AI 不可用（或解析出的歌太少）时，退回旧的关键词轮换搜索。
+ *
+ * ⚠ 这一发必须尽量打出去 —— 它是「每日推荐」的最后一道保底。两处加固：
+ *   · 全源那一发没结果时**降级到单源重试**：全源要 6 个子请求，单源只要 1 个。
+ *     当解析阶段已把子请求配额吃紧时（见 RESOLVE_BUDGET），只有单源还发得出去。
+ *   · 把 errors 带回去：旧版把它丢掉了，上层只能抛一句「搜索源无返回」，
+ *     用户看不出、排查的人也看不出到底是哪一步挂的。
+ */
 async function fallbackSongs(env, db, searchFn = searchOnline) {
   const day = Math.floor(Date.now() / 86400000)
   // 随机起点 + 每次手动刷新 +1，让兜底路径的「换一批」也有变化
@@ -8224,34 +8266,96 @@ async function fallbackSongs(env, db, searchFn = searchOnline) {
   // 音源走全站设置（与「搜索」同一份），不再写死
   const sources = await searchSources(env, dbmod)
   const parsed = parseQuery(keyword, sources)
-  const res = await searchFn(parsed.keyword, { sources: parsed.sources, limit: TARGET_COUNT, pluginPool: env.PLUGIN_POOL })
-  return { title: '今日精选 · ' + keyword, songs: res.list, generator: 'fallback', keyword }
+  let res = null
+  let errors = []
+  try {
+    res = await searchFn(parsed.keyword, { sources: parsed.sources, limit: TARGET_COUNT, pluginPool: env.PLUGIN_POOL })
+    errors = (res && res.errors) || []
+  } catch (e) {
+    errors = [(e && e.message) || String(e)]
+  }
+  if (!res || !Array.isArray(res.list) || !res.list.length) {
+    const first = parsed.sources[0]
+    if (first && parsed.sources.length > 1) {
+      try {
+        const retry = await searchFn(parsed.keyword, { sources: [first], limit: TARGET_COUNT, pluginPool: env.PLUGIN_POOL })
+        if (retry && Array.isArray(retry.list) && retry.list.length) {
+          res = retry
+          errors = retry.errors || []
+        }
+      } catch (e) {
+        errors = errors.concat([(e && e.message) || String(e)])
+      }
+    }
+  }
+  return {
+    title: '今日精选 · ' + keyword,
+    songs: res && Array.isArray(res.list) ? res.list : [],
+    generator: 'fallback',
+    keyword,
+    errors,
+  }
 }
 
 /**
  * 解析 AI 给的「歌名+歌手」列表 → 真实可播放歌曲。
- * 每首做一次多源聚合搜索取第一条（与「猜你喜欢」同口径）；
- * 搜不到（AI 编造 / 太冷门）的直接跳过，宁缺毋滥。
+ *
+ * 与「猜你喜欢」同口径：每首取第一条结果，搜不到（AI 编造 / 太冷门）的跳过，宁缺毋滥。
+ *
+ * ⚠ 与旧版的关键区别 —— **按轮次搜，而不是一次铺开所有源**：
+ *   旧版每首做一次「跨全部源」的聚合搜索，24 首 × 6 源 = 144 个子请求，直接撞上
+ *   Cloudflare 单次请求的子请求上限（本账号实测 ≈50），其后的请求**全部静默失败**
+ *   （被 catch 吞掉），表现就是「换一批」报「搜索源无返回」。对照数据见文件头
+ *   RESOLVE_BUDGET 那段。现在：第 1 轮用设置里**第 1 个源**搜全部待解析歌曲；
+ *   第 2 轮只用第 2 个源补搜上一轮**没命中**的，以此类推。
+ *   每首每轮只花 1 个请求，总量由预算兜住，而且只对漏网的再花下一轮 ——
+ *   省配额的同时命中率反而更高（实测 24 首约 28 个请求、命中 20 首以上）。
+ *
  * searchFn 可注入（单测用），默认真搜索。
+ * @param {object} [opts] 仅供单测/调试覆盖
+ * @param {number} [opts.budget] 解析可用的子请求上限（默认 RESOLVE_BUDGET）
+ * @param {number} [opts.rounds] 最多分几轮（默认 min(源数, RESOLVE_ROUNDS)）
  */
-async function resolveAiSongs(env, db, aiSongs, searchFn = searchOnline) {
+async function resolveAiSongs(env, db, aiSongs, searchFn = searchOnline, opts = {}) {
   // 同上：音源跟「搜索」共用一份设置，别在这里另立一套
-  const parsed = parseQuery('', await searchSources(env, dbmod))
-  const out = []
-  let cursor = 0
-  async function worker() {
-    while (cursor < aiSongs.length) {
-      const item = aiSongs[cursor++]
-      const q = (item.name + ' ' + (item.singer || '')).trim()
-      if (!q) continue
-      try {
-        const res = await searchFn(q, { sources: parsed.sources, limit: 3, pluginPool: env.PLUGIN_POOL })
-        if (res && Array.isArray(res.list) && res.list.length) out.push(res.list[0])
-      } catch { /* 单首失败不影响整体 */ }
+  const sources = await searchSources(env, dbmod)
+  const budget = Math.max(1, Number(opts.budget) || RESOLVE_BUDGET)
+  const rounds = Math.max(1, Number(opts.rounds) || Math.min(sources.length, RESOLVE_ROUNDS))
+
+  // 结果按 AI 给的顺序落位（最后 filter 仍保序），而不是「谁先返回谁排前面」
+  const slots = new Array(aiSongs.length).fill(null)
+  let pending = aiSongs
+    .map((item, index) => ({ item, index }))
+    .filter(x => ((x.item.name || '') + ' ' + (x.item.singer || '')).trim())
+  let used = 0
+
+  for (let round = 0; round < rounds && pending.length && used < budget; round++) {
+    const src = sources[round % sources.length]
+    if (!src) break
+    // 预算只够搜一部分时，剩下的留到下一轮；轮次用完就放弃，不硬撑（硬撑=撞上限=全灭）
+    const room = Math.min(pending.length, budget - used)
+    const batch = pending.slice(0, room)
+    const rest = pending.slice(room)
+    const missed = []
+    let cursor = 0
+    async function worker() {
+      while (cursor < batch.length) {
+        const cur = batch[cursor++]
+        const q = ((cur.item.name || '') + ' ' + (cur.item.singer || '')).trim()
+        try {
+          const res = await searchFn(q, { sources: [src], limit: 3, pluginPool: env.PLUGIN_POOL })
+          if (res && Array.isArray(res.list) && res.list.length) slots[cur.index] = res.list[0]
+          else missed.push(cur)
+        } catch { /* 单首失败不影响整体，下一轮换个源再试 */ missed.push(cur) }
+      }
     }
+    await Promise.all(Array.from({ length: Math.min(SEARCH_CONCURRENCY, batch.length) }, worker))
+    used += batch.length
+    // 下一轮先补这一轮没搜到的，再轮因预算被推迟的
+    pending = missed.concat(rest)
   }
-  await Promise.all(Array.from({ length: Math.min(SEARCH_CONCURRENCY, aiSongs.length) }, worker))
-  return out
+
+  return slots.filter(Boolean)
 }
 
 /**
@@ -8295,8 +8399,16 @@ async function generateDaily(env, db, { userId = null, force = false, toWeb = nu
     record.title = fb.title
     record.songs = fb.songs.map(web)
     record.generator = fb.generator
+    record.errors = fb.errors
   }
-  if (!record.songs.length) throw new Error('每日推荐生成失败：搜索源无返回')
+  if (!record.songs.length) {
+    // 把失败原因带出去：CF 的子请求上限、上游 429、插件 404 …… 只有它看得见。
+    // 旧版这里只有一句「搜索源无返回」，排查时完全无从下手（2026-10-10 报障）。
+    const why = record.errors && record.errors.length
+      ? '（' + record.errors.slice(0, 3).join('；') + '）'
+      : ''
+    throw new Error('每日推荐生成失败：搜索源无返回' + why)
+  }
 
   await saveDaily(db, record)
   // 记下这次用的音源：下次改了设置才知道该不该重算
@@ -8541,7 +8653,7 @@ __modules["src/version.js"] = function (__exports, __require) {
  * 所以统一读这里，谁也别再各写各的。
  *
  * ── 两条版本线，别混 ──────────────────────────────────────────
- *   APP_VERSION      产品版本，人看的。改功能才动它。当前 V2.6
+ *   APP_VERSION      产品版本，人看的。改功能才动它。当前 V2.7
  *   APP_VERSION_CODE 整数构建号，Android 靠它判断「能不能覆盖安装」。
  *                    每次要发新版就 +1，**不能倒退、不能重复**，
  *                    否则手机上会报「应用未安装」（签名相同也装不上）。
@@ -8567,10 +8679,10 @@ __modules["src/version.js"] = function (__exports, __require) {
  */
 
 /** 产品版本（对外展示用）。每发一版升 0.1。 */
-const APP_VERSION = 'V2.6'
+const APP_VERSION = 'V2.7'
 
 /** Android versionCode：整数、单调递增、跨次发布不可重复。每发一版 +1。 */
-const APP_VERSION_CODE = 116
+const APP_VERSION_CODE = 117
 
 /** 人类可读的完整标识，日志/关于页用。 */
 const APP_ID = 'lxmusic'

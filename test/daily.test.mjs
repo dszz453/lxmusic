@@ -227,6 +227,45 @@ const searchEmpty = async () => ({ list: [] })
   } catch { threw = true }
   ok('兜底也搜不到时向上抛错', threw)
 
+  /* 4f-2. 兜底自己必须尽量打出去：全源一发失败 → 降级单源重试
+   *
+   * 为什么：兜底是「每日推荐」的最后一道保底。全源一发要 6 个子请求，单源只要 1 个；
+   * 当解析阶段已经把子请求配额吃紧时（CF 单次请求上限实测 ≈50），只有单源还发得出去。
+   */
+  {
+    const dbF = withHistory(fakeDb(), [], [])
+    const envF = fakeEnv({ DB: dbF })
+    await dbF.prepare('INSERT OR REPLACE INTO settings (k, v) VALUES (?,?)').bind('search.sources', 'wy,kg').run()
+    const widths = []
+    const flaky = async (q, opts) => {
+      const srcs = (opts && opts.sources) || []
+      widths.push(srcs.length)
+      if (srcs.length > 1) return { list: [], errors: ['酷狗: 响应超时'] }
+      return searchOk(q)
+    }
+    const recF = await generateDaily(envF, dbF, { force: true, toWeb: (s) => s, aiFn: aiBoom, searchFn: flaky })
+    ok('兜底：全源那一发没结果时降级到单源重试',
+      recF.generator === 'fallback' && recF.songs.length > 0 && widths.join(',') === '2,1', widths.join(','))
+  }
+
+  /* 4f-3. 兜底彻底失败 → 错误必须带上真实原因
+   *
+   * 旧版只抛一句「搜索源无返回」：用户看不出、排查的人也看不出到底是配额满了、
+   * 上游 429 还是插件 404 —— 2026-10-10 那次报障正是靠这条信息才定位到根因。
+   */
+  {
+    const dbG = withHistory(fakeDb(), [], [])
+    const envG = fakeEnv({ DB: dbG })
+    await dbG.prepare('INSERT OR REPLACE INTO settings (k, v) VALUES (?,?)').bind('search.sources', 'wy,kg').run()
+    const doomed = async () => ({ list: [], errors: ['汽水VIP: HTTP 404'] })
+    let msg = ''
+    try {
+      await generateDaily(envG, dbG, { force: true, aiFn: aiBoom, searchFn: doomed })
+    } catch (e) { msg = String((e && e.message) || e) }
+    ok('⚠ 兜底失败时把真实原因写进错误（「搜索源无返回」本身等于没信息）',
+      msg.includes('搜索源无返回') && msg.includes('汽水VIP: HTTP 404'), msg)
+  }
+
   /* 4g. 音源必须来自「默认搜索源」设置 —— 2026-10-09 报障的根因
    *
    * 原来这里写死 ['kg','wy','kw']（酷狗排第一），于是管理后台把默认搜索源改成
@@ -422,7 +461,19 @@ const searchEmpty = async () => ({ list: [] })
   }
 }
 
-/* ---------- 5. resolveAiSongs ---------- */
+/* ---------- 5. resolveAiSongs：单源分轮 + 子请求预算 ----------
+ *
+ * ⚠ 2026-10-10 报障：CF 版「换一批」报「每日推荐生成失败：搜索源无返回」。
+ * 根因不在搜索本身（单发搜索一直正常），而在**请求数**：旧版对每首歌做一次
+ * 「跨全部搜索源」的搜索 = 24 首 × 6 源 = 144 个子请求，撞上 Cloudflare 单次请求的
+ * 子请求上限（本账号实测 ≈50）。超出后的 fetch 全部静默失败，于是：
+ * · 解析出来的歌不足 MIN_USABLE(8) → 退兜底；
+ * · 兜底自己那 6 个请求也已在上限之外 → 全灭 → 抛「搜索源无返回」。
+ * 同账号实测对照（只改「默认搜索源」）：1 源→24 个请求→24 首 ✅；
+ * 2 源→48→17 首 ✅；5 源→120→9 首（被截断）；6 源→144→失败 ❌。
+ *
+ * 所以护栏钉三件事：**每轮只用单源**、**总量被预算按住**、**只对漏网的补下一轮**。
+ */
 {
   const got = await resolveAiSongs(fakeEnv(), fakeDb(), [
     { name: '晴天', singer: '周杰伦' },
@@ -430,6 +481,54 @@ const searchEmpty = async () => ({ list: [] })
     { name: '冷门歌', singer: '' },   // 搜索失败跳过
   ], async (q) => { if (q.includes('冷门')) throw new Error('无结果'); return searchOk(q) })
   ok('resolveAiSongs：跳过空名与搜索失败的', got.length === 1 && got[0].name.includes('晴天'))
+
+  const many = Array.from({ length: 24 }, (_, i) => ({ name: '曲' + i, singer: '' }))
+
+  // 传下去的源必须是**单元素**：一次铺开全部源 = 每首 6 个请求 = 直接撞上限
+  const seenSrcs = []
+  const spyAll = async (q, opts) => { seenSrcs.push((opts && opts.sources) || []); return searchOk(q) }
+  const rAll = await resolveAiSongs(fakeEnv(), fakeDb(), many, spyAll)
+  ok('⚠ 解析每首每轮只向**一个**源发请求（不是一次铺开全部源）',
+    seenSrcs.length > 0 && seenSrcs.every((s) => Array.isArray(s) && s.length === 1),
+    JSON.stringify(seenSrcs.slice(0, 3)))
+  ok('解析：全部命中时只搜一轮（不对已命中的重搜）',
+    rAll.length === 24 && seenSrcs.length === 24, 'requests=' + seenSrcs.length)
+
+  // 预算按住：撞上限之前必须自己先停
+  let calls = 0
+  const spyCap = async () => { calls++; return { list: [] } }
+  await resolveAiSongs(fakeEnv(), fakeDb(), many, spyCap, { budget: 5 })
+  ok('⚠ 解析的请求数被预算按住（不能放任它把子请求配额打穿）', calls === 5, 'calls=' + calls)
+
+  // 分轮补漏：搜不到的换源再试，最多 rounds 轮
+  let calls3 = 0
+  const spyRounds = async () => { calls3++; return { list: [] } }
+  await resolveAiSongs(fakeEnv(), fakeDb(), many, spyRounds, { rounds: 3, budget: 100 })
+  ok('解析：搜不到的会换源补搜（最多 3 轮），不是一轮定生死',
+    calls3 === 72, 'calls=' + calls3)
+
+  // 保序：第一首没搜到也不该把后面的提前
+  const rOrder = await resolveAiSongs(fakeEnv(), fakeDb(), [
+    { name: 'A', singer: '' }, { name: 'B', singer: '' }, { name: 'C', singer: '' },
+  ], async (q) => ({ list: /^B$/.test(q) ? [] : [{ source: 'kg', id: 'i_' + q, name: q }] }))
+  ok('解析：结果按 AI 给的顺序保序（不是谁先回来谁排前面）',
+    rOrder.map((s) => s.name).join(',') === 'A,C', JSON.stringify(rOrder.map((s) => s.name)))
+
+  /* 结构断言：旧写法不许回来。
+   *
+   * ⚠ 必须先「切函数体再断言」，而且**切完先断长度** —— 否则正则没抠到东西时
+   * 下面的「不包含」永远为真、断言全变空却依然显示通过（本项目踩过）。
+   * 也不能拿整文件匹配：`requeryDailySources`（换源）是**合法地**要用全部源搜索的，
+   * 拿整文件查「有没有全源搜索」会永远红。
+   */
+  const dSrc = deComment(readFileSync(new URL('../src/server/daily.js', import.meta.url), 'utf8'))
+  const resolveFn = (dSrc.match(/export async function resolveAiSongs\([\s\S]*?\n}\n/) || [''])[0]
+  ok('⚠ 结构：resolveAiSongs 函数体抠出来了（不是空壳，否则下面那条是空断言）',
+    resolveFn.length > 400, 'len=' + resolveFn.length)
+  ok('⚠ 结构：解析只传单源（sources: [src]），且不再出现全源写法',
+    /sources: \[src\]/.test(resolveFn) && /parsed\.sources/.test(resolveFn) === false)
+  ok('⚠ 结构：解析有子请求预算（撞 CF 上限前自己先停）',
+    /const RESOLVE_BUDGET = \d+/.test(dSrc) && /budget - used/.test(resolveFn))
 }
 
 /* ---------- 汇总 ---------- */

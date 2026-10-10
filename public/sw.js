@@ -22,14 +22,24 @@
  *      `src/providers/{index,wy}.js` 开始标记试听，`js/player.js` 拿到 metadata 就提示。
  *      同 v41 的道理：它走「同源静态资源 SWR」分支，不抬 VERSION 用户会先跑一版
  *      旧后端（还会把 30 秒片段当完整曲目交出去），要再刷一次才生效。
- */
+ *
  * v43：`js/backend.bundle.js` 又变了 —— 这一版给插件**专有源**开了通道：插件自己注册的源
  *      （汽水 `qsvip`）现在能被列出 / 勾选 / 搜索取流；`js/admin.js` 与 `js/app.js` 也跟着改
  *      （管理页把插件源并进「默认搜索源」那一列、搜索页给插件源单独一行 chip、
  *      「导入歌单」下拉仍只用内置平台）。同 v41/v42 的道理：bundle 走「同源静态资源 SWR」
  *      分支、admin/app 在 PRECACHE 里，不抬 VERSION 用户会先吃到一整轮旧前端。
+ *
+ * v44：`js/backend.bundle.js` 又变了 —— 这一版修「CF 版每日推荐点『换一批』报
+ *      『搜索源无返回』」：`src/server/daily.js` 的 AI 解析改成**单源分轮 + 子请求预算**
+ *      （旧版 24 首 × 6 源 = 144 个子请求，撞上 Cloudflare 单次请求的 fetch 上限
+ *      —— 本账号实测约 50 —— 超出的请求全被静默吞掉，连兜底那一发也发不出去）。
+ *      同 v41~v43 的道理：bundle 走「同源静态资源 SWR」分支，不抬 VERSION 用户会先跑旧后端。
+ *      ⚠ 顺带修一个发版事故：本文件顶部这段说明在 v43 处**提前写了一个块注释结束标记**
+ *        （星号加斜杠），把 v43 的说明变成了裸代码 —— 整个 sw.js 语法错误、
+ *        Service Worker 根本注册不上（自 2.6 起，2026-10-10 才发现）。
+ *        护栏：test/home-cache.test.mjs 里用 node --check 校验本文件可被解析。
  */
-const VERSION = 'v43'
+const VERSION = 'v44'
 const STATIC_CACHE = 'lxmusic-static-' + VERSION
 const SHELL_CACHE = 'lxmusic-shell-' + VERSION
 
