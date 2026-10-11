@@ -1355,7 +1355,6 @@ section('15. 版本号一致性（防止发版漏改）')
   const fs2 = require('fs')
   const path2 = require('path')
   const P2 = path2.resolve(__dirname, '..')
-  const R2 = path2.resolve(P2, '..')
 
   const m = SCRIPT.match(/var CLIENT_VERSION = '([^']+)'/)
   ok(!!m, '前端有唯一的 CLIENT_VERSION 常量')
@@ -1366,15 +1365,19 @@ section('15. 版本号一致性（防止发版漏改）')
 
   const manifest = fs2.readFileSync(path2.join(P2, 'AndroidManifest.xml'), 'utf8')
   const strings = fs2.readFileSync(path2.join(P2, 'res', 'values', 'strings.xml'), 'utf8')
-  const build = fs2.readFileSync(path2.join(R2, 'build_yunmusic.sh'), 'utf8')
+  // ⚠ 构建脚本就在本目录（build.sh），**不在**上一级。
+  //    早先这里读的是上一级的 build_yunmusic.sh —— 那是本地开发布局下的位置，
+  //    一旦这份客户端被放进大仓库的子目录（如 lxmusic/yunmusic-client/），
+  //    上一级就没有那个文件了，测试会以「测试脚本自身异常」的形式炸掉。
+  const build = fs2.readFileSync(path2.join(P2, 'build.sh'), 'utf8')
   const app = fs2.readFileSync(path2.join(P2, 'src', 'com', 'yunmusic', 'app', 'App.java'), 'utf8')
   const act = fs2.readFileSync(path2.join(P2, 'src', 'com', 'yunmusic', 'app', 'MainActivity.java'), 'utf8')
 
   ok(new RegExp('android:versionName="' + ver + '"').test(manifest), 'AndroidManifest versionName 与前端一致', 'want ' + ver)
   ok(new RegExp('android:versionCode="' + code + '"').test(manifest), 'AndroidManifest versionCode 与前端一致', 'want ' + code)
   ok(new RegExp('version_name">' + ver + '<').test(strings), 'strings.xml version_name 与前端一致')
-  ok(new RegExp('VERSION_NAME="' + ver + '"').test(build), 'build_yunmusic.sh VERSION_NAME 与前端一致')
-  ok(new RegExp('VERSION_CODE=' + code + '\\b').test(build), 'build_yunmusic.sh VERSION_CODE 与前端一致')
+  ok(new RegExp('VERSION_NAME="' + ver + '"').test(build), 'build.sh VERSION_NAME 与前端一致')
+  ok(new RegExp('VERSION_CODE=' + code + '\\b').test(build), 'build.sh VERSION_CODE 与前端一致')
   ok(app.indexOf(ver + ' (' + code + ')') >= 0, 'App.java 崩溃报告里的版本号一致')
   ok(act.indexOf('云音乐 ' + ver) >= 0, '原生顶栏标题里的版本号一致')
 

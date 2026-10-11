@@ -1,0 +1,24 @@
+# 统一换行符为 LF
+#
+# 为什么必须显式声明：本机 core.autocrlf=true，Windows 上 checkout 出来的 shell
+# 脚本会带 CRLF，跑到 Linux CI 里就变成
+#     build.sh: line 35: $'\r': command not found
+#     syntax error near unexpected token `$'in\r''
+# 这种报错完全指不到「换行符」这个真正的原因。
+#
+# ⚠ 另一条链路也要留意：tools/publish-github.mjs 是**直接读磁盘文件**上传的
+#   （为了绕开 git 协议），它不经过 git 的换行符规范化 —— 磁盘上是 CRLF，
+#   传到 GitHub 上就还是 CRLF，`.gitattributes` 管不到它。
+#   所以往这个仓库塞新文件时，落盘的那一份必须自己保证是 LF。
+* text=auto eol=lf
+
+# 二进制文件明确标记（text=auto 本可自动识别，显式声明更保险）
+*.png binary
+*.jpg binary
+*.jpeg binary
+*.gif binary
+*.ico binary
+*.keystore binary
+*.apk binary
+*.jar binary
+*.zip binary

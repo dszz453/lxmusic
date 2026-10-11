@@ -1,0 +1,12 @@
+# 统一换行符为 LF
+#
+# build.sh 是要在 Linux CI 上跑的 shell 脚本。本机 core.autocrlf=true，
+# 若不显式声明，checkout 到 Linux 后脚本会带 CRLF，报
+#     $'\r': command not found
+# 这种错完全指不到换行符。
+* text=auto eol=lf
+
+*.png binary
+*.jpg binary
+*.keystore binary
+*.apk binary
