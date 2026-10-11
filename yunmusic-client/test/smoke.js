@@ -334,6 +334,10 @@ const CANCEL_CALLS = []
 const IMG_CALLS = []         // 记录原生 fetchImage 调用
 const API_CALLS = []         // 记录每次接口调用 { path, method, body }
 const MEDIA_CALLS = []       // 记录每次 updateMedia 的完整入参（锁屏/控制中心那份数据）
+// 记录每次 setChromeHidden 的入参。原生顶栏是 WebView 的兄弟节点，网页改不动它，
+// 只能靠这个桥方法开关；一旦它停在「隐藏」而播放器其实没开，WebView 就顶到 y=0，
+// 当前页最上面那条 sticky 栏会落进状态栏底下点不动（实测报障过）。
+const CHROME_CALLS = []
 let LAST_URL = ''
 let LAST_BODY = ''
 const HASHES = []
@@ -457,6 +461,11 @@ async function boot() {
         // 记录每次同步的完整入参：锁屏/控制中心要的是「封面 + 时长 + 进度」，
         // 只给歌名歌手的话锁屏上没有封面、拖动条是死的，所以这里必须逐项断言
         updateMedia() { MEDIA_CALLS.push(Array.prototype.slice.call(arguments)) },
+        // 原生顶栏开关。⚠ 这个假桥以前**没有**这个方法，于是页面里那句
+        // `if (window.YunBridge && window.YunBridge.setChromeHidden)` 直接被跳过，
+        // 「顶栏被误藏、之后再没人恢复」这条链路整条测不到 —— 实测漏过一个 bug：
+        // 播放器展开后 1 秒内收起，残留定时器会把顶栏压回隐藏且永不恢复。
+        setChromeHidden(hidden) { CHROME_CALLS.push(!!hidden) },
         httpFetch: mockFetch,
         getServerConfig() { return JSON.stringify(CFG) },
         switchLine(idx) {
@@ -1623,10 +1632,93 @@ await sleep(120)
 
   ok(/\[120, 320, 600, 1000\]/.test(NOCOMMENT),
     '开播放器后多次确认原生顶栏是藏着的（它可能被重新显示回来，把这一排挤下去）')
+
+  /*
+   * 那批延时确认的**判据**必须是同步翻转的 playerOpen，不能是 $('#player').hidden。
+   *
+   * 曾经的写法是 `if (!$('#player').hidden)`，而 hidden 要等收起动画走完（340ms）
+   * 才置位。于是「展开后 1 秒内就收起」会踩进一个竞态窗口：残留定时器看到 hidden
+   * 还是 false，以为播放器还开着，又把顶栏压回隐藏 —— 而此后**再没有任何代码恢复它**。
+   * 后果：WebView 顶到 y=0（窗口边到边），当前页最上面那条 sticky 栏落进状态栏底下，
+   * 看着「跑到最顶部」，点上去被系统状态栏吃掉 —— 也就是「点不开」。
+   */
+  ok(/var playerOpen = false/.test(NOCOMMENT), '有 playerOpen 这个同步状态量当判据')
+  ok(/setTimeout\(function \(\) \{ if \(playerOpen\) setChromeHidden\(true\) \}/.test(NOCOMMENT),
+    '延时确认的判据是 playerOpen，不是 $(\'#player\').hidden（后者天生滞后一个动画时长）')
+  ok(!/if \(!\$\('#player'\)\.hidden\) setChromeHidden/.test(NOCOMMENT),
+    '没有任何地方再拿 hidden 当顶栏判据')
+
+  const closeBody = (NOCOMMENT.match(/function closePlayer\(\) \{[\s\S]*?\n  \}/) || [''])[0]
+  ok(closeBody !== '', '取到了 closePlayer 函数体（防止下面三条退化成空串假绿灯）')
+  const iFlag = closeBody.indexOf('playerOpen = false')
+  const iChrome = closeBody.indexOf('setChromeHidden(false)')
+  ok(iFlag >= 0, 'closePlayer 里同步翻 playerOpen')
+  ok(iChrome >= 0, 'closePlayer 里通知原生显示顶栏')
+  ok(iFlag >= 0 && iChrome >= 0 && iFlag < iChrome,
+    'closePlayer 先翻 playerOpen、再通知原生（顺序反了会留下竞态窗口）')
+
+  // 换页时校准一次：只要播放器没开着，顶栏就必须是显示的
+  ok(/if \(!playerOpen\) setChromeHidden\(false\)/.test(NOCOMMENT),
+    '每次换页都校准顶栏（兜住「某条路径藏了却没恢复」，否则会长期卡在错的状态）')
+
+  // 第二道保险：就算顶栏真的被藏了，二级页的搜索栏也不能落进状态栏底下
+  ok(/#app\.is-subpage \.view \.searchbar\s*\{[^}]*padding-top\s*:\s*calc\(8px \+ var\(--safe-top\)\)/.test(HTML),
+    '二级页搜索栏用 --safe-top 让开状态栏（共用前端早就这么写，这份单文件前端曾漏掉）')
 }
 
 /* ============================================================ */
-section('18. 全局异常检查')
+section('18. 播放器 ↔ 原生顶栏的状态机（「搜索框跑到最顶部、点不开」）')
+/*
+ * 报障原文：「开始播放歌曲后，把播放窗口最小化，去搜索新的歌曲，
+ *           搜索框跑到最顶部，然后失效，点不开」。
+ *
+ * 根因：原生顶栏被误藏且再没人恢复 → WebView 顶到 y=0（窗口是边到边的）→
+ *       搜索页那条 sticky 的搜索框落进状态栏底下，点上去被系统状态栏吃掉。
+ * 触发条件：展开播放器后 **1 秒内**就收起 —— 残留的延时定时器在收起动画那
+ *       340ms 的窗口里看到 hidden 还是 false，以为播放器还开着，又把顶栏压回去。
+ *
+ * 这里按用户的操作顺序原样跑一遍（展开 → 快速收起 → 去搜索页），
+ * 断言最终原生顶栏是**显示**的。静态断言看的是「源码写没写对」，
+ * 这条看的是「跑起来是不是那个行为」—— 竞态只有跑才抓得到。
+ */
+{
+  const player = $('#player')
+  const mini = $('#miniplayer')
+  const wasHidden = player.hidden
+
+  // 点迷你条是 openPlayer() 的唯一入口，先让它露出来
+  mini.hidden = false
+  CHROME_CALLS.length = 0
+
+  mini.dispatchEvent(new win.MouseEvent('click', { bubbles: true }))
+  await sleep(150)                       // ← 故意在 1 秒内就收起，踩那个竞态
+  ok(CHROME_CALLS[CHROME_CALLS.length - 1] === true, '展开播放器后原生顶栏是藏着的')
+  ok(player.hidden === false, '播放器确实展开了（否则上面那条是空断言）')
+
+  $('#playerCollapse').dispatchEvent(new win.MouseEvent('click', { bubbles: true }))
+  ok(CHROME_CALLS[CHROME_CALLS.length - 1] === false, '一点收起就通知原生把顶栏显示回来')
+
+  // 越过收起动画（340ms）与那批定时器的最后期限（1000ms）
+  await sleep(1100)
+  const trail = CHROME_CALLS.map(v => (v ? '藏' : '显')).join('→')
+  ok(CHROME_CALLS[CHROME_CALLS.length - 1] === false,
+    '残留定时器全部过期后，顶栏仍是**显示**的（不会被压回隐藏）', '轨迹 ' + trail)
+  ok(player.hidden === true, '播放器本身确实收起了（不是靠「没关掉」蒙混过关）')
+
+  // 报障的最后一步：去搜索页
+  await go('#/search')
+  ok(CHROME_CALLS[CHROME_CALLS.length - 1] === false, '切到搜索页后顶栏仍是显示的')
+  ok($('#searchInput') !== null, '搜索页渲染出来了（页面自带输入框）')
+  ok($('#app').classList.contains('is-subpage'),
+    '搜索页带 is-subpage（全局顶栏那条搜索胶囊被藏掉，不会出现「上下两个搜索框」）')
+
+  // 收尾还原，别影响后面的全局异常检查
+  player.hidden = wasHidden
+  CHROME_CALLS.length = 0
+}
+
+/* ============================================================ */
+section('19. 全局异常检查')
 ok(LOGS.length === 0, '全程无未捕获 JS 异常', LOGS.slice(0, 5).join(' | '))
 
 try { dom.window.close() } catch (e) {}

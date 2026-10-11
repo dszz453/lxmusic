@@ -510,7 +510,7 @@ public class YunBridge {
             conn.setReadTimeout(20000);
             conn.setInstanceFollowRedirects(true);
             conn.setRequestProperty("User-Agent",
-                    "Mozilla/5.0 (Linux; Android) YunMusic/2.7");
+                    "Mozilla/5.0 (Linux; Android) YunMusic/2.8");
             // 部分图床看 Referer，缺了会返回 403；这里补上自身 origin 就够了
             try {
                 URL u = new URL(urlStr);

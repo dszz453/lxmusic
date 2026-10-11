@@ -484,6 +484,19 @@ em{font-style:normal}
 
 /* ============================ 搜索页 ============================ */
 .searchbar{display:flex;align-items:center;gap:8px;padding:8px 14px 10px;position:sticky;top:0;z-index:10;background:var(--surface)}
+/*
+ * 二级页的搜索栏让开状态栏。
+ *
+ * 正常情况下顶栏是显示的，`--safe-top` 被原生置为 0，这条规则等于没生效
+ * （8px + 0px 就是原来的 8px）。它只在「原生顶栏被藏起来」时才起作用 ——
+ * 那时 WebView 顶到 y=0（窗口是边到边的），而 .searchbar 是 sticky top:0，
+ * 会正好落进状态栏底下：看着像「搜索框跑到最顶部」，点上去被系统状态栏吃掉。
+ *
+ * 这是一道保险，不是主修：主修是 openPlayer/closePlayer 里那个 playerOpen 竞态
+ * （见脚本里 playerOpen 的说明）。共用前端 public/css/app.css 早就这么写了，
+ * 这份单文件前端漏了，补上。
+ */
+#app.is-subpage .view .searchbar{padding-top:calc(8px + var(--safe-top))}
 .searchbar__back{flex:0 0 auto}
 .searchbar__input{
   flex:1 1 auto;height:36px;border-radius:999px;border:0;background:#f2f2f3;padding:0 14px;
@@ -852,14 +865,16 @@ em{font-style:normal}
   /**
    * 客户端版本号 —— **唯一来源**。
    *
-   * 这个数字必须和下面三处完全一致（自测里有断言锁着）：
+   * 这个数字必须和下面这些地方完全一致（自测里逐条锁着）：
    *   - AndroidManifest.xml 的 versionName / versionCode
    *   - res/values/strings.xml 的 version_name
-   *   - build_yunmusic.sh 的 VERSION_NAME / VERSION_CODE
+   *   - build.sh 的 VERSION_NAME / VERSION_CODE
+   *   - App.java 崩溃报告里的「版本: Vx.y (code)」
+   *   - MainActivity.java 原生顶栏标题的「云音乐 Vx.y」
    * 以前它在抽屉菜单、关于页、顶栏文案里各写一遍，发版必然漏改几处
    * （实测发到 V2.3 时抽屉里还写着 V2.2），所以收口到这里。
    */
-  var CLIENT_VERSION = 'V2.7'
+  var CLIENT_VERSION = 'V2.8'
 
   /* ------------------------------ 兼容垫片 ------------------------------
      部分老设备的系统 WebView 停留在 Chrome 4x，缺少下面这些 ES6 方法。
@@ -2057,8 +2072,30 @@ em{font-style:normal}
     }
   }
 
+  /*
+   * 播放器「是否已展开」的**唯一事实来源**。
+   *
+   * ⚠ 千万不要拿 `$('#player').hidden` 当判据 —— 它是**收起动画走完之后**才置位的：
+   *   closePlayer() 里的 `el.hidden = true` 要等 340ms。而下面 openPlayer() 那批
+   *   延时定时器（120/320/600/1000ms）和 assertChrome() 以前都在判断这个字段，
+   *   于是「展开后不到 1 秒就收起」会踩进一个 340ms 的竞态窗口：
+   *
+   *     t=0     openPlayer()            顶栏藏
+   *     t=150   closePlayer()           顶栏显（正确）
+   *     t=320   残留定时器触发          hidden 此刻**还是 false** → 又去把顶栏藏起来
+   *     t=490   el.hidden = true        播放器终于藏了，但**再没有任何代码恢复顶栏**
+   *
+   *   后果：原生顶栏永久消失 → WebView 顶到 y=0（窗口是边到边的）→
+   *   当前页最上面那条 sticky 的搜索框落进状态栏底下 → 看着「跑到最顶部」，
+   *   点上去被系统状态栏吃掉 → 用户说的「点不开」。
+   *
+   * 所以判据用一个**同步**翻转的布尔量，它和 CSS 动画状态彻底解耦。
+   */
+  var playerOpen = false
+
   function openPlayer() {
     var el = $('#player')
+    playerOpen = true
     el.hidden = false
     setChromeHidden(true)
     requestAnimationFrame(function () {
@@ -2076,14 +2113,21 @@ em{font-style:normal}
      * 甚至用户下拉通知栏之后把顶栏重新显示回来。顶栏一回来，WebView 就被挤下去，
      * 播放器最上面那排「收起箭头 / 音质」跟着往下掉 —— 用户看到的就是「按钮不在顶部」。
      * 这里在一秒内补几次，覆盖掉这些时机；期间只要播放器还开着就一直压着。
+     *
+     * 判据必须是 playerOpen（同步），**不能用 el.hidden** —— 收起动画期间
+     * el.hidden 还是 false，用它就会把「已经收起了」误判成「还开着」，
+     * 把顶栏压回去再也回不来。详见 playerOpen 上面的说明。
      */
     ;[120, 320, 600, 1000].forEach(function (delay) {
-      setTimeout(function () { if (!$('#player').hidden) setChromeHidden(true) }, delay)
+      setTimeout(function () { if (playerOpen) setChromeHidden(true) }, delay)
     })
     $('#view').classList.add('is-player-open')
   }
   function closePlayer() {
     var el = $('#player')
+    // 先同步翻转判据，再动动画 —— 这样上面那批残留定时器即使随后触发，
+    // 也会因为 playerOpen 已是 false 而不再去压顶栏。
+    playerOpen = false
     el.classList.remove('is-open')
     setChromeHidden(false)
     $('#view').classList.remove('is-player-open')
@@ -2091,21 +2135,25 @@ em{font-style:normal}
   }
 
   /*
-   * 兜底：只要播放器还开着，屏幕尺寸/可见性一变就重新压一次原生顶栏。
+   * 兜底校准：把原生顶栏拉到「与播放器状态一致」的位置。
    *
    * 覆盖的是这些时机：横竖屏切换、状态栏高度变化（下拉通知栏、来电横幅）、
    * 从后台切回前台 —— 这些都会让原生重新走一遍 inset 计算，
    * 有可能顺手把顶栏显示回来。顶栏一回来 WebView 就被挤下去，
    * 播放器顶部那排按钮跟着往下掉。
+   *
+   * ⚠ 这里是**双向**的：以前只做「播放器开着 → 压住顶栏」，播放器关着时什么都不做。
+   *   一旦某条路径把顶栏藏了却没恢复（比如收起播放器的那个竞态），
+   *   就再也没有代码能把它拉回来。现在两个方向都校准：
+   *   播放器开着就藏，没开就确保显示 —— 任何一次屏幕变化都会把状态拉回正确值。
    */
-  function assertChromeHidden() {
-    if ($('#player').hidden) return
-    setChromeHidden(true)
+  function assertChrome() {
+    setChromeHidden(playerOpen)
   }
-  window.addEventListener('resize', assertChromeHidden)
-  window.addEventListener('orientationchange', assertChromeHidden)
+  window.addEventListener('resize', assertChrome)
+  window.addEventListener('orientationchange', assertChrome)
   document.addEventListener('visibilitychange', function () {
-    if (!document.hidden) assertChromeHidden()
+    if (!document.hidden) assertChrome()
   })
 
   /* ------------------------------ 播放队列抽屉 ------------------------------ */
@@ -2596,6 +2644,16 @@ em{font-style:normal}
   function route(force) {
     var r = parseHash()
     markTab(r.path)
+    /*
+     * 每次换页都把原生顶栏校准一次：只要播放器没开着，顶栏就必须是显示的。
+     *
+     * 兜的是「某条路径把顶栏藏了却没恢复」——顶栏一消失，WebView 就顶到 y=0
+     * （窗口是边到边的），当前页最上面那条 sticky 的栏（搜索框、二级页标题…）
+     * 会落进状态栏底下，看着像「跑到最顶部」，点上去被系统状态栏吃掉。
+     * 换页是用户必经的动作，在这里校准一次，代价是一次原生调用，
+     * 换来的是「不可能长期卡在错的状态」。
+     */
+    if (!playerOpen) setChromeHidden(false)
     var fn = ROUTES[r.path] || pageHome
     var myToken = ++routeToken
     view.scrollTop = 0
