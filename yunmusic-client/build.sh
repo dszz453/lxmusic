@@ -42,8 +42,40 @@ esac
 # 把路径转成「当前平台的 JDK 工具链能吃的形式」。
 # Windows 上 javac/java 只认 C:/... 这种盘符路径，Git Bash 的 /c/... 它们不认，
 # 所以必须过一遍 cygpath -m；Linux 上没有 cygpath，原样返回即可。
+#
+# ⚠ 契约：**只输出转换后的路径，绝不带尾随换行**，换行一律由调用方显式给出。
+#
+#   为什么必须写死这条契约：cygpath -m 的输出**自带换行**，printf '%s' **不带**。
+#   于是 `winpath "$f" >> list.txt` 这种写法在 Windows 上恰好能分行（蹭了 cygpath
+#   的换行），到 Linux 上所有路径会挤成一行。D8 读到的 argfile 只有一个超长路径，
+#   报出来的错是
+#       java.nio.file.NoSuchFileException:
+#           .../CrashActivity.class/home/runner/.../MusicService$1.class/...
+#   —— 一堆 .class 路径首尾相连，报错信息一个字都不提「换行符」，极难定位。
+#   （CI 上实际踩过：build job 挂在这一步。）
+#   现在把 cygpath 的换行在这里剥掉，两平台的 winpath 行为完全一致。
 winpath() {
-    if command -v cygpath >/dev/null 2>&1; then cygpath -m "$1"; else printf '%s' "$1"; fi
+    if command -v cygpath >/dev/null 2>&1; then
+        cygpath -m "$1" | tr -d '\r\n'
+    else
+        printf '%s' "$1"
+    fi
+}
+
+# 数一个 argfile 的行数，用来验证「一行一条路径」这个前提。
+# 见 winpath 上面那段说明：argfile 一旦被挤成一行，javac / D8 的报错都指不到根因，
+# 所以这里主动数一遍，对不上就用一句人话直接退出。
+check_argfile() {
+    local list="$1" want="$2" label="$3"
+    local got
+    got=$(wc -l < "$list" | tr -d ' \r')
+    if [ "$got" != "$want" ]; then
+        echo "！$label 行数（$got）与实际条目数（$want）不一致。" >&2
+        echo "  说明 $list 的换行丢了 —— 多个路径被挤在同一行，" >&2
+        echo "  javac / D8 会把它们当成一个路径，报 NoSuchFileException 之类的错。" >&2
+        echo "  请检查 winpath 的契约（只转路径、不带换行）是否被破坏。" >&2
+        exit 1
+    fi
 }
 
 # python：Windows 上叫 python，多数 Linux 发行版只装 python3
@@ -122,9 +154,14 @@ WIN_ANDROID_JAR=$(winpath "$ANDROID_JAR")
 WIN_CLASSES_DIR=$(winpath "$OUT_DIR/classes")
 
 rm -f "$OUT_DIR/sources.txt"
+# javac 的 @argfile：一行一个源文件，路径含空格所以用引号包起来。
+# 换行由 echo 给出（winpath 不带换行，见上面的契约说明）。
 find "$PROJECT_DIR/src" "$OUT_DIR/gen" -name "*.java" | while read -r line; do
     echo "\"$(winpath "$line")\"" >> "$OUT_DIR/sources.txt"
 done
+check_argfile "$OUT_DIR/sources.txt" \
+    "$(find "$PROJECT_DIR/src" "$OUT_DIR/gen" -name '*.java' | wc -l | tr -d ' ')" \
+    "sources.txt"
 
 "$JAVAC" -encoding UTF-8 -nowarn \
     -source 11 -target 11 \
@@ -134,9 +171,15 @@ done
 
 echo "=== [4/7] 转换为 DEX 字节码 (D8) ==="
 rm -f "$OUT_DIR/classes.txt"
+# D8 的 @argfile：一行一个 .class。
+# ⚠ 这里曾经是 `winpath "$line" >> classes.txt` —— 蹭了 cygpath 自带的换行，
+#    在 Linux 上失效（所有路径挤成一行）。必须由 echo 显式给换行。
 find "$OUT_DIR/classes" -name "*.class" | while read -r line; do
-    winpath "$line" >> "$OUT_DIR/classes.txt"
+    echo "$(winpath "$line")" >> "$OUT_DIR/classes.txt"
 done
+check_argfile "$OUT_DIR/classes.txt" \
+    "$(find "$OUT_DIR/classes" -name '*.class' | wc -l | tr -d ' ')" \
+    "classes.txt"
 
 "$JAVA" -cp "$(winpath "$D8_JAR")" com.android.tools.r8.D8 \
     --lib "$WIN_ANDROID_JAR" \
