@@ -17,7 +17,7 @@
 npm install
 node build.mjs                                    # 内联插件数据
 export CLOUDFLARE_API_TOKEN=你的令牌
-export CLOUDFLARE_ACCOUNT_ID=4684678c485c4b9318da7d08464e430f
+export CLOUDFLARE_ACCOUNT_ID=你的账号ID
 npx wrangler deploy
 ```
 
@@ -154,8 +154,8 @@ docker compose up -d
 
 | 线路 | 用途 | 示例 |
 |---|---|---|
-| 地址 1（主线路） | 自建 Docker / 本地服务器 | `https://lxmusic.19860819.xyz:8616` |
-| 地址 2（备用线路） | Cloudflare Workers | `https://music.zyplnn.dpdns.org` |
+| 地址 1（主线路） | 自建 Docker / 本地服务器 | `https://你的服务器地址:端口` |
+| 地址 2（备用线路） | Cloudflare Workers | `https://你的Workers域名` |
 
 切换线路后自动清空 token 并重新登录，避免旧 token 打新服务器导致 401。
 
