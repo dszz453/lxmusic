@@ -1,0 +1,22 @@
+# ---- 构建产物 ----
+build/
+outputs/
+*.apk
+*.ap_
+*.dex
+*.class
+
+# ---- 本地便携工具链（体积上千文件，CI 上用 setup-java / setup-android 代替）----
+android-build/
+jdk/
+sdk/
+
+# ---- 编辑器 / 系统 ----
+.idea/
+.vscode/
+*.iml
+.DS_Store
+Thumbs.db
+
+# ---- 日志 ----
+*.log

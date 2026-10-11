@@ -1,0 +1,89 @@
+name: yunmusic-android
+
+# 云音乐安卓客户端（yunmusic-client/）的出包链路。
+#
+# ⚠ 为什么放在**仓库根**的 .github/workflows/ 而不是 yunmusic-client/.github/：
+#    GitHub Actions 只扫描仓库根那一层，子目录里的 workflow 文件会被完全忽略
+#    （不会报错，就是不跑 —— 排查起来很费时间）。所以这里必须放根目录，
+#    再用 working-directory / paths 把作用域收回到 yunmusic-client。
+#
+# 为什么要跑自测再打包：yunmusic-client/assets/web/index.html 是约 20 万字符的
+# 单文件前端，改一处布局很容易把别处带崩（比如删掉 `.player__src` 那条 CSS 规则后，
+# 依赖它的断言要同步改）。smoke.js 有 400+ 条断言，几秒就跑完，比装到手机上肉眼验收快。
+#
+# 为什么要真出 APK 而不是只跑测试：aapt2 / d8 / apksigner 这条链路上的问题
+# （资源 id 冲突、dex 方法数、签名方案）测试照不到，只有真打包才暴露。
+
+on:
+  push:
+    branches: [main]
+    # 只在客户端相关文件变化时触发 —— 服务端改插件清单不该顺带跑一遍安卓构建
+    paths:
+      - 'yunmusic-client/**'
+      - '.github/workflows/yunmusic-android.yml'
+  workflow_dispatch:
+
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    defaults:
+      run:
+        working-directory: yunmusic-client
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: '22'
+
+      # smoke.js 用 jsdom 把前端跑在假 DOM 里。仓库不锁依赖版本，
+      # 所以临时装一份（不写 package.json，避免为一个测试依赖引入 lock 文件维护）
+      - name: 装测试依赖
+        run: npm install --no-save --no-audit --no-fund jsdom
+
+      - name: 前端自测（smoke.js）
+        run: node test/smoke.js
+
+  build:
+    runs-on: ubuntu-latest
+    defaults:
+      run:
+        working-directory: yunmusic-client
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: '17'
+
+      - uses: android-actions/setup-android@v3
+
+      - name: 安装 SDK 组件
+        # 版本必须和 build.sh 里写死的一致（build-tools 34.0.0 / android-34）
+        run: |
+          yes | sdkmanager --licenses > /dev/null || true
+          sdkmanager "build-tools;34.0.0" "platforms;android-34"
+
+      - name: 构建 APK
+        # build.sh 默认去同级 repo_extracted/ 找便携工具链（那是本地开发布局，
+        # CI 上没有），所以这里把四个路径显式指到 setup-java / setup-android 装好的位置。
+        run: |
+          export JDK_DIR="$JAVA_HOME"
+          export BUILD_TOOLS="$ANDROID_HOME/build-tools/34.0.0"
+          export PLATFORM="$ANDROID_HOME/platforms/android-34"
+          export OUTPUT_DIR="$PWD/outputs"
+          bash build.sh
+
+      - name: 汇总产物信息
+        run: |
+          apk=$(ls outputs/*.apk | head -1)
+          echo "产物：$apk"
+          echo "大小：$(du -h "$apk" | cut -f1)"
+          echo "sha256：$(sha256sum "$apk" | cut -d' ' -f1)"
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: yunmusic-apk
+          path: yunmusic-client/outputs/*.apk
+          if-no-files-found: error
