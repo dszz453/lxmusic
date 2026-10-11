@@ -4,15 +4,29 @@ compatibility_date = "2025-09-01"
 compatibility_flags = ["nodejs_compat"]
 workers_dev = true
 
+# 自定义域名（workers.dev 在国内 DNS 被污染，必须绑自有域名）
+#
+# ⚠ 必须放在任何 [table] 头**之前**：TOML 里一旦出现 `[triggers]` 这样的 table 头，
+#    它下面直到下一个 table 头为止的所有键都归属那个 table。routes 写在 [triggers]
+#    后面会被解析成 `triggers.routes`，wrangler 只报一句
+#    `Unexpected fields found in triggers field: "routes"` 然后**静默忽略**，
+#    结果 Worker 部署成功、自定义域名却没绑上（workers.dev 在国内又被污染）。
+#
+# ⚠ 这里每次 deploy 都会报一条 code 100117 的 ERROR，**属预期、无害**：
+#    该域名在 dpdns.org 侧已经有一条外部管理的 CNAME
+#    （music.zyplnn.dpdns.org → dszzlnn.cf.090227.xyz → cloudflare），
+#    CF 因此拒绝把它登记成「custom domain」。但请求照样能到 Worker ——
+#    实测 `curl https://music.zyplnn.dpdns.org/api/version` 返回
+#    {"ok":true,"app":"lxmusic","version":"V2.7",...}，与 workers.dev 一致。
+#    保留这段配置是为了留下「这个域名归这个 Worker」的意图声明。
+routes = [
+  { pattern = "music.zyplnn.dpdns.org", custom_domain = true }
+]
+
 # 每日推荐定时生成：UTC 22:00 = 北京时间 06:00（CF cron 只认 UTC）。
 # 生成逻辑见 src/index.js 的 scheduled；手动刷新走 POST /api/daily/refresh。
 [triggers]
 crons = ["0 22 * * *"]
-
-# 自定义域名（workers.dev 在国内 DNS 被污染，必须绑自有域名）
-routes = [
-  { pattern = "music.zyplnn.dpdns.org", custom_domain = true }
-]
 
 [[d1_databases]]
 binding = "DB"
