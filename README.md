@@ -177,8 +177,8 @@ GH_TOKEN=ghp_xxx node tools/publish-github.mjs --dry    # 只看清单
 ```bash
 bash client/build-client.sh              # 构建（自动打包跨端层 + 重建离线后端）
 bash client/build-client.sh --skip-backend
-node test/client-wiring.test.mjs         # 78 项静态接线审计（秒级）
-node test/client-layer.mjs               # 25 项跨端层行为（自带 DOM 替身，秒级）
+node test/client-wiring.test.mjs         # 111 项静态接线审计（秒级）
+node test/client-layer.mjs               # 34 项跨端层行为（自带 DOM 替身，秒级）
 LX_PASS='密码' node test/ui-dialogs.mjs   # 31 项真浏览器：对话框 / 菜单去重（需本地服务）
 ```
 

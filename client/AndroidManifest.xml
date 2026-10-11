@@ -31,13 +31,15 @@
 -->
 <manifest xmlns:android="http://schemas.android.com/apk/res/android"
     package="com.zyplnn.lxclient"
-    android:versionCode="114"
-    android:versionName="2.4">
+    android:versionCode="270"
+    android:versionName="2.7">
     <!--
       versionCode / versionName 是 aapt2 link 时用 version-code / version-name 参数覆盖的
-      （见 build-client.sh，值来自 client/version.js —— 客户端自己的版本线）。
+      （见 build-client.sh，值来自 client/version.mjs —— 客户端自己的版本线）。
       这里写的是兜底值，直接用 Android Studio 打开这个工程时也不至于没有版本号。
-      改版本请改 client/version.js，不要改这里。
+      ⚠ 改版本请改 client/version.mjs，不要只改这里 —— test/client-wiring.test.mjs
+      有两条断言锁着「兜底值必须与版本线一致」，只改一边会直接红。
+      （2026-10-11 前这里停在 2.4/114、而版本线是 V2.0/200，两条断言一直是红的。）
 
       注意：XML 注释里不能出现连续两个连字符（会报 not well-formed）。
     -->

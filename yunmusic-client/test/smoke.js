@@ -1,5 +1,5 @@
 /*
- * 云音乐 V2.2 自测脚本
+ * 云音乐 V2.7 自测脚本
  *
  * 两条腿：
  *   1) 源码级单元测试 —— 从 index.html 里把纯函数源码抠出来单独跑，
@@ -1359,7 +1359,7 @@ section('15. 版本号一致性（防止发版漏改）')
   const m = SCRIPT.match(/var CLIENT_VERSION = '([^']+)'/)
   ok(!!m, '前端有唯一的 CLIENT_VERSION 常量')
   const ver = m ? m[1] : ''
-  // V2.4 → 240（主版本*100 + 次版本*10）
+  // V2.7 → 270（主版本*100 + 次版本*10）
   const parts = String(ver).replace(/^V/, '').split('.')
   const code = String(Number(parts[0]) * 100 + Number(parts[1]) * 10)
 

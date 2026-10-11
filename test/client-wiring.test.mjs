@@ -304,8 +304,12 @@ console.log('\n== 6. 注入契约：宿主给的变量，前端真的在读 ═�
     !/append\(" · 服务端 "\)/.test(SERVERPAGE) && !/\.build\b/.test(SERVERPAGE))
   ok('但「版本对不上」的警告保留（可执行的建议，不是给人看的数字）',
     /versionMismatch/.test(SERVERPAGE) && /compareVersion\(p\.version/.test(SERVERPAGE))
-  ok('设置页**保留**服务端版本（收敛不等于全删）',
-    /" · 服务端 " \+ p\.version/.test(SETTINGS))
+  // 2026-10-11：主行里的「服务端版本」已收敛进「诊断快照」块（默认折叠，
+  // 点按钮才展开），所以断言的落点从「主行拼串」改成「诊断块里可达」。
+  // 规矩没变：值仍**只在设置页**出现，别处依然一个都不许有（上面四条钉着）。
+  ok('设置页**保留**服务端版本（收敛进「诊断快照」，不等于全删）',
+    /p\.brandName\(\) \+ " · " \+ p\.version/.test(SETTINGS)
+    && /diag\.setText\(buildDiag\(\)\)/.test(SETTINGS))
 }
 
 /* ══════════════ 7. 桥（AndroidHost）向后兼容 ══════════════ */
@@ -347,12 +351,19 @@ console.log('\n== 8. 底层能力层、权限与主题 ════════�
     C_MANIFEST.includes('android.permission.READ_MEDIA_AUDIO')
     && C_MANIFEST.includes('android.permission.READ_EXTERNAL_STORAGE'))
 
-  ok('ServerStore 有三档预设槽位（内置 / CF / Docker）',
-    /ID_BUILTIN\s*=\s*"builtin"/.test(STORE_JAVA)
-    && /ID_CF\s*=\s*"cf"/.test(STORE_JAVA)
-    && /ID_DOCKER\s*=\s*"docker"/.test(STORE_JAVA))
-  ok('ServerStore 的预设槽位不许删（品牌判定要靠它）',
-    /ID_BUILTIN\.equals\(id\) \|\| ID_CF\.equals\(id\) \|\| ID_DOCKER\.equals\(id\)/.test(STORE_JAVA))
+  // 2026-10-11：档案槽位从「三档（内置 / CF / Docker）」重构成「两档线路」
+  // （地址 1 = Docker 主线路、地址 2 = CF 备用线路）。内置离线档案已废弃，
+  // 加载时还会主动丢弃历史残留（见下面第 3 条）。断言跟着钉当前设计。
+  ok('ServerStore 是两档线路槽位（地址 1 = Docker / 地址 2 = CF），不再有内置档',
+    /ID_CF\s*=\s*"cf"/.test(STORE_JAVA)
+    && /ID_DOCKER\s*=\s*"docker"/.test(STORE_JAVA)
+    && /ID_LINE1\s*=\s*ID_DOCKER/.test(STORE_JAVA)
+    && /ID_LINE2\s*=\s*ID_CF/.test(STORE_JAVA)
+    && !/ID_BUILTIN/.test(STORE_JAVA))
+  ok('品牌判定优先用握手自报的 host；槽位不许删（ensureDefaults 会补回来）',
+    /if\s*\(!host\.isEmpty\(\)\)\s*return\s*ClientBrand\.nameOf\(host\)/.test(STORE_JAVA)
+    && /if\s*\(find\(ID_LINE1\)\s*==\s*null\)/.test(STORE_JAVA)
+    && /if\s*\(find\(ID_LINE2\)\s*==\s*null\)/.test(STORE_JAVA))
   ok('Handshake 不会只看状态码就判定成功（必须看正文像不像本项目的接口）',
     /trimmed\.startsWith\("<"\)/.test(read('client/src/com/zyplnn/lxclient/Handshake.java'))
     && /没有 version 字段/.test(read('client/src/com/zyplnn/lxclient/Handshake.java')))

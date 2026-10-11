@@ -143,10 +143,10 @@ bash client/build-client.sh --skip-backend   # 只改前端/跨端层时更快
 client/build/lx-music-client-1.0.apk         # 主产物
 dist/lx-music-client-1.0.apk                 # 副本，方便取件
 
-# 静态接线审计（78 项，秒级，不需要安卓运行时）
+# 静态接线审计（111 项，秒级，不需要安卓运行时）
 node test/client-wiring.test.mjs
 
-# 跨端层行为（25 项，秒级，不需要浏览器/安卓 —— 自带一个极小 DOM 替身）
+# 跨端层行为（34 项，秒级，不需要浏览器/安卓 —— 自带一个极小 DOM 替身）
 # 产物缺失或落后于 client/rn/src/ 时会先自动重打一遍，不会静默测旧产物
 node test/client-layer.mjs
 ```
@@ -155,9 +155,9 @@ node test/client-layer.mjs
 
 ```bash
 node test/brand.test.mjs              # 38 项：品牌判定（客户端的同步判据在这里被钉住）
-node test/app-wiring.test.mjs         # 46 项：版本落点 / 媒体会话接线
-node test/client-wiring.test.mjs      # 78 项：客户端四条链路（静态接线审计）
-node test/client-layer.mjs            # 25 项：跨端层行为（守卫 / 路由归属 / 入口接管 / 桥崩容错）
+node test/app-wiring.test.mjs         # 47 项：版本落点 / 媒体会话接线
+node test/client-wiring.test.mjs      # 111 项：客户端四条链路（静态接线审计）
+node test/client-layer.mjs            # 34 项：跨端层行为（守卫 / 路由归属 / 入口接管 / 桥崩容错）
 ```
 
 > `client-wiring` 与 `client-layer` 是**互补**的，别只跑一个：
