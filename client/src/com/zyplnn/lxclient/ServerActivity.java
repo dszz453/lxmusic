@@ -84,6 +84,9 @@ public class ServerActivity extends Activity {
         listHost.setOrientation(LinearLayout.VERTICAL);
         col.addView(listHost);
 
+        // 双地址配置卡片（一次性配置地址 1 与地址 2）
+        col.addView(buildDualAddressCard());
+
         editorHost = new LinearLayout(this);
         editorHost.setOrientation(LinearLayout.VERTICAL);
         col.addView(editorHost);
@@ -138,19 +141,13 @@ public class ServerActivity extends Activity {
 
     /** 一条档案：名称 + 副标题（类型 / 地址 / 品牌）+ 右侧状态 + 选中标记 */
     private View profileRow(final ServerStore.Profile p, boolean active) {
-        boolean builtin = ServerStore.KIND_BUILTIN.equals(p.kind);
-        // 右侧只说「通没通过信」，不报版本号 —— 这一页是挑服务器用的，
-        // 版本号只该出现在设置页（老板 2026-10-08）。
         String right;
-        if (builtin) right = active ? "使用中" : "";
-        else if (!p.usable()) right = "未配置";
+        if (!p.usable()) right = "未配置";
         else if (p.checkedAt > 0) right = "已连接";
         else right = "未握手";
 
         String subtitle;
-        if (builtin) {
-            subtitle = "数据只在这台手机上，不连任何服务器";
-        } else if (p.base.isEmpty()) {
+        if (p.base.isEmpty()) {
             subtitle = kindLabel(p.kind) + " · 还没填地址";
         } else {
             subtitle = kindLabel(p.kind) + " · " + p.base
@@ -168,8 +165,6 @@ public class ServerActivity extends Activity {
                     }
                 });
         if (active) {
-            // 「使用中」那条加一条左侧品牌色细线：光靠右边两个字不够醒目，
-            // 用户切来切去最容易搞混的就是「现在到底在用哪条」
             View mark = new View(this);
             mark.setBackgroundColor(Ui.color(this, R.color.brand));
             LinearLayout wrap = new LinearLayout(this);
@@ -186,7 +181,6 @@ public class ServerActivity extends Activity {
     private static String kindLabel(String kind) {
         if (ServerStore.KIND_CF.equals(kind)) return "Cloudflare";
         if (ServerStore.KIND_DOCKER.equals(kind)) return "Docker 自托管";
-        if (ServerStore.KIND_BUILTIN.equals(kind)) return "内置离线";
         return "自建";
     }
 
@@ -203,28 +197,10 @@ public class ServerActivity extends Activity {
             editingId = null;
             return;
         }
-        boolean builtin = ServerStore.KIND_BUILTIN.equals(p.kind);
 
         editorHost.addView(Ui.section(this, "编辑：" + p.name));
         LinearLayout card = Ui.card(this);
         card.setPadding(0, Ui.dp(this, 6), 0, Ui.dp(this, 12));
-
-        if (builtin) {
-            card.addView(Ui.note(this,
-                    "内置离线模式没有地址可填：后端逻辑、数据库、音源插件全部打包在安装包里，"
-                            + "搜索与播放都在设备内完成。好处是不依赖任何服务器、断网也能搜（"
-                            + "只是出不了声）；代价是数据只在这台手机上，换机或重装会清空。"));
-            card.addView(buttonRow(new String[]{"使用内置离线"}, new Runnable[]{new Runnable() {
-                @Override
-                public void run() {
-                    st.setActive(ServerStore.ID_BUILTIN);
-                    st.setOnboarded(true);
-                    finishWith(true);
-                }
-            }}));
-            editorHost.addView(card);
-            return;
-        }
 
         // 名称（仅自定义档案可改）
         final EditText nameIn = Ui.input(this, "名称（列表里显示）", p.name,
@@ -365,6 +341,134 @@ public class ServerActivity extends Activity {
                             + "但如果遇到奇怪的问题，先把两边都升到同一版再试。");
         }
         return sb.toString();
+    }
+
+    /* ══════════════════ 双地址一站式配置卡片 ══════════════════ */
+
+    private View buildDualAddressCard() {
+        final ServerStore st = ServerStore.get(this);
+        final ServerStore.Profile p1 = st.getLine1();
+        final ServerStore.Profile p2 = st.getLine2();
+
+        LinearLayout wrap = new LinearLayout(this);
+        wrap.setOrientation(LinearLayout.VERTICAL);
+        wrap.addView(Ui.section(this, "双服务器地址（一次填写两个地址）"));
+
+        LinearLayout card = Ui.card(this);
+        card.setPadding(0, Ui.dp(this, 10), 0, Ui.dp(this, 14));
+
+        TextView intro = Ui.text(this, "可同时配置两套后端（例如主线路填内网/自建 Docker，备用线路填 Cloudflare Workers），随时在设置里自由切换。",
+                12.5f, Ui.color(this, R.color.text_2), false);
+        intro.setPadding(Ui.dp(this, 16), 0, Ui.dp(this, 16), Ui.dp(this, 8));
+        card.addView(intro);
+
+        // ===== 节点 1：主线路 (Docker) =====
+        card.addView(Ui.divider(this, true));
+        TextView title1 = Ui.text(this, "【地址 1 · 主线路】", 13.5f, Ui.color(this, R.color.brand), true);
+        title1.setPadding(Ui.dp(this, 16), Ui.dp(this, 8), Ui.dp(this, 16), 0);
+        card.addView(title1);
+
+        final EditText base1In = Ui.input(this, "如: http://192.168.1.100:8080 或域名",
+                p1 != null ? p1.base : "", InputType.TYPE_CLASS_TEXT | InputType.TYPE_TEXT_VARIATION_URI);
+        card.addView(wrapField("服务器地址 1", base1In));
+
+        final EditText user1In = Ui.input(this, "用户名 1（可选）",
+                p1 != null ? p1.user : "", InputType.TYPE_CLASS_TEXT);
+        card.addView(wrapField("用户名 1", user1In));
+
+        final TextView hint1 = Ui.text(this, (p1 != null && p1.checkedAt > 0) ? statusLine(p1) : "",
+                12f, Ui.color(this, R.color.text_3), false);
+        hint1.setPadding(Ui.dp(this, 16), Ui.dp(this, 2), Ui.dp(this, 16), Ui.dp(this, 4));
+        card.addView(hint1);
+
+        // ===== 节点 2：备用线路 (Cloudflare) =====
+        card.addView(Ui.divider(this, true));
+        TextView title2 = Ui.text(this, "【地址 2 · 备用线路】", 13.5f, Ui.color(this, R.color.brand), true);
+        title2.setPadding(Ui.dp(this, 16), Ui.dp(this, 8), Ui.dp(this, 16), 0);
+        card.addView(title2);
+
+        final EditText base2In = Ui.input(this, "如: https://你的-worker.workers.dev",
+                p2 != null ? p2.base : "", InputType.TYPE_CLASS_TEXT | InputType.TYPE_TEXT_VARIATION_URI);
+        card.addView(wrapField("服务器地址 2", base2In));
+
+        final EditText user2In = Ui.input(this, "用户名 2（可选）",
+                p2 != null ? p2.user : "", InputType.TYPE_CLASS_TEXT);
+        card.addView(wrapField("用户名 2", user2In));
+
+        final TextView hint2 = Ui.text(this, (p2 != null && p2.checkedAt > 0) ? statusLine(p2) : "",
+                12f, Ui.color(this, R.color.text_3), false);
+        hint2.setPadding(Ui.dp(this, 16), Ui.dp(this, 2), Ui.dp(this, 16), Ui.dp(this, 4));
+        card.addView(hint2);
+
+        card.addView(Ui.divider(this, true));
+
+        // ===== 当前启用线路选择状态 =====
+        final String[] curSelect = new String[]{
+                ServerStore.ID_LINE2.equals(st.activeId()) ? ServerStore.ID_LINE2 : ServerStore.ID_LINE1
+        };
+        final TextView selectStatus = Ui.text(this,
+                "当前选用生效：" + (ServerStore.ID_LINE2.equals(curSelect[0]) ? "地址 2 (备用线路)" : "地址 1 (主线路)"),
+                13f, Ui.color(this, R.color.text), true);
+        selectStatus.setPadding(Ui.dp(this, 16), Ui.dp(this, 8), Ui.dp(this, 16), Ui.dp(this, 6));
+        card.addView(selectStatus);
+
+        // 线路切换辅助切换行
+        card.addView(buttonRow(new String[]{"测试地址 1 连通性", "测试地址 2 连通性"}, new Runnable[]{
+                new Runnable() {
+                    @Override
+                    public void run() {
+                        if (p1 != null) doProbe(p1, base1In, user1In, hint1, null);
+                    }
+                },
+                new Runnable() {
+                    @Override
+                    public void run() {
+                        if (p2 != null) doProbe(p2, base2In, user2In, hint2, null);
+                    }
+                }
+        }));
+
+        card.addView(buttonRow(new String[]{
+                "启用地址 1", "启用地址 2", "一键保存双地址并连接"
+        }, new Runnable[]{
+                new Runnable() {
+                    @Override
+                    public void run() {
+                        curSelect[0] = ServerStore.ID_LINE1;
+                        selectStatus.setText("当前选用生效：地址 1 (主线路)");
+                        Ui.toast(ServerActivity.this, "已选择地址 1 (主线路)");
+                    }
+                },
+                new Runnable() {
+                    @Override
+                    public void run() {
+                        curSelect[0] = ServerStore.ID_LINE2;
+                        selectStatus.setText("当前选用生效：地址 2 (备用线路)");
+                        Ui.toast(ServerActivity.this, "已选择地址 2 (备用线路)");
+                    }
+                },
+                new Runnable() {
+                    @Override
+                    public void run() {
+                        String b1 = Handshake.normalize(base1In.getText().toString());
+                        String u1 = user1In.getText().toString().trim();
+                        String b2 = Handshake.normalize(base2In.getText().toString());
+                        String u2 = user2In.getText().toString().trim();
+
+                        if (b1.isEmpty() && b2.isEmpty()) {
+                            Ui.toast(ServerActivity.this, "请至少填写一个服务器地址");
+                            return;
+                        }
+
+                        st.saveDualLines(b1, u1, b2, u2, curSelect[0]);
+                        rebuildList();
+                        finishWith(true);
+                    }
+                }
+        }));
+
+        wrap.addView(card);
+        return wrap;
     }
 
     /* ══════════════════ 握手 ══════════════════ */

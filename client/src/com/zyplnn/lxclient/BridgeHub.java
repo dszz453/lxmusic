@@ -83,9 +83,9 @@ public final class BridgeHub {
             o.put("profileId", p.id);
             o.put("profileName", p.name);
             o.put("kind", p.kind);
-            o.put("base", ServerStore.KIND_BUILTIN.equals(p.kind) ? "" : p.base);
+            o.put("base", p.base == null ? "" : p.base);
             o.put("user", p.user == null ? "" : p.user);
-            o.put("builtin", ServerStore.KIND_BUILTIN.equals(p.kind));
+            o.put("builtin", false);
             o.put("brandKey", p.host == null || p.host.isEmpty()
                     ? (ServerStore.KIND_DOCKER.equals(p.kind) ? "docker" : "cf")
                     : p.host);
@@ -114,7 +114,7 @@ public final class BridgeHub {
                 o.put("id", p.id);
                 o.put("name", p.name);
                 o.put("kind", p.kind);
-                o.put("base", ServerStore.KIND_BUILTIN.equals(p.kind) ? "" : p.base);
+                o.put("base", p.base == null ? "" : p.base);
                 o.put("usable", p.usable());
                 o.put("brand", p.brandName());
                 o.put("version", p.version == null ? "" : p.version);
@@ -178,7 +178,13 @@ public final class BridgeHub {
                     return;
                 }
                 try {
-                    act.startActivity(new Intent(act, target));
+                    if (PAGE_SETTINGS.equals(p)) {
+                        act.startActivityForResult(new Intent(act, SettingsActivity.class), 2002);
+                    } else if (PAGE_SERVER.equals(p)) {
+                        act.startActivityForResult(new Intent(act, ServerActivity.class), 2001);
+                    } else {
+                        act.startActivity(new Intent(act, target));
+                    }
                 } catch (Throwable t) {
                     Log.w(TAG, "打开原生页失败 " + p + ": " + t.getMessage());
                     Ui.toast(act, "打不开这个页面");

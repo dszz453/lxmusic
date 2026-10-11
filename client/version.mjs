@@ -33,11 +33,11 @@
  * 注意分工：改客户端**不动** SERVICE_VERSION（那是「本 App 按哪版服务端设计」
  * 的声明）—— 只有服务端抬了 APP_VERSION，这里才跟着抬。 */
 
-/** 客户端产品版本。从 V1.0 起算，每出一个新包升 0.1 */
-export const CLIENT_VERSION = 'V2.4'
+/** 客户端产品版本。当前为 V2.0，以后每个版本增加 0.1 */
+export const CLIENT_VERSION = 'V2.0'
 
 /** 安卓 versionCode：整数、单调递增、跨次发布不可重复 */
-export const CLIENT_VERSION_CODE = 114
+export const CLIENT_VERSION_CODE = 200
 
 /** 客户端包名（与既有 music-edge 壳 com.zyplnn.musicedge 并存，互不覆盖） */
 export const CLIENT_PACKAGE = 'com.zyplnn.lxclient'

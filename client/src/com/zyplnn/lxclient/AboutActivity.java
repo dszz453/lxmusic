@@ -62,10 +62,9 @@ public class AboutActivity extends Activity {
         /* ---------------- 服务端 ---------------- */
         col.addView(Ui.section(this, "当前连接的服务端"));
         LinearLayout c2 = Ui.card(this);
-        boolean builtin = ServerStore.KIND_BUILTIN.equals(p.kind);
         c2.addView(infoRow("档案", p.name + "（" + kindLabel(p.kind) + "）"));
         c2.addView(Ui.divider(this, false));
-        c2.addView(infoRow("地址", builtin ? "内置离线：不连任何服务器" : p.base));
+        c2.addView(infoRow("地址", p.base.isEmpty() ? "（尚未配置服务器地址）" : p.base));
         c2.addView(Ui.divider(this, false));
         c2.addView(infoRow("品牌", p.brandName()));
         col.addView(c2);
@@ -76,7 +75,7 @@ public class AboutActivity extends Activity {
                         + "点下面的「切换服务器」可以直接换一条线。"));
 
         LinearLayout cSwitch = Ui.card(this);
-        cSwitch.addView(Ui.row(this, null, "切换服务器", "内置离线 / Cloudflare / Docker / 自建",
+        cSwitch.addView(Ui.row(this, null, "切换服务器", "双服务器地址 (主线路 / 备用线路) / 自建",
                 null, true, new View.OnClickListener() {
                     @Override
                     public void onClick(View v) {
@@ -88,11 +87,10 @@ public class AboutActivity extends Activity {
         /* ---------------- 架构 ---------------- */
         col.addView(Ui.section(this, "架构"));
         col.addView(Ui.note(this,
-                "同一份核心代码驱动三端宿主：\n"
+                "同一份核心代码驱动多端宿主：\n"
                         + "· Docker 自托管 —— Node.js + 内置 SQLite 适配层，数据在自己手里；\n"
                         + "· Cloudflare Workers —— 零运维 Serverless + 全球 D1 数据库；\n"
-                        + "· 安卓客户端（本 App）—— 原生宿主 + 跨端业务层 + 底层能力层，\n"
-                        + "  既能连上面两条线，也能完全离线自包含地跑在设备内。\n\n"
+                        + "· 安卓客户端（本 App）—— 原生宿主 + 跨端业务层 + 底层能力层，支持双服务器地址自由切换。\n\n"
                         + "客户端的分层（对应网易云客户端那套 原生 + React Native 混合架构）：\n"
                         + "· 原生宿主层：顶栏 / 底部导航 / 本页这类原生页面 / 播放前台服务；\n"
                         + "· 跨端桥接层：http / 数据库 / 媒体会话 / 原生 UI 能力统一门面；\n"

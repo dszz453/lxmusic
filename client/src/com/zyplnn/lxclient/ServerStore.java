@@ -38,8 +38,6 @@ public final class ServerStore {
 
     /* ---------------- 档案类型 ---------------- */
 
-    /** 内置离线：后端整个跑在设备内，不连任何服务器 */
-    public static final String KIND_BUILTIN = "builtin";
     /** Cloudflare Worker 那条线 */
     public static final String KIND_CF = "cf";
     /** Docker / 本机 node 那条线 */
@@ -47,18 +45,21 @@ public final class ServerStore {
     /** 用户自建的其它地址（反代、局域网其它机器…） */
     public static final String KIND_CUSTOM = "custom";
 
-    /** 三档预设的固定 id —— 它们是「槽位」，地址由用户填，不随增删走动 */
-    public static final String ID_BUILTIN = "builtin";
+    /** 两档预设的固定 id —— 它们是「槽位」，地址由用户填，不随增删走动 */
     public static final String ID_CF = "cf";
     public static final String ID_DOCKER = "docker";
+
+    /** 双地址槽位映射：地址 1 (主线路) 与 地址 2 (备用线路) */
+    public static final String ID_LINE1 = ID_DOCKER;
+    public static final String ID_LINE2 = ID_CF;
 
     public static final class Profile {
         public String id = "";
         /** 界面上显示的名字 */
         public String name = "";
         /** 见上面 KIND_* */
-        public String kind = KIND_BUILTIN;
-        /** 基址，形如 https://music.example.com（builtin 恒为空串） */
+        public String kind = KIND_DOCKER;
+        /** 基址，形如 https://music.example.com */
         public String base = "";
         /** 登录用户名，仅用于预填登录页，不参与鉴权 */
         public String user = "";
@@ -71,16 +72,15 @@ public final class ServerStore {
         /** 最近一次握手时间（毫秒），0 = 从未 */
         public long checkedAt = 0;
 
-        /** 这条档案能不能直接用来启动：内置模式永远可以，其余必须填了地址 */
+        /** 这条档案能不能直接用来启动：必须填了地址 */
         public boolean usable() {
-            return KIND_BUILTIN.equals(kind) || (base != null && !base.trim().isEmpty());
+            return base != null && !base.trim().isEmpty();
         }
 
         /** 界面上显示的品牌名（还没握手时按档案类型兜底） */
         public String brandName() {
             if (!host.isEmpty()) return ClientBrand.nameOf(host);
             if (KIND_DOCKER.equals(kind)) return ClientBrand.NAME_DOCKER;
-            if (KIND_BUILTIN.equals(kind)) return ClientBrand.builtinName();
             return ClientBrand.NAME_CF;
         }
 
@@ -102,7 +102,7 @@ public final class ServerStore {
             Profile p = new Profile();
             p.id = o.optString("id", "");
             p.name = o.optString("name", "");
-            p.kind = o.optString("kind", KIND_BUILTIN);
+            p.kind = o.optString("kind", KIND_DOCKER);
             p.base = o.optString("base", "");
             p.user = o.optString("user", "");
             p.host = o.optString("host", "");
@@ -117,7 +117,7 @@ public final class ServerStore {
 
     private final SharedPreferences prefs;
     private List<Profile> profiles = new ArrayList<Profile>();
-    private String activeId = ID_BUILTIN;
+    private String activeId = ID_LINE1;
     private boolean onboarded = false;
 
     private ServerStore(Context ctx) {
@@ -143,24 +143,28 @@ public final class ServerStore {
 
     private void load() {
         profiles = new ArrayList<Profile>();
-        activeId = ID_BUILTIN;
+        activeId = ID_LINE1;
         onboarded = false;
         String raw = prefs.getString(KEY, null);
         if (raw != null) {
             try {
                 JSONObject o = new JSONObject(raw);
-                activeId = o.optString("active", ID_BUILTIN);
+                activeId = o.optString("active", ID_LINE1);
                 onboarded = o.optBoolean("onboarded", false);
                 JSONArray arr = o.optJSONArray("profiles");
                 if (arr != null) {
                     for (int i = 0; i < arr.length(); i++) {
                         JSONObject po = arr.optJSONObject(i);
-                        if (po != null) profiles.add(Profile.fromJson(po));
+                        if (po != null) {
+                            Profile p = Profile.fromJson(po);
+                            // 丢弃历史残留的内置离线档案
+                            if (!"builtin".equals(p.id)) {
+                                profiles.add(p);
+                            }
+                        }
                     }
                 }
             } catch (Throwable t) {
-                // 存档损坏（手改过、写入被打断）不能导致 App 起不来：
-                // 丢掉重来一遍默认档案，用户的地址重新填一次，代价远小于白屏。
                 Log.w(TAG, "服务器档案解析失败，回退默认: " + t.getMessage());
             }
         }
@@ -168,39 +172,25 @@ public final class ServerStore {
     }
 
     /**
-     * 补齐三档预设槽位。
-     *
-     * 为什么预设是「固定槽位」而不是用户自己新建：CF 与 Docker 是**两条线的既定形态**，
-     * 客户端的任务就是让你在这两条线之间挑 —— 让用户给它们随便改名、删掉再加，
-     * 只会让「我现在连的是哪条线」变得不可辨认（品牌判定要靠它）。
+     * 补齐双地址预设槽位：地址 1 (主线路 / Docker) 与 地址 2 (备用线路 / Cloudflare)
      */
     private void ensureDefaults() {
-        if (find(ID_BUILTIN) == null) {
+        if (find(ID_LINE1) == null) {
             Profile p = new Profile();
-            p.id = ID_BUILTIN;
-            p.name = "内置离线";
-            p.kind = KIND_BUILTIN;
-            profiles.add(0, p);
-        }
-        if (find(ID_CF) == null) {
-            Profile p = new Profile();
-            p.id = ID_CF;
-            p.name = "Cloudflare 部署";
-            p.kind = KIND_CF;
-            profiles.add(p);
-        }
-        if (find(ID_DOCKER) == null) {
-            Profile p = new Profile();
-            p.id = ID_DOCKER;
-            p.name = "Docker 自托管";
+            p.id = ID_LINE1;
+            p.name = "地址 1 (主线路 / Docker)";
             p.kind = KIND_DOCKER;
             profiles.add(p);
         }
-        if (find(activeId) == null || !find(activeId).usable()) {
-            // 当前选中的那条不可用（被清过地址、或从没填过）→ 退回内置，
-            // 保证「客户端永远是能起来的」，而不是启动就卡在一个连不上的地址上。
-            Profile a = find(activeId);
-            if (a == null || !a.usable()) activeId = ID_BUILTIN;
+        if (find(ID_LINE2) == null) {
+            Profile p = new Profile();
+            p.id = ID_LINE2;
+            p.name = "地址 2 (备用线路 / Cloudflare)";
+            p.kind = KIND_CF;
+            profiles.add(p);
+        }
+        if (find(activeId) == null) {
+            activeId = ID_LINE1;
         }
     }
 
@@ -233,13 +223,84 @@ public final class ServerStore {
     public Profile active() {
         Profile p = find(activeId);
         if (p == null) {
-            p = find(ID_BUILTIN);
+            p = getLine1();
         }
         return p;
     }
 
     public String activeId() {
         return activeId;
+    }
+
+    /** 获取地址 1 (主线路) 档案 */
+    public Profile getLine1() {
+        Profile p = find(ID_LINE1);
+        if (p == null) {
+            ensureDefaults();
+            p = find(ID_LINE1);
+        }
+        return p;
+    }
+
+    /** 获取地址 2 (备用线路) 档案 */
+    public Profile getLine2() {
+        Profile p = find(ID_LINE2);
+        if (p == null) {
+            ensureDefaults();
+            p = find(ID_LINE2);
+        }
+        return p;
+    }
+
+    /**
+     * 一次性配置两个地址，并指定激活其中一条
+     * @param addr1 地址 1 (如内网/公网 Docker)
+     * @param user1 地址 1 用户名
+     * @param addr2 地址 2 (如 Cloudflare Workers)
+     * @param user2 地址 2 用户名
+     * @param activeLine 要激活的线路 ID (ID_LINE1 或 ID_LINE2)
+     */
+    public Profile saveDualLines(String addr1, String user1, String addr2, String user2, String activeLine) {
+        Profile p1 = getLine1();
+        if (p1 != null) {
+            p1.base = addr1 != null ? addr1.trim() : "";
+            p1.user = user1 != null ? user1.trim() : "";
+        }
+        Profile p2 = getLine2();
+        if (p2 != null) {
+            p2.base = addr2 != null ? addr2.trim() : "";
+            p2.user = user2 != null ? user2.trim() : "";
+        }
+
+        if (activeLine != null && (activeLine.equals(ID_LINE1) || activeLine.equals(ID_LINE2))) {
+            activeId = activeLine;
+        } else if (p1 != null && p1.usable()) {
+            activeId = ID_LINE1;
+        } else if (p2 != null && p2.usable()) {
+            activeId = ID_LINE2;
+        } else {
+            activeId = ID_LINE1;
+        }
+        onboarded = true;
+        save();
+        return active();
+    }
+
+    /** 在地址 1 和 地址 2 之间快速切换 */
+    public Profile toggleDualLine() {
+        if (ID_LINE1.equals(activeId)) {
+            Profile p2 = getLine2();
+            if (p2 != null && p2.usable()) {
+                activeId = ID_LINE2;
+            }
+        } else {
+            Profile p1 = getLine1();
+            if (p1 != null && p1.usable()) {
+                activeId = ID_LINE1;
+            }
+        }
+        save();
+        return active();
     }
 
     /**
@@ -307,9 +368,9 @@ public final class ServerStore {
         return find(p.id);
     }
 
-    /** 删除档案。三档预设不给删（它们是品牌判定的锚点），只清空地址 */
+    /** 删除档案。双地址预设槽位不给删，只清空地址 */
     public boolean remove(String id) {
-        if (ID_BUILTIN.equals(id) || ID_CF.equals(id) || ID_DOCKER.equals(id)) {
+        if (ID_LINE1.equals(id) || ID_LINE2.equals(id)) {
             Profile p = find(id);
             if (p != null) {
                 p.base = "";
@@ -327,7 +388,7 @@ public final class ServerStore {
         if (p == null) return false;
         profiles.remove(p);
         if (id.equals(activeId)) {
-            activeId = ID_BUILTIN;
+            activeId = ID_LINE1;
             ensureDefaults();
         }
         save();

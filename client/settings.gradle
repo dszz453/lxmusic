@@ -1,0 +1,3 @@
+rootProject.name = "lx-music-client"
+include ':client'
+project(':client').projectDir = new File('.')

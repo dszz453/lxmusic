@@ -41,8 +41,8 @@ export PATH="$JDK/bin:$PATH"
 # 让 javac/d8 的中文提示按 UTF-8 输出，否则在 Git Bash 里是一堆乱码
 export JAVA_TOOL_OPTIONS="-Dfile.encoding=UTF-8 -Dsun.stdout.encoding=UTF-8 -Dsun.stderr.encoding=UTF-8"
 
-W() { cygpath -w "$1"; }                                  # MSYS 路径 → Windows 路径
-LIST_WIN() { find "$@" | while read -r f; do cygpath -w "$f"; done; }
+W() { cygpath -m "$1"; }                                  # MSYS 路径 → Windows 正斜杠路径
+LIST_WIN() { find "$@" | while read -r f; do printf '"%s"\n' "$(cygpath -m "$f")"; done; }
 
 # ── 客户端产品名（装在桌面上的名字）。注意与**品牌**不是一回事：
 #    连 CF 时界面显示 music-edge、连 Docker 时显示 LX-MUSIC，那是运行期由服务端自报的。
@@ -151,12 +151,12 @@ javac -encoding UTF-8 -nowarn -source 11 -target 11 \
   -classpath "$(W "$PLAT")" -d "$(W "$OUT/classes")" "@$(W "$OUT/sources.txt")"
 
 echo "== 4. d8：转 Dex =="
-LIST_WIN "$OUT/classes" -name '*.class' > "$OUT/classes.txt"
-"$BT/d8.bat" --lib "$(W "$PLAT")" --min-api 21 --output "$(W "$OUT/dex")" "@$(W "$OUT/classes.txt")"
+find "$OUT/classes" -name '*.class' | while read -r f; do cygpath -m "$f"; done > "$OUT/classes.txt"
+java -cp "$(W "$BT/lib/d8.jar")" com.android.tools.r8.D8 --lib "$(W "$PLAT")" --min-api 21 --output "$(W "$OUT/dex")" "@$(W "$OUT/classes.txt")"
 
 echo "== 5. 合成 APK：dex 塞进 aapt2 产物 =="
 cp "$OUT/app-base.apk" "$OUT/app-unsigned.apk"
-python -c "
+"C:/Users/zhangxiaonan/.workbuddy-ai/binaries/python/versions/3.13.12/python.exe" -c "
 import zipfile, sys
 p = sys.argv[1]
 z = zipfile.ZipFile(p, 'a', zipfile.ZIP_DEFLATED)
@@ -187,14 +187,14 @@ else
 fi
 
 echo "== 8. apksigner：签名 =="
-"$BT/apksigner.bat" sign \
-  --ks "$KS" --ks-pass pass:android --key-pass pass:android --ks-key-alias yunmusic \
+java -jar "$(W "$BT/lib/apksigner.jar")" sign \
+  --ks "$(W "$KS")" --ks-pass pass:android --key-pass pass:android --ks-key-alias yunmusic \
   --v1-signing-enabled true --v2-signing-enabled true --v3-signing-enabled true \
-  --out "$OUT/$APP_NAME-$VERSION_NAME.apk" \
-  "$OUT/app-aligned.apk"
+  --out "$(W "$OUT/$APP_NAME-$VERSION_NAME.apk")" \
+  "$(W "$OUT/app-aligned.apk")"
 
 echo "== 9. 校验 =="
-"$BT/apksigner.bat" verify --print-certs "$OUT/$APP_NAME-$VERSION_NAME.apk" | head -6
+java -jar "$(W "$BT/lib/apksigner.jar")" verify --print-certs "$(W "$OUT/$APP_NAME-$VERSION_NAME.apk")" | head -6
 "$BT/aapt2.exe" dump badging "$OUT/$APP_NAME-$VERSION_NAME.apk" 2>/dev/null \
   | grep -E "^package|^application-label|^launchable-activity|^uses-permission" | head -12
 ls -la "$OUT/$APP_NAME-$VERSION_NAME.apk"

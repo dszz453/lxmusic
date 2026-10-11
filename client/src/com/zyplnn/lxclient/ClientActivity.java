@@ -85,6 +85,8 @@ public class ClientActivity extends Activity {
     private static final int REQ_NOTIFICATIONS = 1001;
     /** 首启向导 / 服务器页回来的结果码。用它决定要不要重建页面 */
     private static final int REQ_SERVER = 2001;
+    /** 设置页回来的结果码（检测是否在设置页直接切换了双服务器地址） */
+    private static final int REQ_SETTINGS = 2002;
 
     /**
      * 页面 origin 用线上域名，内容由 assets 供给（内容拦截层做）。
@@ -327,11 +329,11 @@ public class ClientActivity extends Activity {
         plp.setMargins(Ui.dp(this, 2), 0, Ui.dp(this, 2), 0);
         bar.addView(pill, plp);
 
-        // 右：设置（原生页面）
+        // 右：设置（原生页面，带结果码以便切换服务器后热重载）
         bar.addView(topIconBtn(R.drawable.ic_settings, "设置", new View.OnClickListener() {
             @Override
             public void onClick(View v) {
-                startActivity(new Intent(ClientActivity.this, SettingsActivity.class));
+                startActivityForResult(new Intent(ClientActivity.this, SettingsActivity.class), REQ_SETTINGS);
             }
         }));
         return bar;
@@ -695,12 +697,10 @@ public class ClientActivity extends Activity {
     private String injectClientShell(String html) throws Exception {
         ServerStore st = ServerStore.get(this);
         ServerStore.Profile p = st.active();
-        boolean builtin = ServerStore.KIND_BUILTIN.equals(p.kind);
-        String base = builtin ? "" : (p.base == null ? "" : p.base);
+        String base = p.base == null ? "" : p.base;
 
         /**
          * 品牌同步判据：优先用握手时服务端自报的 host；还没握手过就按档案类型推。
-         * 内置离线跑的是从 CF 那条线打包下来的同一份前端，所以按 cf 算。
          */
         String brandKey = p.host == null || p.host.isEmpty()
                 ? (ServerStore.KIND_DOCKER.equals(p.kind) ? "docker" : "cf")
@@ -719,7 +719,7 @@ public class ClientActivity extends Activity {
         c.put("base", base);
         c.put("user", p.user == null ? "" : p.user);
         c.put("serverVersion", p.version == null ? "" : p.version);
-        c.put("builtin", builtin);
+        c.put("builtin", false);
 
         JSONArray arr = new JSONArray();
         List<ServerStore.Profile> ps = st.profiles();
@@ -729,7 +729,7 @@ public class ClientActivity extends Activity {
             j.put("id", q.id);
             j.put("name", q.name);
             j.put("kind", q.kind);
-            j.put("base", ServerStore.KIND_BUILTIN.equals(q.kind) ? "" : q.base);
+            j.put("base", q.base == null ? "" : q.base);
             j.put("usable", q.usable());
             j.put("brand", q.brandName());
             j.put("version", q.version == null ? "" : q.version);
@@ -1104,18 +1104,17 @@ public class ClientActivity extends Activity {
 
     /* ══════════════════ 生命周期 ══════════════════ */
 
-    /** 服务器页回来：档案可能变了（品牌、地址、版本都要重新反映到原生外壳上） */
+    /** 服务器页或设置页回来：档案可能变了（切换了双服务器地址、品牌、版本） */
     @Override
     protected void onActivityResult(int requestCode, int resultCode, Intent data) {
         super.onActivityResult(requestCode, resultCode, data);
-        if (requestCode != REQ_SERVER) return;
+        if (requestCode != REQ_SERVER && requestCode != REQ_SETTINGS) return;
         boolean changed = data != null && data.getBooleanExtra(ServerActivity.EXTRA_CHANGED, false);
         refreshStatus();
         if (changed) {
             /**
-             * 换了服务器就整页重载 —— **故意不做「热切换」**：
+             * 换了服务器就整页重载：
              * 两套后端意味着 token、插件池、缓存、播放队列全都要换一套，
-             * 热切换留下的残留状态比重新加载一次贵得多。
              * 重载后注入脚本会把新的地址写进 localStorage，页面从零开始连新服务器。
              */
             try {
