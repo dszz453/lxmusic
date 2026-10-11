@@ -11,6 +11,10 @@ android-build/
 jdk/
 sdk/
 
+# ---- 测试依赖（jsdom 只给 test/smoke.js 用，CI 里临时装）----
+node_modules/
+package-lock.json
+
 # ---- 编辑器 / 系统 ----
 .idea/
 .vscode/

@@ -4,7 +4,7 @@ name: yunmusic-android
 #
 # ⚠ 为什么放在**仓库根**的 .github/workflows/ 而不是 yunmusic-client/.github/：
 #    GitHub Actions 只扫描仓库根那一层，子目录里的 workflow 文件会被完全忽略
-#    （不会报错，就是不跑 —— 排查起来很费时间）。所以这里必须放根目录，
+#    （不报错，就是不跑 —— 排查起来很费时间）。所以这里必须放根目录，
 #    再用 working-directory / paths 把作用域收回到 yunmusic-client。
 #
 # 为什么要跑自测再打包：yunmusic-client/assets/web/index.html 是约 20 万字符的
@@ -36,10 +36,12 @@ jobs:
         with:
           node-version: '22'
 
-      # smoke.js 用 jsdom 把前端跑在假 DOM 里。仓库不锁依赖版本，
-      # 所以临时装一份（不写 package.json，避免为一个测试依赖引入 lock 文件维护）
+      # ⚠ yunmusic-client/ 必须有自己的 package.json。
+      #    否则 npm 会**向上**找到仓库根那份（lxmusic-cf），连带去装 wrangler 的
+      #    @cloudflare/workerd-windows-64 —— 那是 Windows 专用包，在 Linux 上直接
+      #    EBADPLATFORM 挂掉，报错信息完全指不到真正的原因（实测踩过）。
       - name: 装测试依赖
-        run: npm install --no-save --no-audit --no-fund jsdom
+        run: npm install --no-audit --no-fund
 
       - name: 前端自测（smoke.js）
         run: node test/smoke.js
@@ -57,17 +59,22 @@ jobs:
           distribution: temurin
           java-version: '17'
 
-      - uses: android-actions/setup-android@v3
-
-      - name: 安装 SDK 组件
-        # 版本必须和 build.sh 里写死的一致（build-tools 34.0.0 / android-34）
+      # ⚠ 刻意**不用** android-actions/setup-android：它会执行 `sdkmanager tools`，
+      #    而 `tools` 这个包在新版 SDK 里已被移除，直接报
+      #    "Warning: Failed to find package 'tools'" 然后 exit 1，整个 job 挂掉。
+      #    GitHub 的 ubuntu runner 本来就预装了 Android SDK
+      #    （ANDROID_HOME=/usr/local/lib/android/sdk），只补装缺的那两个包即可。
+      - name: 补装 SDK 组件
         run: |
-          yes | sdkmanager --licenses > /dev/null || true
-          sdkmanager "build-tools;34.0.0" "platforms;android-34"
+          SM=$(find "$ANDROID_HOME/cmdline-tools" -maxdepth 3 -name sdkmanager -type f | head -1)
+          echo "sdkmanager = $SM"
+          if [ -z "$SM" ]; then echo "找不到 sdkmanager"; exit 1; fi
+          yes | "$SM" --licenses > /dev/null || true
+          "$SM" "build-tools;34.0.0" "platforms;android-34"
 
       - name: 构建 APK
         # build.sh 默认去同级 repo_extracted/ 找便携工具链（那是本地开发布局，
-        # CI 上没有），所以这里把四个路径显式指到 setup-java / setup-android 装好的位置。
+        # CI 上没有），所以这里把四个路径显式指到 setup-java / 预装 SDK 的位置。
         run: |
           export JDK_DIR="$JAVA_HOME"
           export BUILD_TOOLS="$ANDROID_HOME/build-tools/34.0.0"
