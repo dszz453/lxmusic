@@ -485,7 +485,7 @@ export async function resolveMusicUrlFast(song, quality, pluginPool, options = {
     })[0]
   }
 
-  const flow = Promise.all(thunks.map(async (t) => {
+  const flow = Promise.all(thunks.map(async (t, rank) => {
     let r = null
     try { r = await withDeadline(t(), deadline) } catch { return }
     if (!r || !r.url) return
@@ -509,6 +509,24 @@ export async function resolveMusicUrlFast(song, quality, pluginPool, options = {
       weak: hostMatches(url, WEAK_HOSTS),
       trial: r.trial === true,            // 源自己标的「这是试听片段」（见 wy.js 的 freeTrialInfo）
       size: 0,
+      /**
+       * 这条候选在服务端**偏好序**里的位次（0 = 服务端最想用的那条）。
+       *
+       * 就是 thunks 的下标，而 thunks 的顺序正是 `musicUrlCandidateList()` 给的：
+       * 默认「插件按实测评分降序、原生兜底」，`prefer:'native'` 时前面先放 3 个
+       * 原生槽位（见 providers/index.js，以及 plugins.js 的 setRank(PLUGIN_RANK)）。
+       * 也就是说 **rank 里已经含着「哪个插件评分高」这个信息**。
+       *
+       * 为什么必须显式带给客户端：下面返回的 `ordered` 是
+       * 「best 打头 + 其余按**探测完成先后**排列」—— 完成顺序是网络快慢，
+       * 不是评分。插件评分到这一步就被冲掉了，客户端只看得到一串插件名，
+       * 没法自己判断该信哪个。老板的原话是「插件也自动选择评分高的插件」。
+       *
+       * ⚠ 客户端**不一定会**照 rank 排：它还要优先排除试听片段、优先体积大的
+       * （那条判据来自手机侧的真实网络，服务端探不出来）。rank 是给它做
+       * 「同等条件下谁更该先试」的依据，不是命令。
+       */
+      rank,
     }
     cands.push(rec)                       // 先入列：哪怕探测没赶上预算也要能返回
     const p = await withDeadline(probeAudioBytes(url), probeDeadline)
@@ -569,7 +587,7 @@ export async function resolveMusicUrlFast(song, quality, pluginPool, options = {
     // 它要是不知道哪条是片段，就会把「30 秒的无损片段（5MB）」排在
     // 「128k 完整版（4MB）」前面 —— 体积大在这一档恰恰是错的信号。
     const ordered = [best, ...probed.filter(x => x !== best)]
-      .map((x) => ({ url: x.url, from: x.from, size: x.size || 0, trial: x.trial === true }))
+      .map((x) => ({ url: x.url, from: x.from, size: x.size || 0, trial: x.trial === true, rank: x.rank }))
     return {
       urls: ordered,
       url: best.url,
@@ -601,7 +619,7 @@ export async function resolveMusicUrlFast(song, quality, pluginPool, options = {
   }
   const ordered = cands.slice().sort(compareCandidates)
   return {
-    urls: ordered.map((x) => ({ url: x.url, from: x.from, size: x.size || 0, trial: x.trial === true })),
+    urls: ordered.map((x) => ({ url: x.url, from: x.from, size: x.size || 0, trial: x.trial === true, rank: x.rank })),
     url: ordered[0].url,
     from: ordered[0].from,
     tried,

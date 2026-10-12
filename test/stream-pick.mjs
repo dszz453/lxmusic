@@ -215,6 +215,19 @@ check('已等到完整版时把窗口收回 450ms（别白耗满预算）',
 check('⚠ 交给客户端的每条候选都带上 trial（客户端会按体积重排，缺了它就会选错）',
   (src.match(/trial: x\.trial === true/g) || []).length === 2,
   '出现 ' + ((src.match(/trial: x\.trial === true/g) || []).length) + ' 处')
+/*
+ * rank：服务端偏好序位次。老板的原话是「插件也自动选择评分高的插件」。
+ * 服务端确实有一份实测评分排序表（src/generated/plugin-rank.js），也确实用它
+ * 决定先解析哪个插件；但返回给客户端的 urls 是「best 打头 + 其余按探测完成先后」，
+ * 完成顺序是网络快慢、不是评分 —— 评分到这一步就被冲掉了。必须显式带过去。
+ */
+check('⚠ 交给客户端的每条候选都带上 rank（插件实测评分序，缺了它评分就到不了客户端）',
+  (src.match(/rank: x\.rank/g) || []).length === 2,
+  '出现 ' + ((src.match(/rank: x\.rank/g) || []).length) + ' 处')
+check('rank 取自 thunk 下标 —— 而 thunk 顺序正是 musicUrlCandidateList 的评分序',
+  /thunks\.map\(async \(t, rank\) => \{/.test(src))
+check('rank 挂进了候选记录 rec（少了它，返回时就没得带）',
+  /\n\s+rank,\n\s+\}/.test(src))
 
 console.log('\n== 5b. 两份排序必须同档位同顺序（本轮揪出的真 bug） ==')
 /**
@@ -254,8 +267,10 @@ const playerCode = deComment(player)
 check('player.js 把 size 带进候选', /size: Number\(x\.size\) \|\| 0/.test(player))
 check('player.js 把 trial 也带进候选（少了它，服务端的判定到这就断了）',
   /trial: x\.trial === true/.test(player))
-check('⚠ player.js 排序里 trial 先于体积（30 秒的无损片段比 128k 完整版还大）',
-  /list\.sort\(\(a, b\) => \(a\.trial \? 1 : 0\) - \(b\.trial \? 1 : 0\) \|\| \(b\.size \|\| 0\) - \(a\.size \|\| 0\)\)/.test(player))
+check('player.js 把 rank 也带进候选（插件评分序）',
+  /rank: Number\.isFinite\(Number\(x\.rank\)\) \? Number\(x\.rank\) : Infinity/.test(player))
+check('⚠ player.js 排序：trial 先于体积，rank（评分序）也先于体积',
+  /list\.sort\(\(a, b\) => \(a\.trial \? 1 : 0\) - \(b\.trial \? 1 : 0\) \|\| \(a\.rank - b\.rank\) \|\| \(b\.size \|\| 0\) - \(a\.size \|\| 0\)\)/.test(player))
 check('player.js 有「播放长度与声明时长不符」的提示', /function warnIfSnippet/.test(player))
 check('提示足够保守（声明时长要 > 60s）', /declared < 60/.test(player))
 check('本地缓存不算音源的锅', /audio\.dataset\.cached === '1'\) return/.test(player))

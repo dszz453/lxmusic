@@ -874,7 +874,7 @@ em{font-style:normal}
    * 以前它在抽屉菜单、关于页、顶栏文案里各写一遍，发版必然漏改几处
    * （实测发到 V2.3 时抽屉里还写着 V2.2），所以收口到这里。
    */
-  var CLIENT_VERSION = 'V2.10'
+  var CLIENT_VERSION = 'V2.11'
 
   /* ------------------------------ 兼容垫片 ------------------------------
      部分老设备的系统 WebView 停留在 Chrome 4x，缺少下面这些 ES6 方法。
@@ -1096,7 +1096,14 @@ em{font-style:normal}
     })
   }
 
-  function toast(msg) {
+  /**
+   * 轻提示。`ms` 可选 —— 默认 1.9 秒，够看一句「已加入播放队列」。
+   *
+   * 但「当前音源只提供了试听片段（30s / 223s）——可换个音质或换条音源再试」
+   * 这种要解释原因的句子，1.9 秒根本读不完（实测读一半就消失了），
+   * 所以允许调用方指定更长的停留时间。
+   */
+  function toast(msg, ms) {
     var t = $('#toast')
     if (!t) return
     t.textContent = msg
@@ -1106,7 +1113,7 @@ em{font-style:normal}
     toast._t = setTimeout(function () {
       t.classList.remove('is-show')
       setTimeout(function () { t.hidden = true }, 220)
-    }, 1900)
+    }, ms || 1900)
   }
 
   /* ------------------------------ 原生网络桥 ------------------------------ */
@@ -1310,7 +1317,15 @@ em{font-style:normal}
     cands: [],
     candIndex: -1,
     // 这一首是否已经退到过服务端代理流（每首只退一次，避免来回横跳）
-    triedProxy: false
+    triedProxy: false,
+    // ---- 试听片段（见 warnIfSnippet / useNextFullCandidate）----
+    // 当前这条音源是否已确认只给了片段。判据是「实播时长 vs 歌曲声明时长」。
+    snippet: false,
+    // 同一条候选只提示一次，别在 loadedmetadata 与 ended 里各弹一遍
+    snippetWarned: false,
+    // 「因为片段而换源」的额度，按**歌曲**记账（见 useNextFullCandidate）
+    snippetSwaps: 0,
+    snippetSwapFor: ''
   }
   if (!MODES.some(function (m) { return m.key === P.mode })) P.mode = 'loop'
   if (QUALITIES.indexOf(P.quality) < 0) P.quality = '320k'
@@ -1369,6 +1384,7 @@ em{font-style:normal}
     // 用户主动选歌：给一次干净的机会，别让上一首攒下的失败计数误伤
     P.errStreak = 0
     P.resumePos = 0        // 新的一首，从头放
+    P.snippetSwapFor = ''  // 「因为片段而换源」的额度也重新给一次（见 useNextFullCandidate）
     if (list && list.length) {
       P.queue = list.slice(0)
       saveQueue()
@@ -1386,6 +1402,7 @@ em{font-style:normal}
     if (!list || !list.length) return toast('列表为空')
     P.errStreak = 0        // 用户主动播放全部，同样给一次干净的机会
     P.resumePos = 0        // 新的一首，从头放
+    P.snippetSwapFor = ''  // 换源额度同样重新给一次
     P.queue = list.slice(0)
     P.index = startIndex || 0
     saveQueue()
@@ -1393,31 +1410,67 @@ em{font-style:normal}
   }
 
   /**
-   * 把服务端给的一串候选直链摊平成数组。
+   * 把服务端给的一串候选直链摊平成数组，并**按「完整版优先」再排一次**。
    *
    * ⚠ `/url?fast=1` 的返回里 **`urls` 才是全量候选**（服务端已按「完整版优先、原生优先」
    * 排好序，见 src/lib/stream.js 的 resolveMusicUrlFast），`url` 只是其中第一条。
    * 以前客户端只用 `url` 那一条 —— 那条不通就整首判失败跳下一首。
    * 这就是「播放歌单时候会跳歌，中间有歌曲没有播放，跳过去」的根因：
    * 同一首歌往往有五六个插件源，只有其中一两个不通，本可以换一条接着放。
+   *
+   * ⚠ 服务端**明确要求**客户端拿到 urls 之后再排一次 —— 它在自己的注释里把这
+   *   叫做「第二道保险」，理由是服务端探测走的是它自己的出口，和手机网络不是一回事。
+   *   排序口径必须和服务端逐档对齐，其中最容易搞错的一条是：
+   *   **`trial`（试听片段）必须排在体积之前**。30 秒的**无损**片段可能有 5MB，
+   *   比 128k 的完整版（4MB）还大 —— 只按体积排会把它顶到最前面，
+   *   结果就是用户说的「播一段就没了」。以前这里把 `size` / `trial` 一起丢掉，
+   *   这道保险等于根本不存在。
+   *
+   * ⚠ 还有 `rank` —— 服务端给的**偏好序位次**（0 = 服务端最想用的那条）。
+   *   服务端有一份实测评分排序表（`src/generated/plugin-rank.js`：取流成功率 45%
+   *   + 响应速度 25% + 直链可播性 15% + 覆盖广度 15%），它据此决定**先解析哪个插件**；
+   *   但它返回的 urls 是「best 打头 + 其余按探测完成先后」—— 完成顺序是网络快慢，
+   *   评分到这一步就被冲掉了。老板的原话是「插件也自动选择评分高的插件」，
+   *   所以服务端把 rank 显式带过来，这里用它做排序依据。
+   *
+   *   三档顺序：① trial 排最后（别放到一半就没了）→ ② rank 小的先（评分高）
+   *   → ③ 体积大的先（完整版；只在 rank 并列时起作用）。
+   *   rank 缺失（老服务端）时取 Infinity，于是自动退化成「trial → 体积」的老口径，
+   *   新旧服务端都能用。
+   *
+   *   `size` 为 0 表示探不出体积（未知）。未知不等于小，但「已知的完整版」
+   *   比「未知的」更值得先试 —— 与服务端 compareCandidates 同口径。
    */
   function candidateList(r, song) {
     var out = [], seen = {}
-    function push(u, from) {
+    function push(u, from, size, trial, rank) {
       var s = String(u || '')
       if (!s || seen[s]) return
       seen[s] = 1
-      out.push({ url: s, from: from || '' })
+      var rk = Number(rank)
+      out.push({
+        url: s, from: from || '',
+        size: Number(size) || 0,
+        trial: trial === true,
+        // 老服务端不带 rank → NaN → Infinity，排序时自动让位给体积那一档
+        rank: isFinite(rk) ? rk : Infinity
+      })
     }
     if (r && r.urls && r.urls.length) {
       for (var i = 0; i < r.urls.length; i++) {
         var c = r.urls[i]
         if (!c) continue
-        if (typeof c === 'string') push(c, r.from)
-        else push(c.url, c.from || r.from)
+        if (typeof c === 'string') push(c, r.from, 0, false, NaN)
+        else push(c.url, c.from || r.from, c.size, c.trial, c.rank)
       }
     }
-    if (r && r.url) push(r.url, r.from)
+    if (r && r.url) push(r.url, r.from, r.size, r.trial, r.rank)
+    // Array.prototype.sort 自 ES2019 起保证稳定，所以「全都并列」时服务端的原始顺序原样保留
+    out.sort(function (a, b) {
+      if (a.trial !== b.trial) return a.trial ? 1 : -1
+      if (a.rank !== b.rank) return a.rank - b.rank
+      return (b.size || 0) - (a.size || 0)
+    })
     return out
   }
 
@@ -1429,6 +1482,10 @@ em{font-style:normal}
     P.candIndex = i
     P.localSrc = false
     P.watchWaits = 0
+    // 换了一条音源，「是不是片段」要重新判一轮（上一条的结论不能套到这条头上）。
+    // ⚠ snippetSwaps 不在这里清 —— 那个是按歌曲记账的换源额度，见 useNextFullCandidate。
+    P.snippet = false
+    P.snippetWarned = false
     audio.src = c.url
     // 两处音源信息（平台名 / 插件名）都由 applySource 一次更新，别再各写一遍
     applySource(c.from || (song && (song.source || song.sourceName)) || '')
@@ -1473,6 +1530,9 @@ em{font-style:normal}
     P.triedProxy = false
     P.watchWaits = 0
     P.watchHits = 0        // 每一首都有自己的两次抢救额度
+    // 「是不是试听片段」同样按这一轮重置 —— 上一首的结论不能带到下一首
+    P.snippet = false
+    P.snippetWarned = false
     // ⚠ 这里**不要**清零 errStreak。清零的后果是「连续失败 4 次就停下」的熔断保护
     // 永远触发不了 —— error → 自动下一首 → loadCurrent 清零 → error …
     // 就是一条无限循环：每 600ms 跳一次、每跳一次发一个 /url 请求，
@@ -1556,6 +1616,88 @@ em{font-style:normal}
       toast('播放卡住了，正在重新解析…')
       loadCurrent(true)
     }, ms || WATCH_MS)
+  }
+
+  /* ---------------------------- 试听片段 ---------------------------- */
+  /**
+   * 「这一条音源其实只给了试听片段」—— 判据是**实播时长 vs 歌曲声明时长**。
+   *
+   * 为什么不看服务端的 `trial` 字段：那个字段要靠服务端**探测体积**才能补齐
+   * （见 src/lib/stream.js 的 looksLikeTrial），探不出来时 size/trial 全是 0/false
+   * ——实测本地和部分线路就是这样。而 `audio.duration` 是浏览器解码出来的
+   * **地面真相**，谁都不依赖。网页版同此口径（public/js/player.js 的 warnIfSnippet）。
+   *
+   * 判定要保守，免得把正常短歌、纯音乐里的长静音误报成片段：
+   * 只有「歌曲声明时长 ≥ 60 秒」且「实播不到声明的六成」才算。
+   */
+  var SNIPPET_RATIO = 0.6
+  function looksSnippet() {
+    var song = currentSong()
+    if (!song) return false
+    var declared = Number(song.interval) || 0
+    var played = Number(audio.duration) || 0
+    if (declared < 60 || !played || !isFinite(played)) return false
+    return played < declared * SNIPPET_RATIO
+  }
+
+  /**
+   * 确认是片段就**说清楚原因**。
+   *
+   * 这一步不能省。以前客户端在这里是**静默跳下一首**，用户看到的就是
+   * 「歌曲播放一段，不播放，自动播放下一首歌曲」，而且完全不知道为什么 ——
+   * 只会以为播放器坏了。告诉他是音源的问题、以及可以怎么绕，才算把 bug 修完。
+   *
+   * 两个调用时机，判据只有这一份：
+   *   · `loadedmetadata` —— 元数据一到就知道时长，**提前**告知，
+   *     不必让用户先白听 30 秒才发现不对；
+   *   · `ended` —— 兜底（`snippetWarned` 保证同一条候选只弹一次）。
+   */
+  function warnIfSnippet() {
+    if (P.snippetWarned) return false
+    if (!looksSnippet()) return false
+    P.snippetWarned = true
+    P.snippet = true
+    var song = currentSong() || {}
+    var declared = Number(song.interval) || 0
+    var played = Number(audio.duration) || 0
+    // 停留 6 秒：这句话比「已加入播放队列」长得多，1.9 秒读不完
+    toast('「' + (song.name || '') + '」当前音源只提供了试听片段（'
+      + Math.round(played) + 's / ' + declared + 's）——可换个音质或换条音源再试', 6000)
+    return true
+  }
+
+  /**
+   * 因为「当前这条只有片段」而换一条候选（**同一首歌**，从头放）。
+   *
+   * 为什么要换而不是直接下一首：候选列表里往往还有别的插件源，其中就有完整版。
+   * 直接 playNext() 等于把「这首歌可能放得完整」的机会丢掉了 ——
+   * 这正是用户报的「播一段就跳下一首」。
+   *
+   * 两道刹车，缺一不可：
+   *   ① 只往后走（从 candIndex + 1 开始），且跳过已标为片段的候选
+   *      → 不会来回横跳；
+   *   ② 换源额度按**歌曲**记账、每首最多 1 次（`snippetSwaps`）
+   *      → 万一候选全是片段（size/trial 都探不出来时判不出来），
+   *        最多多试一条就走，不会把一首歌拖成一长串 30 秒。
+   */
+  function useNextFullCandidate() {
+    var song = currentSong()
+    if (!song) return false
+    // ⚠ 代理流（candIndex = -1）时**不许**回跳到候选列表：直连候选都已经试败过
+    //    才退到代理的，回去只会再失败一遍，还平白多一次起播。
+    if (P.candIndex < 0) return false
+    if (P.snippetSwapFor !== song.id) { P.snippetSwapFor = song.id; P.snippetSwaps = 0 }
+    if ((P.snippetSwaps || 0) >= 1) return false
+    var list = P.cands || []
+    for (var i = P.candIndex + 1; i < list.length; i++) {
+      if (list[i].trial) continue          // 已知是片段，换了也是白换
+      P.snippetSwaps = (P.snippetSwaps || 0) + 1
+      P.resumePos = 0                      // 从头放：片段已经放过一遍了
+      useCandidate(i, true)                // 内部会把 snippet / snippetWarned 重置
+      toast('这条音源只有片段，换一条试试完整版')
+      return true
+    }
+    return false
   }
 
   function togglePlay() {
@@ -4044,6 +4186,11 @@ em{font-style:normal}
             '所有检索、解析与播放均由远端节点完成，客户端不内置任何离线曲库与伪登录。</div>' +
         '</div>' +
         '<div class="card-block">' +
+          '<div class="card-block__head"><div class="card-block__name">服务端</div>' +
+            '<span class="pill" id="srvVerPill">读取中…</span></div>' +
+          '<div class="card-block__desc" id="srvVerDesc">正在向远端查询版本…</div>' +
+        '</div>' +
+        '<div class="card-block">' +
           '<div class="card-block__head"><div class="card-block__name">双线路架构</div></div>' +
           '<div class="card-block__desc">' +
             '<b>线路一</b> ' + esc(cfg.line1.url) + '<br>' +
@@ -4063,6 +4210,72 @@ em{font-style:normal}
         '</div>' +
       '</div>'
     bindBack()
+    loadSrvVer(myToken)
+  }
+
+  /* ------------------------------ 服务端版本 ------------------------------ */
+  /*
+   * 「关于」页要显示**服务端**版本号。
+   *
+   * 为什么值得占一块地方：用户报障时第一件事永远是确认双方说的是同一版
+   * （「你那边是 V2.8 吗？」）。要登录、要翻后台才能看到，就白白多一轮来回。
+   * 服务端 `/api/version` 是**公开接口**（见 src/server/api.js 顶部「公开接口」
+   * 那段注释），所以这里不带 token 也能读。
+   *
+   * 为什么只如实展示、**不做**「期望版本 vs 实际版本」的不一致告警：
+   * 客户端并没有「我该对接哪一版服务端」这个常量，硬造一个就得在服务端每次发版时
+   * 同步抬它 —— 一旦漏抬，页面上就会挂一条**永远亮着的假警告**，比没有警告更糟
+   * （用户会学会忽略它）。对不对得上交给用户自己看即可。
+   *
+   * 为什么**不缓存**上次读到的值：进本页是低频动作，一次 GET 的代价可以忽略；
+   * 而缓存会把「远端此刻到底通不通」这件事盖住 —— 页面显示着三天前的版本号，
+   * 用户却以为服务端好好的。宁可先闪一下「读取中…」，也要给一个当下的真值。
+   * （网页版 public/js/app.js 的 fillVersionBlock 也是这个口径。）
+   */
+
+  /**
+   * 把服务端版本这一小块画出来。`state` 取 'loading' / 'ok' / 'fail'。
+   *
+   * ⚠ 每次都**重新查询**元素，不复用渲染时的引用：异步回来时用户可能已经切走，
+   * 那时整页 innerHTML 早被换掉，手里的节点是脱管的 —— 往里写既不报错也不显示。
+   * 查不到就说明不在这一页，直接返回。
+   */
+  function renderSrvVer(state, data) {
+    var pill = $('#srvVerPill'), desc = $('#srvVerDesc')
+    if (!pill || !desc) return
+    if (state === 'ok') {
+      pill.className = 'pill pill--brand'
+      pill.textContent = data.version || '?'
+      desc.innerHTML = '构建号 ' + esc(String(data.versionCode == null ? '?' : data.versionCode)) +
+        ' · 构建 ' + esc(String(data.build || 'dev')) +
+        (data.host ? ' · 宿主 ' + esc(String(data.host)) : '')
+    } else if (state === 'fail') {
+      pill.className = 'pill pill--bad'
+      pill.textContent = '读取失败'
+      desc.textContent = '读取失败：' + data + '（重进本页可重试）'
+    } else {
+      pill.className = 'pill'
+      pill.textContent = '读取中…'
+      desc.textContent = '正在向远端查询版本…'
+    }
+  }
+
+  function loadSrvVer(myToken) {
+    renderSrvVer('loading')
+    nativeHttp(apiBase() + '/api/version', 'GET', {}, '', 15000)
+      .then(function (res) {
+        var d = null
+        try { d = JSON.parse(res.body || '{}') } catch (e) { d = null }
+        if (res.status < 200 || res.status >= 300) throw new Error('HTTP ' + res.status)
+        // 字段缺失要当成失败，别把 undefined 画成一个空角标 —— 那样看着像「服务端没版本号」
+        if (!d || !d.version) throw new Error('响应里没有 version 字段')
+        if (myToken !== routeToken) return   // 用户已经切走，别再动 DOM
+        renderSrvVer('ok', d)
+      })
+      .catch(function (e) {
+        if (myToken !== routeToken) return
+        renderSrvVer('fail', (e && e.message) || '网络不可达')
+      })
   }
 
   /* ============================ 头部 / 返回 ============================ */
@@ -4243,17 +4456,49 @@ em{font-style:normal}
   audio.addEventListener('pause', function () { clearPlayWatch(); updatePlayIcon(false); stopLyricLoop() })
   // 重新解析 / 兜底切流之后回到原来的位置，别让用户从 0 秒重听
   audio.addEventListener('loadedmetadata', function () {
+    var dur = audio.duration
     if (P.resumePos > 0 && isFinite(P.resumePos)) {
-      try { audio.currentTime = P.resumePos } catch (e) { }
+      /*
+       * ⚠ 续播点必须落在**新音源自己的时长之内**。
+       *
+       * 换候选（error / 看门狗）时会带着旧位置过来，可新那条可能短得多 ——
+       * 典型是「完整版放到 100 秒时源断了，换到的下一条是 30 秒的试听片段」。
+       * 这时把 currentTime 设成 100 会被浏览器钳到 30，<audio> 立刻派发 `ended`
+       * → playNext()，用户看到的就是「播到一半突然停、直接跳下一首」。
+       * 钳不住就宁可从头放，也绝不让它瞬间「播完」。
+       */
+      if (isFinite(dur) && dur > 0 && P.resumePos >= dur - 0.5) P.resumePos = 0
+      else { try { audio.currentTime = P.resumePos } catch (e) { } }
     }
     P.resumePos = 0
+    // 元数据一到就知道真实时长 —— 是片段的话**提前**告诉用户，
+    // 别让他先白听 30 秒才发现不对（判据见 warnIfSnippet）
+    warnIfSnippet()
     // 到这里才知道总时长，补一份给锁屏，否则锁屏上时长/进度条是空的
     lastMediaSync = Date.now()
     syncMedia()
   })
   // 拖动进度条之后立刻按新位置重摆歌词：暂停状态下 rAF 循环是停的
   audio.addEventListener('seeked', function () { realignLyric(); lastMediaSync = Date.now(); syncMedia() })
-  audio.addEventListener('ended', function () { clearPlayWatch(); playNext() })
+  /**
+   * 「播完了」其实有两种：真的放完了，和**音源只给了片段**。
+   *
+   * 后者必须区别对待 —— 用户的原话是「按照歌单播放时候，存在歌曲播放一段，
+   * 不播放，自动播放下一首歌曲」。以前这里无条件 `playNext()`，
+   * 后果是：整张歌单里凡是没有完整版的歌都被默默跳过，用户既不知道为什么，
+   * 也永远听不到后半段。
+   *
+   * 顺序：
+   *   ① 先判这一条是不是片段（`loadedmetadata` 没弹过就现在弹，把原因说清楚）；
+   *   ② 是片段、且后面还有**没标成片段**的候选 → 换那条接着放（同一首歌，从头）；
+   *   ③ 没得换了 → 按正常流程走下一首。
+   */
+  audio.addEventListener('ended', function () {
+    clearPlayWatch()
+    warnIfSnippet()
+    if (P.snippet && useNextFullCandidate()) return
+    playNext()
+  })
   audio.addEventListener('error', function () {
     if (!audio.src) return
     clearPlayWatch()

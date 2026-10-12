@@ -361,6 +361,22 @@ const SONG = {
 const RESPONSES = {
   '/me': { user: { username: 'admin', isAdmin: true } },
   '/login': { token: 'tk', user: { username: 'admin', isAdmin: true } },
+  /*
+   * 版本。形状**照抄真实服务端**：`src/version.js` 的 versionInfo()
+   * （app / version / versionCode / build / full）加上 `src/server/api.js`
+   * 的 /version 分支再补一个 host。
+   *
+   * ⚠ 加这一条时最容易犯的错是「随手编一个 `{ version: 'V2.8' }` 就完事」——
+   *   那样测出来的只是「客户端能读它自己编的字段」，不是「能读服务端真回的字段」。
+   *   这里逐字段照抄，下面还有一条断言去核对两边字段名是否还一致。
+   *
+   * 没有这一条时，请求会落到 mockFetch 的兜底 `{ ok, list: [] }` —— 一个服务端
+   * 根本不会回的形状，客户端读 `d.version` 恒为 undefined。
+   */
+  '/version': {
+    ok: true, app: 'lxmusic', version: 'V2.8', versionCode: 118,
+    build: 'dev', full: 'lxmusic V2.8 (dev)', host: 'docker'
+  },
   '/favorites': { list: [{ id: 's1', name: '测试歌曲', singer: '测试歌手' }] },
   '/favorite': { ok: true },
   '/search': { list: [SONG, { id: 's2', name: '第二首', singer: '歌手二' }, { id: 's3', name: '第三首', singer: '歌手三' }] },
@@ -1857,7 +1873,399 @@ section('20. 专辑卡片集数角标 + 搜索进 history（返回能还原结�
 }
 
 /* ============================================================ */
-section('21. 全局异常检查')
+section('21. 歌单「播一段就跳下一首」= 音源只给了试听片段')
+
+/*
+ * 报障原文：「按照歌单播放时候，存在歌曲播放一段，不播放，自动播放下一首歌曲」
+ *
+ * 真因在源侧：平台对没有播放权限的曲子只给**试听片段**（网易 eapi 的
+ * freeTrialInfo={start:0,end:30}，实测 470KB ≈ 30 秒），完整曲目往往要由插件源给出。
+ * 片段放完 <audio> 派发的是 `ended` —— 和「真的放完了」是同一个事件，
+ * 于是被当成正常结束直接 playNext()，用户看到的就是「播一段、停、跳下一首」。
+ *
+ * 修法三件，**全在客户端**（服务端一行没动 —— 它本来就做了「优先挑完整版」）：
+ *   ① 候选排序保留 size/trial 并按「片段排最后」重排（服务端注释里要求的第二道保险）；
+ *   ② 续播点超出新音源时长时归零，堵住「换到更短的源 → 瞬间 ended → 跳歌」；
+ *   ③ 用**实播时长 vs 声明时长**判定片段：提前告知原因，且先换同曲的候选，
+ *      换不到才走下一首。
+ */
+
+// ① candidateList：size / trial 不能再被丢掉
+{
+  const cCtx = vm.createContext({ console })
+  vm.runInContext(extractFn(SCRIPT, 'candidateList'), cCtx)
+  const cl = vm.runInContext('candidateList', cCtx)
+
+  // 关键场景：30 秒的**无损**片段体积(5MB)比 128k 的完整版(4MB)还大 ——
+  // 只按体积排会选错，所以必须先按 trial 分档，再比体积
+  const list = cl({
+    url: 'T', from: 'native',
+    urls: [
+      { url: 'T', from: 'native', size: 5 * 1024 * 1024, trial: true },
+      { url: 'F', from: 'plugin:甲', size: 4 * 1024 * 1024, trial: false }
+    ]
+  }, {})
+  eq(list.length, 2, '两条候选都收进来')
+  eq(list[0].url, 'F', '完整版排在试听片段之前（trial 这一档必须优先于体积）')
+  eq(list[0].size, 4 * 1024 * 1024, 'size 保留下来（以前被丢掉，等于没有第二道保险）')
+  // ⚠ 必须按 url 反查那一条来断言。写 `list[0].trial === false` 是**假绿灯**：
+  //    size/trial 一起被丢掉时 list[0] 会变成 T 那条、trial 也恰好是 false，照样通过。
+  eq(list.filter(x => x.url === 'T')[0].trial, true, 'trial 保留下来（丢了就认不出哪条是片段）')
+  eq(list[1].trial, true, '片段被排到最后')
+
+  // 都不是片段 → 体积大的优先；体积未知(0)排到已知的后面
+  const l2 = cl({ urls: [{ url: 'a', size: 1000 }, { url: 'c', size: 0 }, { url: 'b', size: 9000 }] }, {})
+  eq(l2.map(x => x.url).join(''), 'bac', '体积大优先，未知(0)排在已知之后')
+
+  // 全是未知时不能打乱服务端的原始顺序（服务端已经排过一遍了）
+  const l3 = cl({ urls: [{ url: 'x' }, { url: 'y' }, { url: 'z' }] }, {})
+  eq(l3.map(x => x.url).join(''), 'xyz', '全未知时保持服务端原序（sort 稳定，不打乱）')
+
+  // rank：服务端给的偏好序（背后是插件实测评分表）—— 「插件也自动选择评分高的插件」
+  const l4 = cl({
+    urls: [
+      { url: 'lo', from: 'plugin:低分源', size: 9000, trial: false, rank: 7 },
+      { url: 'hi', from: 'plugin:高分源', size: 1000, trial: false, rank: 1 }
+    ]
+  }, {})
+  eq(l4[0].url, 'hi', 'rank 小的（评分高）排前面 —— 即使它的体积更小')
+  eq(l4[0].rank, 1, 'rank 保留下来了（以前被丢掉，评分信息就到不了客户端）')
+
+  // ⚠ 但「已知是片段」必须压过 rank：不能因为某条评分高就去放 30 秒片段
+  const l5 = cl({
+    urls: [
+      { url: 'snip', from: 'plugin:高分源', size: 5000, trial: true, rank: 0 },
+      { url: 'full', from: 'plugin:低分源', size: 4000, trial: false, rank: 9 }
+    ]
+  }, {})
+  eq(l5[0].url, 'full', '试听片段仍然排最后（trial 这一档压过 rank）')
+
+  // 老服务端不带 rank → 自动退化成「trial → 体积」的老口径，不炸也不乱
+  const l6 = cl({ urls: [{ url: 'a', size: 1000 }, { url: 'b', size: 9000 }] }, {})
+  eq(l6[0].url, 'b', '服务端没带 rank 时退化成体积优先（新旧服务端都能用）')
+}
+
+// ② 实播时长明显短于声明时长 → 判定为片段，并且**说清楚原因**（不再静默跳歌）
+{
+  RESPONSES['/url'] = {
+    ok: true, from: 'plugin:甲', verified: false,
+    url: 'https://cdn.example.com/1.mp3',
+    urls: [
+      { url: 'https://cdn.example.com/1.mp3', from: 'plugin:甲' },
+      { url: 'https://cdn.example.com/2.mp3', from: 'plugin:乙' }
+    ]
+  }
+  await go('#/chart?source=wy&id=c1')
+  await sleep(80)
+  $('#view .song').dispatchEvent(new win.MouseEvent('click', { bubbles: true }))
+  await sleep(300)
+  const a = $('#audio')
+  eq(a.src, 'https://cdn.example.com/1.mp3', '（前置）先用第一条候选')
+
+  // jsdom 不会真的解码，手工把「这条音源只有 30 秒」摆上去（歌曲声明的是 245 秒）
+  TOASTS.length = 0
+  Object.defineProperty(a, 'duration', { configurable: true, value: 30 })
+  a.dispatchEvent(new win.Event('loadedmetadata'))
+  await sleep(60)
+  ok(TOASTS.some(t => /试听片段/.test(t)),
+    '元数据一到就提示「当前音源只提供了试听片段」，不让用户白听 30 秒才发现不对', TOASTS.join(' | '))
+  ok(TOASTS.some(t => /30s \/ 245s/.test(t)), '提示里带上「实播 / 声明」两个数字，用户才知道是音源的问题')
+
+  // 片段播完 → 换**同一首歌**的下一条候选，而不是把整首歌跳过去
+  const titleBefore = $('#playerTitle').textContent
+  TOASTS.length = 0
+  a.dispatchEvent(new win.Event('ended'))
+  await sleep(120)
+  eq(a.src, 'https://cdn.example.com/2.mp3', '片段播完 → 换同曲的下一条候选（不是跳下一首）')
+  eq($('#playerTitle').textContent, titleBefore, '换的是音源不是歌曲（标题仍是同一首）')
+  ok(TOASTS.some(t => /完整版/.test(t)), '换源时说明「这条只有片段，换一条试试完整版」')
+  eq($('#playerResolvedBy').textContent, '音源：乙', '音源标识跟着切到新候选')
+
+  // 候选换完了还是片段 → 这时候才走下一首（每首只换一次，不会无限换下去）
+  TOASTS.length = 0
+  Object.defineProperty(a, 'duration', { configurable: true, value: 30 })
+  a.dispatchEvent(new win.Event('ended'))
+  await sleep(220)
+  eq($('#playerTitle').textContent, '第二首', '没有可换的候选了 → 才跳到下一首')
+}
+
+// ③ 换候选时的续播点必须落在**新音源**时长之内
+//
+// 场景：完整版放到 100 秒时源断了，换到的下一条却是 30 秒的片段。
+// 这时把 currentTime 设成 100 会被浏览器钳到 30 → <audio> 立刻派发 ended
+// → playNext()，用户看到的就是「播到一半突然停、直接跳下一首」。
+{
+  RESPONSES['/url'] = {
+    ok: true, from: 'plugin:甲', verified: false,
+    url: 'https://cdn.example.com/1.mp3',
+    urls: [
+      { url: 'https://cdn.example.com/1.mp3', from: 'plugin:甲' },
+      { url: 'https://cdn.example.com/2.mp3', from: 'plugin:乙' }
+    ]
+  }
+  await go('#/chart?source=wy&id=c1')
+  await sleep(80)
+  $('#view .song').dispatchEvent(new win.MouseEvent('click', { bubbles: true }))
+  await sleep(300)
+  const a = $('#audio')
+
+  /*
+   * ⚠ 必须装一个「记录写入」的 currentTime 替身才看得出问题：
+   * jsdom 换 src **不会**把 currentTime 归零（真实浏览器会），
+   * 所以直接读它是读不出「有没有去 seek」的 —— 那会是一条永远绿的空断言。
+   */
+  let pos = 100
+  const seeks = []
+  Object.defineProperty(a, 'currentTime', {
+    configurable: true,
+    get: function () { return pos },
+    set: function (v) { seeks.push(v); pos = v }
+  })
+
+  // 完整版放到 100 秒时源断了 → 换候选，续播点就是 100
+  a.dispatchEvent(new win.Event('error'))
+  await sleep(80)
+  eq(a.src, 'https://cdn.example.com/2.mp3', '（前置）源断了 → 换到下一条候选')
+
+  // A：新音源 200 秒（比续播点长）→ 照常续播
+  seeks.length = 0
+  Object.defineProperty(a, 'duration', { configurable: true, value: 200 })
+  a.dispatchEvent(new win.Event('loadedmetadata'))
+  eq(seeks.join(','), '100', '新音源比续播点长 → 照常续播到 100 秒（这条不能修坏）')
+
+  // B：新音源只有 30 秒（比续播点短）→ 不许 seek，宁可从头放
+  await go('#/chart?source=wy&id=c1')
+  await sleep(80)
+  $('#view .song').dispatchEvent(new win.MouseEvent('click', { bubbles: true }))
+  await sleep(300)
+  pos = 100
+  a.dispatchEvent(new win.Event('error'))
+  await sleep(80)
+  seeks.length = 0
+  Object.defineProperty(a, 'duration', { configurable: true, value: 30 })
+  a.dispatchEvent(new win.Event('loadedmetadata'))
+  eq(seeks.length, 0, '新音源比续播点短 → 不 seek（否则被钳到片尾、瞬间 ended → 跳歌）')
+
+  RESPONSES['/url'] = { ok: true, url: 'https://cdn.example.com/a.mp3', from: 'wy', verified: true }
+}
+
+// ④ 已经退到代理流时，不许因为「片段」再回跳到直连候选
+//
+// 直连候选是**全都试败了**才退到代理流的（见 error 处理 ② 分支），
+// 片段播完时若按「往后找一条候选」的逻辑走，candIndex=-1 会让它从 0 开始 ——
+// 等于把刚刚失败过的那条又拉回来放一遍，纯属倒退。
+{
+  RESPONSES['/url'] = {
+    ok: true, from: 'plugin:甲', verified: false,
+    url: 'https://cdn.example.com/1.mp3',
+    urls: [
+      { url: 'https://cdn.example.com/1.mp3', from: 'plugin:甲' },
+      { url: 'https://cdn.example.com/2.mp3', from: 'plugin:乙' }
+    ]
+  }
+  await go('#/chart?source=wy&id=c1')
+  await sleep(80)
+  $('#view .song').dispatchEvent(new win.MouseEvent('click', { bubbles: true }))
+  await sleep(300)
+  const a = $('#audio')
+  // 两条候选都报错 → 退到服务端代理流（此时 candIndex = -1）
+  a.dispatchEvent(new win.Event('error'))
+  await sleep(80)
+  a.dispatchEvent(new win.Event('error'))
+  await sleep(80)
+  ok(/\/api\/stream/.test(a.src), '（前置）候选都试完 → 退到代理流', a.src)
+
+  /*
+   * ⚠ 这里**不能**断言 `a.src === '.../1.mp3'`。
+   * 下一首（第二首）自己也会去请求 /url，而 mock 是**按路径**而不是按歌曲 id 给的，
+   * 返回的首条候选同样是 1.mp3 —— 于是「回跳」和「换歌」两条路的 src 一模一样，
+   * 断言就成了永远绿的空话。改用两个真正能区分的信号：
+   *   · 有没有出现「换一条试试完整版」这条**换源**提示（回跳才会弹）；
+   *   · 歌曲标题有没有变（回跳的话标题仍是原曲）。
+   */
+  TOASTS.length = 0
+  Object.defineProperty(a, 'duration', { configurable: true, value: 30 })
+  a.dispatchEvent(new win.Event('ended'))
+  await sleep(220)
+  ok(!TOASTS.some(t => /换一条试试完整版/.test(t)), '代理流上的片段播完 → 不回跳到已失败的直连候选（没有换源）')
+  eq($('#playerTitle').textContent, '第二首', '（同上）而是按正常流程走下一首')
+
+  RESPONSES['/url'] = { ok: true, url: 'https://cdn.example.com/a.mp3', from: 'wy', verified: true }
+}
+
+// ⑤ 首页各榜单最常见的那一种：**官方直连给的是 30 秒片段，完整版在插件那条上**
+//
+// 报障补充：「首页，各个榜单的歌曲也存在直接取流，不过插件的情况」。
+// 服务端注释里记过同一个现象 ——「进度条只有 30 秒、音源显示 native · 直连」：
+// 平台对没有播放权限的曲子，官方 eapi 只回 freeTrialInfo={start:0,end:30}（470KB），
+// 而完整曲目由插件给出。**服务端探不出体积时 trial 判不出来**（实测 size 全为 0），
+// 于是官方直连按「official 优先」排在第一条 —— 客户端必须能在播出来之后自己纠正。
+{
+  RESPONSES['/url'] = {
+    ok: true, from: 'native', verified: false,
+    url: 'https://native.example.com/trial.mp3',
+    urls: [
+      // ⚠ 两条的 size 都是 0（探不出体积）：客户端按体积排时并列，
+      //    稳定的 sort 会保留服务端原序 —— 也就是官方直连在前。
+      { url: 'https://native.example.com/trial.mp3', from: 'native', size: 0, trial: false },
+      { url: 'https://cdn.example.com/full.mp3', from: 'plugin:六音音源', size: 0, trial: false }
+    ]
+  }
+  await go('#/chart?source=wy&id=c1')
+  await sleep(80)
+  $('#view .song').dispatchEvent(new win.MouseEvent('click', { bubbles: true }))
+  await sleep(300)
+  const a = $('#audio')
+  eq(a.src, 'https://native.example.com/trial.mp3', '（前置）体积未知时官方直连仍排在最前（与服务端同口径）')
+  eq($('#playerResolvedBy').textContent, '音源：官方直连', '（前置）最底那一行显示「官方直连」')
+
+  // 真播出来才知道它只有 30 秒 —— 这正是「直接取流、不过插件」的那种情况
+  TOASTS.length = 0
+  Object.defineProperty(a, 'duration', { configurable: true, value: 30 })
+  a.dispatchEvent(new win.Event('loadedmetadata'))
+  await sleep(60)
+  ok(TOASTS.some(t => /试听片段/.test(t)), '官方直连只有 30 秒 → 同样会提示（判据与音源是插件还是直连无关）')
+
+  a.dispatchEvent(new win.Event('ended'))
+  await sleep(120)
+  eq(a.src, 'https://cdn.example.com/full.mp3', '官方直连只是片段 → 换到插件那条（完整版）')
+  eq($('#playerResolvedBy').textContent, '音源：六音音源', '音源标识从「官方直连」变成插件名')
+
+  RESPONSES['/url'] = { ok: true, url: 'https://cdn.example.com/a.mp3', from: 'wy', verified: true }
+}
+
+/* ============================================================ */
+section('22. 「关于」页显示服务端版本号')
+
+/*
+ * 这一块是**异步补进来**的：页面先渲染「读取中…」，网络回来再改写那一小块。
+ * 所以三种状态（读取中 / 成功 / 失败）与三种时序（回来时还在本页 / 旧请求后回 /
+ * 已经切走）都要各测一遍 —— 只测「成功」那种，等于只测了理想路径。
+ *
+ * ⚠ 顺序有讲究：srvVer 是模块级缓存，**第一次成功之后就一直有值**，
+ *   失败态再也不会显示。所以「失败」必须排在「成功」前面测。
+ */
+{
+  const CLIENT_VER = (SCRIPT.match(/var CLIENT_VERSION = '([^']+)'/) || [])[1] || ''
+  ok(CLIENT_VER !== '', '取到了客户端 CLIENT_VERSION（防止下面断言退化成空串假绿灯）')
+
+  // ① 读取中：请求发出但还没回来
+  const realFetch = win.YunBridge.httpFetch
+  let releaseVer = null
+  win.YunBridge.httpFetch = function (reqId, url) {
+    if (/\/api\/version$/.test(url)) { releaseVer = reqId; return }   // 先扣住，等测试放行
+    return realFetch.apply(this, arguments)
+  }
+  await go('#/about')
+  const pillEl = $('#srvVerPill'), descEl = $('#srvVerDesc')
+  ok(!!pillEl && !!descEl, '「关于」页有服务端版本的两个节点（#srvVerPill / #srvVerDesc）')
+  // 结构都没了就往下走不了，直接停：否则只会连锁抛一串 TypeError，
+  // 报错信息也指不清「是页面少了那一块」。
+  if (!pillEl || !descEl) throw new Error('「关于」页缺少 #srvVerPill / #srvVerDesc')
+  eq(pillEl.textContent, '读取中…', '还没回来时角标显示「读取中…」（不是空白、也不是假版本号）')
+  ok(/正在向远端查询/.test(descEl.textContent), '同时给出「正在查询」的说明')
+
+  // ② 失败：原生桥回错误（走真实失败路径，不是编一个 HTTP 码）
+  ok(releaseVer !== null, '确实发出了 /api/version 请求（否则下面两条断言是空跑）')
+  win.onNativeHttpCallback({ reqId: releaseVer, error: '连接被拒绝' })
+  await sleep(40)
+  eq($('#srvVerPill').textContent, '读取失败', '远端不通 → 角标显示「读取失败」')
+  ok($('#srvVerPill').classList.contains('pill--bad'), '失败态用红色角标')
+  ok(/连接被拒绝/.test($('#srvVerDesc').textContent),
+    '失败原因如实写出来（不是一句「出错了」）', $('#srvVerDesc').textContent)
+  ok(!isErrorBlock(), '版本读不到只让这一块降级，整页照常渲染')
+
+  // ③ 成功：恢复真实 mock 再进一次
+  win.YunBridge.httpFetch = realFetch
+  await go('#/mine')
+  await go('#/about')
+  await sleep(80)
+  eq($('#srvVerPill').textContent, 'V2.8', '读到服务端版本 → 角标显示版本号')
+  ok($('#srvVerPill').classList.contains('pill--brand'), '成功态用品牌色角标')
+  const srvDesc = $('#srvVerDesc').textContent
+  ok(/构建号 118/.test(srvDesc), '构建号也显示出来（光看版本号分不出是不是同一次构建）', srvDesc)
+  ok(/构建 dev/.test(srvDesc), '构建标识显示出来', srvDesc)
+  ok(/宿主 docker/.test(srvDesc), '宿主（docker / cf）显示出来', srvDesc)
+
+  // ④ 同页同时看得到客户端与服务端两个版本 —— 这正是报障时要对的两个数
+  const aboutText = viewText()
+  ok(aboutText.indexOf('云音乐 ' + CLIENT_VER) >= 0, '同页显示客户端版本', aboutText.slice(0, 120))
+  ok(aboutText.indexOf('V2.8') >= 0, '同页显示服务端版本')
+  eq(API_CALLS.filter(c => c.path === '/version').length >= 1, true, '确实请求了 /api/version')
+
+  // ⑤ 时序：两条请求都在飞时，**先发的后回**不能盖掉后发的。
+  //    真实场景 —— 在「关于」页切了线路又重进本页，旧线路的响应迟到一步；
+  //    两个线路可能根本不是同一版服务端，画错了比不画更糟。
+  const ids = []
+  win.YunBridge.httpFetch = function (reqId, url) {
+    if (/\/api\/version$/.test(url)) { ids.push(reqId); return }
+    return realFetch.apply(this, arguments)
+  }
+  // ⚠ 必须先离开再回来：go() 打的是同一个 hash 时**不派发 hashchange**，
+  //   而步骤③结束时正停在 #/about 上 —— 直接 go('#/about') 是个空动作，
+  //   只会得到 1 条请求（这条一开始就是这么写错的）。
+  await go('#/mine')
+  await go('#/about')                       // 第一次进页 → 请求 A
+  await go('#/mine')
+  await go('#/about')                       // 重进本页 → 请求 B
+  eq(ids.length, 2, '两次进页各发了一条 /api/version')
+  const before = LOGS.length
+  // 旧的那条先回，还带一个别的线路才可能有的版本号 —— 没有时序守卫就会画上去
+  win.onNativeHttpCallback({
+    reqId: ids[0], status: 200,
+    body: JSON.stringify({ ok: true, version: 'V9.9', versionCode: 999, build: 'old', host: 'cf' })
+  })
+  await sleep(40)
+  eq($('#srvVerPill').textContent, '读取中…', '先发的旧响应迟到 → 不覆盖当前这次查询的结果')
+  ok(!/V9\.9/.test(viewText()), '页面上没有出现旧线路的版本号')
+  // 当前这次回来了才作数
+  win.onNativeHttpCallback({ reqId: ids[1], status: 200, body: JSON.stringify(RESPONSES['/version']) })
+  await sleep(40)
+  eq($('#srvVerPill').textContent, 'V2.8', '当前这次查询的结果才作数')
+  eq(LOGS.length, before, '迟到的响应不会引发 JS 异常', LOGS.slice(before).join(' | '))
+
+  // ⑥ 已经离开本页，响应才到 —— 不能画到「我的」页上
+  let lateId = null
+  win.YunBridge.httpFetch = function (reqId, url) {
+    if (/\/api\/version$/.test(url)) { lateId = reqId; return }
+    return realFetch.apply(this, arguments)
+  }
+  await go('#/mine')                        // 同样要先离开（当前正停在 #/about）
+  await go('#/about')
+  await go('#/mine')
+  ok(lateId !== null, '确实发出了 /api/version 请求（否则下面两条是空跑）')
+  const before2 = LOGS.length
+  win.onNativeHttpCallback({ reqId: lateId, status: 200, body: JSON.stringify(RESPONSES['/version']) })
+  await sleep(40)
+  eq(LOGS.length, before2, '迟到响应不引发 JS 异常', LOGS.slice(before2).join(' | '))
+  eq($('#srvVerPill'), null, '离开「关于」页后那两个节点已不在 DOM 里')
+  ok(!/V2\.8/.test(viewText()), '迟到的版本号没被画到「我的」页上', viewText().slice(0, 120))
+  win.YunBridge.httpFetch = realFetch
+
+  // ⑦ 替身形状守卫：能读到服务端源码时，核对 mock 的字段名与 versionInfo() 一致。
+  //    客户端可能被放进大仓库的子目录、也可能单独成库，所以两个候选路径都试，
+  //    都读不到就跳过（不硬失败）—— 但能读到就必须对上。
+  const fsp = require('fs')
+  const pth = require('path')
+  const verSrcPath = [pth.join(__dirname, '..', '..', 'src', 'version.js'),
+    pth.join(__dirname, '..', 'src', 'version.js')].find(p => fsp.existsSync(p))
+  if (verSrcPath) {
+    const src = fsp.readFileSync(verSrcPath, 'utf8')
+    const fields = (src.match(/return \{([\s\S]*?)\n  \}/) || ['', ''])[1]
+    const names = (fields.match(/(\w+):/g) || []).map(s => s.slice(0, -1))
+    ok(names.length >= 4, '从 src/version.js 的 versionInfo() 里取到了字段名', names.join(','))
+    const mock = RESPONSES['/version']
+    const missing = names.filter(n => !(n in mock))
+    ok(missing.length === 0, '测试替身带上了 versionInfo() 的每个字段',
+      '缺 ' + missing.join(',') + '（真响应有、替身没有 → 客户端读了也测不出来）')
+    ok('host' in mock, '测试替身带上了 api.js 补的 host 字段')
+  } else {
+    console.log('  · 跳过替身形状守卫：没找到 src/version.js（客户端单独成库时正常）')
+  }
+}
+
+/* ============================================================ */
+section('23. 全局异常检查')
 ok(LOGS.length === 0, '全程无未捕获 JS 异常', LOGS.slice(0, 5).join(' | '))
 
 try { dom.window.close() } catch (e) {}

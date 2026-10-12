@@ -344,10 +344,13 @@
             from: x.from || r.from || '直链',
             size: Number(x.size) || 0,
             trial: x.trial === true,
+            // 服务端给的偏好序位次（0 = 最想用的那条），背后是插件实测评分表。
+            // 缺了就取 Infinity —— 排序时自动让位给体积那一档，老服务端也能用。
+            rank: Number.isFinite(Number(x.rank)) ? Number(x.rank) : Infinity,
           }))
           // 本宿主播不了的地址不必浪费一次尝试（网页里是 http，壳里没有这种限制）
           .filter(x => x.url && isPlayable(x.url))
-          .map(x => ({ url: x.url, from: x.from + ' · 直连', size: x.size, trial: x.trial }))
+          .map(x => ({ url: x.url, from: x.from + ' · 直连', size: x.size, trial: x.trial, rank: x.rank }))
         /**
          * 「先排除试听片段，再体积大优先」—— 这条排序是为了「别放到一半就没了」。
          *
@@ -361,10 +364,15 @@
          * 服务端那条 `looksLikeTrial` 就是这个字段的来源（网易的 freeTrialInfo
          * 或「体积 / 声明时长」推出的码率低得离谱），两边档位必须一致。
          *
+         * ⚠ `rank`（服务端偏好序 = 插件实测评分序）排在体积**之前**：
+         * 同等条件下先用评分高的插件。老板的原话是「插件也自动选择评分高的插件」。
+         * rank 缺失时是 Infinity，`Infinity - Infinity = NaN` 会被 `||` 判为假，
+         * 于是自然落到体积那一档 —— 老服务端行为不变。
+         *
          * size 为 0 表示探不出体积（未知），排到已知的后面 —— 未知不等于小，
          * 但「已知的完整版」比「未知的」更值得先试。
          */
-        list.sort((a, b) => (a.trial ? 1 : 0) - (b.trial ? 1 : 0) || (b.size || 0) - (a.size || 0))
+        list.sort((a, b) => (a.trial ? 1 : 0) - (b.trial ? 1 : 0) || (a.rank - b.rank) || (b.size || 0) - (a.size || 0))
         directCache = list
         // 服务端把「全部候选一个都没探通」如实标成 verified=false。
         // 这种直连地址可信度不高 —— 探测是在 Cloudflare 出口做的，和用户手机
