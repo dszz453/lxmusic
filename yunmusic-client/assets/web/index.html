@@ -874,7 +874,7 @@ em{font-style:normal}
    * 以前它在抽屉菜单、关于页、顶栏文案里各写一遍，发版必然漏改几处
    * （实测发到 V2.3 时抽屉里还写着 V2.2），所以收口到这里。
    */
-  var CLIENT_VERSION = 'V2.8'
+  var CLIENT_VERSION = 'V2.9'
 
   /* ------------------------------ 兼容垫片 ------------------------------
      部分老设备的系统 WebView 停留在 Chrome 4x，缺少下面这些 ES6 方法。
@@ -3418,12 +3418,24 @@ em{font-style:normal}
     bindBack()
     if (!source || !id) { $('#albumBody').innerHTML = emptyBlock('缺少专辑参数'); return }
 
-    api('/album?source=' + encodeURIComponent(source) + '&id=' + encodeURIComponent(id))
+    api('/album?source=' + encodeURIComponent(source) + '&id=' + encodeURIComponent(id) + '&limit=200')
       .then(function (data) {
         if (myToken !== routeToken) return
-        var list = data.list || data.songs || []
+        /*
+         * ⚠ 服务端 `/album` 的返回是**嵌套**的，曲目在 `album.songs` 里：
+         *
+         *   { ok: true, album: { source, sourceId, name, cover, total, songs: [...] } }
+         *
+         * 以前这里读的是**顶层** `data.list` / `data.songs` —— 两个都不存在，
+         * 于是恒为 `[]`：界面显示「共 0 首」+ 空列表，看着就像这张专辑没有资源。
+         * 但服务端其实返回了 200 和完整曲目（真的没曲目时它会回 404
+         * 「该专辑没有可用曲目」，而不是 200），所以「能渲染出 0 首」本身就是判据。
+         *
+         * 以 `album.songs` 为准；顶层那两个只作兼容兜底（老版本 / 其它宿主）。
+         */
         var info = data.album || {}
-        var cover = info.img || (list[0] && list[0].img) || ''
+        var list = info.songs || data.list || data.songs || []
+        var cover = info.cover || info.img || (list[0] && list[0].img) || ''
         $('.pagehead__title').textContent = info.name || '专辑'
         $('#albumBody').innerHTML =
           '<div class="detailhero">' +

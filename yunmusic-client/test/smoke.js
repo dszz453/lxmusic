@@ -379,7 +379,27 @@ const RESPONSES = {
     ]
   },
   '/chart': { name: '热歌榜', list: [SONG, { id: 's2', name: '第二首', singer: '歌手二' }] },
-  '/album': { name: '测试专辑', singer: '测试歌手', img: '', list: [SONG] },
+  /*
+   * ⚠ 形状必须**照抄真实服务端**（src/server/api.js 的 /album 分支）：
+   *
+   *   { ok: true, album: { source, sourceId, name, cover, total, songs: [...] } }
+   *
+   * 这里以前写的是扁平的 `{ name, singer, img, list: [SONG] }` —— 那是一个
+   * **服务端根本不存在**的形状。于是客户端把 `data.list`（恒为 undefined）
+   * 当曲目列表这个 bug，在测试里永远绿：假数据喂对了假代码。
+   * 实测漏过一个线上 bug：打开任何一张专辑都显示「共 0 首」。
+   * 教训：替身要照着真响应写，不能照着客户端代码「看着像什么」写。
+   */
+  '/album': {
+    ok: true,
+    album: { source: 'wy', sourceId: 'a1', name: '测试专辑', cover: COVER, total: 1, songs: [SONG] },
+  },
+  // 搜专辑：真实服务端回 { ok, list, total, page, errors }，每项是
+  // { source, id, name, singer, img }（各平台 provider 的 searchAlbum 口径一致）
+  '/search-albums': {
+    ok: true, total: 1, page: 1,
+    list: [{ source: 'wy', id: 'a1', name: '测试专辑', singer: '测试歌手', img: COVER }],
+  },
   '/playlists': { list: [{ id: 'p1', name: '我的歌单' }] },
   '/playlist': { name: '我的歌单', list: [SONG] },
   '/playlist/add': { ok: true, added: 1 },
@@ -562,7 +582,9 @@ ok(bootImgs.length > 0 && bootImgs.every(isCachedCover), '首页封面已换成�
 section('3. 14 条路由逐个导航（回归）')
 const ROUTES = [
   ['#/', '首页'], ['#/charts', '排行榜'], ['#/chart?source=wy&id=c1', '榜单详情'],
-  ['#/album?id=a1', '专辑'], ['#/daily', '每日推荐'], ['#/ai', 'AI 歌单'],
+  // ⚠ 必须带 source：pageAlbum 在 `!source || !id` 时直接渲染「缺少专辑参数」空状态，
+  //    那种情况下连 /album 都不会请求 —— 只写 `#/album?id=a1` 等于没测到这个页面。
+  ['#/album?source=wy&id=a1', '专辑'], ['#/daily', '每日推荐'], ['#/ai', 'AI 歌单'],
   ['#/library', '歌单库'], ['#/playlist?id=p1', '歌单详情'],
   ['#/favorite', '我的收藏'], ['#/history', '播放历史'], ['#/mine', '我的'],
   ['#/settings', '双线路管理'], ['#/about', '关于'], ['#/downloads', '我的下载']
@@ -1718,7 +1740,56 @@ section('18. 播放器 ↔ 原生顶栏的状态机（「搜索框跑到最顶�
 }
 
 /* ============================================================ */
-section('19. 全局异常检查')
+section('19. 搜专辑 → 打开专辑（/album 是嵌套响应）')
+/*
+ * 报障原文：「客户端搜索专辑类搜索之后，里面资源显示是 0，
+ *           用网页版搜索其实都是有的（比如牛津英语、李哪吒上学记）」。
+ *
+ * 根因：服务端 /album 的曲目在 **album.songs** 里（嵌套一层），
+ *       客户端却读**顶层** data.list / data.songs —— 两个都不存在 → 恒为 [] →
+ *       界面显示「共 0 首」+ 空列表，看着就像这张专辑没有资源。
+ *       判据很硬：服务端在**真的**没有曲目时回的是 404「该专辑没有可用曲目」，
+ *       而客户端能渲染出「共 0 首」，说明服务端回了 200 + 完整曲目，是读错了地方。
+ *
+ * 这条用例同时钉两件事：搜专辑的结果画得出来、打开专辑能列出曲目。
+ * ⚠ mock 的 /album 必须保持**真服务端的嵌套形状**，否则又会退化成
+ *   「假数据喂假代码」的假绿灯（这正是这个 bug 当初漏过去的原因）。
+ */
+{
+  // ① 搜专辑：走 /search-albums，读顶层 list
+  await go('#/search?type=album&q=测试')
+  await sleep(140)
+  ok(API_CALLS.some(c => c.path === '/search-albums'), '搜专辑打的是 /search-albums（不是 /search）')
+  const cards = $$('#searchBody .grid3 .card')
+  eq(cards.length, 1, '专辑搜索结果画出了卡片（不是 0 张）')
+  ok(/测试专辑/.test(cards.length ? cards[0].textContent : ''), '专辑卡片显示专辑名')
+  ok(/测试歌手/.test(cards.length ? cards[0].textContent : ''), '专辑卡片显示歌手')
+
+  // ② 点进专辑：走 /album，曲目在 album.songs 里
+  await go('#/album?source=wy&id=a1')
+  await sleep(140)
+  const albumCall = API_CALLS.filter(c => c.path === '/album').pop()
+  ok(!!albumCall, '打开专辑打的是 /album')
+  ok(/source=wy/.test(albumCall.url) && /id=a1/.test(albumCall.url), '请求带上 source 与 id')
+
+  const albumText = $('#albumBody') ? $('#albumBody').textContent : ''
+  const rows = $$('#albumList .song')
+  eq(rows.length, 1, '专辑里的曲目列出来了（读的是 album.songs，不是顶层 list）', 'rows=' + rows.length)
+  ok(/共 1 首/.test(albumText), '曲目计数是真实的 1 首，不是 0', albumText.slice(0, 90))
+  ok(!/缺少专辑参数/.test(albumText), '不是「缺少专辑参数」那条空状态（说明 source 传对了）')
+  ok(!/打不开这张专辑/.test(albumText), '服务端 200 时不该落到错误块')
+
+  // ③ 防御性：万一以后服务端把 songs 挪回顶层，兼容兜底也还在
+  const albumMock = RESPONSES['/album']
+  RESPONSES['/album'] = { ok: true, list: [SONG] }
+  await go('#/album?source=wy&id=a1')
+  await sleep(140)
+  eq($$('#albumList .song').length, 1, '顶层 list 的兼容兜底仍然有效')
+  RESPONSES['/album'] = albumMock
+}
+
+/* ============================================================ */
+section('20. 全局异常检查')
 ok(LOGS.length === 0, '全程无未捕获 JS 异常', LOGS.slice(0, 5).join(' | '))
 
 try { dom.window.close() } catch (e) {}
