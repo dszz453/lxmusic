@@ -395,10 +395,10 @@ const RESPONSES = {
     album: { source: 'wy', sourceId: 'a1', name: '测试专辑', cover: COVER, total: 1, songs: [SONG] },
   },
   // 搜专辑：真实服务端回 { ok, list, total, page, errors }，每项是
-  // { source, id, name, singer, img }（各平台 provider 的 searchAlbum 口径一致）
+  // { source, id, name, singer, img, trackCount }（各平台 provider 的 searchAlbum 口径一致）
   '/search-albums': {
     ok: true, total: 1, page: 1,
-    list: [{ source: 'wy', id: 'a1', name: '测试专辑', singer: '测试歌手', img: COVER }],
+    list: [{ source: 'wy', id: 'a1', name: '测试专辑', singer: '测试歌手', img: COVER, trackCount: 12 }],
   },
   '/playlists': { list: [{ id: 'p1', name: '我的歌单' }] },
   '/playlist': { name: '我的歌单', list: [SONG] },
@@ -1789,7 +1789,75 @@ section('19. 搜专辑 → 打开专辑（/album 是嵌套响应）')
 }
 
 /* ============================================================ */
-section('20. 全局异常检查')
+section('20. 专辑卡片集数角标 + 搜索进 history（返回能还原结果）')
+/*
+ * 两个报障：
+ *  ① 「搜索出来专辑，专辑封面要显示里面的集数」→ 参照网页版 albumCard 的
+ *     `trackCount ? '<span class="card__badge">N 首</span>'`。
+ *  ② 「点开专辑后按返回，不是回到搜索结果，而是直接回到搜索界面，结果没了」
+ *     → 根因是**搜索没有把关键词写进 URL**：hash 不动 → history 里没有
+ *     「搜索结果」这一站 → 返回时掉回 `#/search` 空白页。
+ *     网页版走 `go(searchHash(q, source, type))`，这里对齐它。
+ */
+{
+  // ① 集数角标：直接从搜索结果卡片上读
+  await go('#/search?type=album&q=测试')
+  await sleep(160)
+  const card = $('#searchBody .grid3 .card')
+  ok(!!card, '搜到专辑卡片')
+  ok(/12 首/.test(card.textContent), '封面角标显示集数（12 首）', card.textContent.slice(0, 70))
+  ok(/网易/.test(card.textContent), '副标题带平台短名（同一专辑多平台时用来分辨）')
+
+  // ② 搜索把关键词写进 hash —— 这是「返回能还原」的前提
+  await go('#/search?type=album')
+  await sleep(140)
+  $('#searchInput').value = '测试'
+  $('#searchGo').dispatchEvent(new win.MouseEvent('click', { bubbles: true }))
+  await sleep(180)
+  const h1 = decodeURIComponent(win.location.hash)
+  ok(/q=测试/.test(h1), '点「搜索」后关键词进了 URL hash', h1)
+  ok(/type=album/.test(h1), '类型也跟着进 hash（返回后不会切回单曲）', h1)
+  eq($$('#searchBody .grid3 .card').length, 1, '搜索结果已渲染')
+
+  // ③ 切平台也进 hash（否则切完平台再返回同样丢状态）
+  const kgChip = $$('#srcChips .chip').filter(c => c.dataset.src === 'kg')[0]
+  kgChip.dispatchEvent(new win.MouseEvent('click', { bubbles: true }))
+  await sleep(180)
+  const h2 = decodeURIComponent(win.location.hash)
+  ok(/source=kg/.test(h2), '切平台后 hash 里带上 source', h2)
+  // ⚠ 切平台会整页重渲染，之前那个 chip 节点已经脱离 DOM，
+  //    必须重新查一次再断言选中态（拿旧节点断言永远失败）
+  const kgAfter = $$('#srcChips .chip').filter(c => c.dataset.src === 'kg')[0]
+  ok(!!kgAfter && kgAfter.classList.contains('is-active'), '平台 chip 选中态由 hash 重建')
+
+  // ④ 返回键真的能回到「那一份搜索结果」
+  //
+  //    ⚠ 这一段必须**用 UI 走一遍**（输入框 + 点搜索 + 点卡片 + history.back），
+  //    不能直接 go() 到目标 hash —— 直接 go() 的话，无论修没修，history 里
+  //    都有那一站，返回当然能回去，这条就成了永远绿的空断言。
+  await go('#/search?type=album')
+  await sleep(140)
+  $('#searchInput').value = '测试'
+  $('#searchGo').dispatchEvent(new win.MouseEvent('click', { bubbles: true }))
+  await sleep(200)
+  eq($$('#searchBody .grid3 .card').length, 1, '用 UI 搜到了专辑（前置条件）')
+
+  $('#searchBody .grid3 .card').dispatchEvent(new win.MouseEvent('click', { bubbles: true }))
+  await sleep(240)
+  ok(/\/album\?/.test(win.location.hash), '点专辑进了详情页', win.location.hash)
+  eq($$('#albumList .song').length, 1, '专辑详情列出了曲目（前置条件）')
+
+  // 模拟左上角返回按钮
+  win.history.back()
+  await sleep(320)
+  const backHash = decodeURIComponent(win.location.hash)
+  ok(/\/search\?/.test(backHash) && /q=测试/.test(backHash),
+    '返回回到的是**带关键词的搜索结果页**（不是空白 #/search）', backHash)
+  eq($$('#searchBody .grid3 .card').length, 1, '返回后搜索结果还在，没有丢')
+}
+
+/* ============================================================ */
+section('21. 全局异常检查')
 ok(LOGS.length === 0, '全程无未捕获 JS 异常', LOGS.slice(0, 5).join(' | '))
 
 try { dom.window.close() } catch (e) {}

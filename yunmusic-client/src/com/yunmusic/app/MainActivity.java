@@ -259,7 +259,7 @@ public class MainActivity extends Activity {
 
         // 应用标题
         TextView tvTitle = new TextView(this);
-        tvTitle.setText("云音乐 V2.9");
+        tvTitle.setText("云音乐 V2.10");
         tvTitle.setTextColor(Color.WHITE);
         tvTitle.setTextSize(17);
         tvTitle.setTypeface(null, Typeface.BOLD);
