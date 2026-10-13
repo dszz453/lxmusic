@@ -2791,6 +2791,10 @@ section('23. 本地插件与音源设置（V2.12）')
     'var P = { quality: "320k" }',
     'var LOG = []',
     'var HIT = null',
+    // ⚠ 源码级测试是把函数源码抠出来单跑，依赖必须在替身里备齐，少一个就 ReferenceError。
+    //    这个值要和 index.html 里的 LP_RESOLVE_HARD_MS 一致。
+    'var LP_RESOLVE_HARD_MS = 6000',
+    'var LAST_OPTS = null',
     'function lpUrlKey(s) { return s.source + ":" + s.id + ":" + P.quality }',
     'function lpUrlCacheGet(k) { LOG.push("cacheGet:" + k); return HIT }',
     'function lpUrlCacheSet(k, v) { LOG.push("cacheSet") }',
@@ -2801,7 +2805,9 @@ section('23. 本地插件与音源设置（V2.12）')
     //    返回数字的话 .length 是 undefined，会被判成「没有候选」而漏掉提示
     'function lpCandidates(src) { LOG.push("cands:" + src); return CAND_N ? [{ id: "p1" }] : [] }',
     'var CAND_N = 1',
-    'function lpResolve(song) { LOG.push("local"); return LOCAL_REJECT ? Promise.reject(new Error("插件全挂了")) : Promise.resolve(LOCAL) }',
+    // ⚠ 保持 LOG 里是精确的 "local"：下面有断言用 x === "local" 判「根本没调本地」，
+    //    这里一旦改成 "local:xxx" 那条断言会变成永真（假绿）。
+    'function lpResolve(song, opts) { LOG.push("local"); LAST_OPTS = opts || null; return LOCAL_REJECT ? Promise.reject(new Error("插件全挂了")) : Promise.resolve(LOCAL) }',
     'var SERVER = { url: "https://srv/a.mp3", from: "wy" }, SERVER_REJECT = false',
     'function api(p) { LOG.push("api:" + p); return SERVER_REJECT ? Promise.reject(new Error("服务端也挂了")) : Promise.resolve(SERVER) }',
     extractFn(SCRIPT, 'resolveUrl')
@@ -2881,6 +2887,17 @@ section('23. 本地插件与音源设置（V2.12）')
   await run()
   eq(get('LOG').filter(x => /^cacheGet:/.test(x))[0], 'cacheGet:wy:s1:128k',
     '缓存键带上音质（换音质不会拿到上一档的地址）')
+
+  /*
+   * ⑧ 本地解析必须有**硬超时**。
+   * 没有它的话，手机上插件全军覆没时取流要干等 lpResolve 的默认 15 秒才退服务端 ——
+   * 用户看到的就是「点了播放，十几秒没动静」，然后才出声或跳歌。
+   */
+  reset()
+  set('LOCAL = [{ url: "https://local/1.mp3" }]')
+  await run()
+  eq(get('LAST_OPTS') && get('LAST_OPTS').hardMs, 6000,
+    '本地解析带硬超时 6000ms（不能等 lpResolve 默认的 15 秒）')
 }
 
 /* ---- 23.13 跑分口径（源码级）：成功率 60% + 速度 40%，速度取中位数 ---- */
@@ -3157,6 +3174,94 @@ let WY_ENCODED_ID = ''
 
   // ④ 管理员闸门：普通账号不该看到这一块（服务端 /admin/search-sources 会 403）
   ok(/user && user\.isAdmin/.test(HTML), '渲染前有管理员判断（普通账号不画这块）')
+}
+
+/* ---- 23.18 retryViaServer：本地插件候选播不出来 → 改问服务端（源码级） ---- */
+/*
+ * 老板报障：开了「本地插件」后歌一首接一首被跳过。
+ * 根因是本地插件只把地址**解出来**、不验证能不能播；解出来的多是第三方中转域名，
+ * 解得到 URL、真拉流却超时或回错误页。早先候选试完只退代理流甚至直接跳下一首。
+ * 现在必须在候选失败时改问服务端 /api/url（服务端会探测候选），并清掉本地那份坏缓存。
+ */
+{
+  const c = vm.createContext({
+    console, Promise, JSON, Date, Math, String, Number, Object, Array, encodeURIComponent, setTimeout
+  })
+  vm.runInContext([
+    'var LOG = []',
+    'var LP = { stat: { local: 0, server: 0 } }',
+    'var P = { quality: "320k", loadToken: 7, triedServerResolve: false, cands: [], candIndex: -1,' +
+      ' candsLocal: true, watchWaits: 3, snippet: true, snippetWarned: true, triedProxy: false,' +
+      ' mode: "loop", errStreak: 0 }',
+    'var SONG = { source: "wy", id: "s1" }',
+    'function currentSong() { return SONG }',
+    'function lpUrlKey(s) { return s.source + ":" + s.id + ":" + P.quality }',
+    'function lpUrlCacheDel(k) { LOG.push("cacheDel:" + k) }',
+    'function toast(m) { LOG.push("toast:" + m) }',
+    'var SERVER = { urls: [{ url: "https://srv/1.mp3", from: "wy" }, { url: "https://srv/2.mp3", from: "wy" }] }',
+    'var SERVER_REJECT = false',
+    'function api(p) { LOG.push("api:" + p); return SERVER_REJECT ? Promise.reject(new Error("服务端挂了")) : Promise.resolve(SERVER) }',
+    'function candidateList(r, song) { return (r && r.urls) ? r.urls.slice(0) : [] }',
+    'function useCandidate(i, ap) { LOG.push("use:" + i + ":" + ap); return true }',
+    'function useProxyStream(ap) { LOG.push("proxy"); return true }',
+    'var NEXTED = 0',
+    'function playNext() { NEXTED++ }',
+    extractFn(SCRIPT, 'retryViaServer'),
+    extractFn(SCRIPT, 'afterServerResolveFail')
+  ].join('\n'), c)
+  const set = (code) => vm.runInContext(code, c)
+  const get = (code) => vm.runInContext(code, c)
+
+  // ① 正常路径：清本地缓存 → 问服务端 → 整串换成服务端候选并起播
+  let took = await vm.runInContext('retryViaServer()', c)
+  await sleep(20)
+  eq(took, true, '返回 true 表示已接管（调用方不要再往下走）')
+  eq(get('LOG').filter(x => /^cacheDel:/.test(x))[0], 'cacheDel:wy:s1:320k',
+    '先清掉本地那份坏地址的缓存（不清的话重新解析会原地命中同一个坏地址）')
+  ok(get('LOG').some(x => /^api:\/url\?id=s1/.test(x)), '改问服务端 /api/url')
+  eq(get('P.cands').length, 2, '候选整串换成服务端给的（本地那几条已证明播不出来）')
+  eq(get('P.candsLocal'), false, '来源标记改成服务端')
+  eq(get('P.candIndex'), -1, '候选指针重置')
+  ok(get('LOG').some(x => x === 'use:0:true'), '用服务端第一条候选续播')
+  ok(get('LOG').some(x => /本地插件没解出可播地址/.test(x)), '告诉用户「已改用服务端」')
+  eq(get('NEXTED'), 0, '救回来了就不该跳下一首')
+
+  // ② 每首只试一次：已经问过服务端就不再问（否则会和看门狗互相触发成死循环）
+  set('LOG = []; P.triedServerResolve = true; P.cands = []; P.candIndex = -1')
+  took = await vm.runInContext('retryViaServer()', c)
+  await sleep(20)
+  eq(took, false, '已经问过服务端 → 返回 false，让调用方继续走后面的兜底')
+  ok(!get('LOG').some(x => /^api:/.test(x)), '不重复请求服务端')
+
+  // ③ 服务端也没解出候选 → 退代理流
+  set('LOG = []; P.triedServerResolve = false; P.triedProxy = false; SERVER = {}')
+  await vm.runInContext('retryViaServer()', c)
+  await sleep(20)
+  ok(get('LOG').some(x => x === 'proxy'), '服务端也没候选 → 退服务端代理流')
+  eq(get('NEXTED'), 0, '代理流兜底成功就不跳歌')
+
+  // ④ 服务端请求失败 → 同样退代理流（不能把整首判死）
+  set('LOG = []; P.triedServerResolve = false; P.triedProxy = false; SERVER_REJECT = true')
+  await vm.runInContext('retryViaServer()', c)
+  await sleep(20)
+  ok(get('LOG').some(x => x === 'proxy'), '服务端挂了 → 退代理流')
+
+  // ⑤ 代理流也试过且失败 → 才跳下一首
+  set('LOG = []; P.triedServerResolve = false; P.triedProxy = true; SERVER = {}; P.errStreak = 0')
+  await vm.runInContext('retryViaServer()', c)
+  await sleep(30)
+  ok(get('LOG').some(x => /尝试下一首/.test(x)), '实在没辙才提示跳下一首')
+  await sleep(700)
+  eq(get('NEXTED'), 1, '兜底全失败后才真的跳下一首')
+
+  /*
+   * ⑥ 接线检查：函数写好了还得**真的被调用**。
+   * error 处理与看门狗两处都要接 —— 少一处就是「本地插件卡住时原地打转」，
+   * 而上面那些断言照样全绿（它们只测函数本身）。「写好了却没接线」这个坑本项目
+   * 踩过一次（lpProbeWorker 写好了却没有任何调用点）。
+   */
+  eq((CODE.match(/P\.candsLocal && retryViaServer\(\)/g) || []).length, 2,
+    'error 处理与看门狗两处都接了「本地候选失败 → 改问服务端」')
 }
 
 /* ============================================================ */

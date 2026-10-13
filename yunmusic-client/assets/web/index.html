@@ -914,7 +914,7 @@ em{font-style:normal}
    * 以前它在抽屉菜单、关于页、顶栏文案里各写一遍，发版必然漏改几处
    * （实测发到 V2.3 时抽屉里还写着 V2.2），所以收口到这里。
    */
-  var CLIENT_VERSION = 'V2.14'
+  var CLIENT_VERSION = 'V2.15'
 
   /* ------------------------------ 兼容垫片 ------------------------------
      部分老设备的系统 WebView 停留在 Chrome 4x，缺少下面这些 ES6 方法。
@@ -2084,6 +2084,14 @@ em{font-style:normal}
    */
   var LP_URL_TTL = 20 * 60 * 1000
   var LP_URL_MAX = 120
+  /*
+   * 本地插件解析的**硬超时**。取流路径上绝不能等满 lpResolve 的默认 15 秒：
+   * 手机上插件要么几秒内出结果（第一个候选回来 800ms 就收尾），要么就是全军覆没，
+   * 让它慢慢耗 15 秒的后果是用户盯着「加载中」十几秒，然后才退服务端 ——
+   * 观感就是「开了本地插件以后歌都放不出来」。6 秒足够正常的插件出结果。
+   * ⚠ 只作用于**取流**；跑分（lpScoreAll）走自己的超时，不受这里影响。
+   */
+  var LP_RESOLVE_HARD_MS = 6000
 
   function lpUrlKey(song) { return song.source + ':' + song.id + ':' + P.quality }
 
@@ -2107,6 +2115,20 @@ em{font-style:normal}
       for (var i = 0; i < Math.ceil(keys.length / 2); i++) delete all[keys[i]]
     }
     all[key] = { at: Date.now(), v: v }
+    store.set('ym.lp.urlcache', all)
+  }
+
+  /**
+   * 丢掉某首歌的地址缓存。
+   *
+   * 为什么必须有它：本地插件解出来的地址**不保证播得出来**，而这条坏地址会被
+   * 缓存 20 分钟。播放器发现播不了、回头重新解析时又会命中同一条坏地址 ——
+   * 来回打转，永远退不到服务端。所以「本地候选失败」那一刻必须把它清掉。
+   */
+  function lpUrlCacheDel(key) {
+    var all = store.get('ym.lp.urlcache', null)
+    if (!all || typeof all !== 'object' || !all[key]) return
+    delete all[key]
     store.set('ym.lp.urlcache', all)
   }
 
@@ -2238,7 +2260,7 @@ em{font-style:normal}
      */
     var localTried = !!(LP.on && LP.runtime && lpCandidates(song.source).length)
     var local = (LP.on && LP.runtime)
-      ? lpResolve(song).then(function (cands) {
+      ? lpResolve(song, { hardMs: LP_RESOLVE_HARD_MS }).then(function (cands) {
         if (cands && cands.length) {
           LP.stat.local++
           lpSaveStat()
@@ -2603,6 +2625,8 @@ em{font-style:normal}
     candsLocal: false,
     // 这一首是否已经退到过服务端代理流（每首只退一次，避免来回横跳）
     triedProxy: false,
+    // 本地插件候选播不出来时，是否已经改问过服务端（每首只问一次，见 retryViaServer）
+    triedServerResolve: false,
     // ---- 试听片段（见 warnIfSnippet / useNextFullCandidate）----
     // 当前这条音源是否已确认只给了片段。判据是「实播时长 vs 歌曲声明时长」。
     snippet: false,
@@ -2798,6 +2822,66 @@ em{font-style:normal}
     return true
   }
 
+  /**
+   * 本地插件给的候选**全都播不出来** → 丢掉本地那份，改问服务端 `/api/url`。
+   *
+   * ── 为什么必须有这一步 ─────────────────────────────────────────
+   * 本地插件只是把地址**解出来**，解出来 ≠ 播得出来：插件拼出来的常常是第三方
+   * 中转域名（如 `*.bdycdn.cn`、纯 IP），解得到 URL、真拉流却超时或回错误页。
+   * 服务端取流会**探测候选**（发 Range 请求确认真能出字节，见 src/lib/stream.js
+   * 的 probeAudioBytes）才把它交出来，所以服务端给的地址能出声的概率高得多。
+   *
+   * 早先这里候选试完就直接退代理流（`/api/stream`）甚至跳下一首 —— 表现就是
+   * 「本地插件一开，歌一首接一首被跳过」。这就是老板报的那个现象。
+   *
+   * 每首歌只试一次；服务端也没解出来时继续走代理流兜底（见 afterServerResolveFail）。
+   * 返回 true 表示已接管（异步续播），调用方不要再往下走。
+   */
+  function retryViaServer() {
+    if (P.triedServerResolve) return false
+    var song = currentSong()
+    if (!song || !song.id) return false
+    P.triedServerResolve = true
+    var myToken = P.loadToken
+    // 关键：清掉本地那份坏地址。不清的话后续任何一次重新解析（包括看门狗触发的
+    // loadCurrent）都会原地命中同一个坏地址 —— 来回打转、永远退不到服务端。
+    lpUrlCacheDel(lpUrlKey(song))
+    toast('本地插件没解出可播地址，改用服务端解析…', 2600)
+    api('/url?id=' + encodeURIComponent(song.id) + '&q=' + P.quality + '&fast=1')
+      .then(function (r) {
+        if (myToken !== P.loadToken) return
+        var list = candidateList(r || {}, song)
+        if (list.length) {
+          // 整串换成服务端候选：本地那几条已经证明播不出来，留着只会再跳一次
+          P.cands = list
+          P.candsLocal = false
+          P.candIndex = -1
+          P.watchWaits = 0
+          P.snippet = false
+          P.snippetWarned = false
+          useCandidate(0, true)
+          return
+        }
+        afterServerResolveFail()
+      })
+      .catch(function () {
+        if (myToken !== P.loadToken) return
+        afterServerResolveFail()
+      })
+    return true
+  }
+
+  /** 服务端也没解出地址 —— 退代理流；代理流也不行就跳下一首（与 error 处理尾部同口径） */
+  function afterServerResolveFail() {
+    if (!P.triedProxy && useProxyStream(true)) return
+    // 单曲循环下绝不能走 playNext（会把同一个坏地址再放一遍 → 死循环）
+    if (P.mode === 'single') { toast('当前音源无法播放，请切换线路后重试'); return }
+    P.errStreak = (P.errStreak || 0) + 1
+    if (P.errStreak > 3) { P.errStreak = 0; toast('多个音源均无法播放，请切换线路后重试'); return }
+    toast('播放出错，尝试下一首')
+    setTimeout(playNext, 600)
+  }
+
   function loadCurrent(autoplay) {
     var song = currentSong()
     if (!song) return
@@ -2814,6 +2898,7 @@ em{font-style:normal}
     P.candIndex = -1
     P.candsLocal = false
     P.triedProxy = false
+    P.triedServerResolve = false
     P.watchWaits = 0
     P.watchHits = 0        // 每一首都有自己的两次抢救额度
     // 「是不是试听片段」同样按这一轮重置 —— 上一首的结论不能带到下一首
@@ -2917,6 +3002,9 @@ em{font-style:normal}
         useCandidate(P.candIndex + 1, true)
         return
       }
+      // 本地插件候选卡住（解出来了却推不动）→ 直接改问服务端，而不是原地重解析 ——
+      // 原地重解析会命中同一份缓存，来回打转（见 retryViaServer 注释）。
+      if (P.candsLocal && retryViaServer()) return
       toast('播放卡住了，正在重新解析…')
       loadCurrent(true)
     }, ms || WATCH_MS)
@@ -6377,7 +6465,10 @@ em{font-style:normal}
       useCandidate(P.candIndex + 1, true)
       return
     }
-    // ② 候选都试完了 → 退服务端代理流（同源，规避防盗链），每首只退一次
+    // ② 本地插件给的候选全军覆没 → 改问服务端（服务端会探测候选，可靠得多）。
+    //    ⚠ 必须在代理流之前：本地插件只是把地址解出来，解出来 ≠ 播得出来。
+    if (P.candsLocal && retryViaServer()) return
+    // ③ 候选都试完了 → 退服务端代理流（同源，规避防盗链），每首只退一次
     if (!P.triedProxy && useProxyStream(true)) return
     // ③ 真的没辙了：连续失败兜底。整队列音源都失效时，不能无休止地「自动下一首」
     P.errStreak = (P.errStreak || 0) + 1
