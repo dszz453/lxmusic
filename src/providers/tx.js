@@ -131,6 +131,40 @@ async function searchMusicu(keyword, page, limit) {
   }
 }
 
+/**
+ * 专辑接口（fcg_v8_album_info_cp）的曲目是**扁平字段**，与搜索接口的嵌套形状
+ * 完全不同，不能直接喂给 filterSong —— 那边读的是 item.mid / item.name /
+ * item.file.size_128mp3，专辑条目里这些字段一个都不存在，结果就是「每一条都被
+ * filter(s => s.songmid) 丢掉」→ 点开专辑永远报「该 QQ 音乐专辑没有可用曲目」。
+ *
+ * 这里先把专辑条目归一化成搜索条目的形状，再交给 filterSong。归一化只做「搬字段」，
+ * 输出形状仍然只有 filterSong 一处定义，免得两套映射各自漂移。
+ *
+ * 实测字段对照（2026-10-13）：
+ *   songmid → mid          songname → name         songid → id
+ *   strMediaMid → file.media_mid
+ *   size128/320/flac → file.size_128mp3 / size_320mp3 / size_flac
+ *   singer / interval / albummid / albumname 与搜索接口同形，原样带走。
+ * 注意专辑接口**没有** size_hires（24bit），所以不搬 —— 硬编成 0 只会让上层
+ * 以为「有 24bit 资源」，那是假信息。
+ */
+function albumItemToSongItem(it) {
+  return {
+    mid: it.songmid,
+    id: it.songid,
+    name: it.songname,
+    interval: it.interval,
+    album: { mid: it.albummid, name: it.albumname },
+    singer: it.singer,
+    file: {
+      media_mid: it.strMediaMid || it.songmid,
+      size_128mp3: it.size128,
+      size_320mp3: it.size320,
+      size_flac: it.sizeflac,
+    },
+  }
+}
+
 function filterSong(item) {
   const file = item.file || {}
   const types = []
@@ -334,12 +368,13 @@ export default {
     const data = json || safeParse(text)
     const raw = data && data.data && data.data.list
     if (!Array.isArray(raw) || !raw.length) throw new Error('QQ音乐专辑曲目获取失败')
-    const songs = raw.slice(0, limit).map(filterSong).filter(s => s && s.songmid)
+    const songs = raw.slice(0, limit).map(albumItemToSongItem).map(filterSong).filter(s => s && s.songmid)
     if (!songs.length) throw new Error('该 QQ 音乐专辑没有可用曲目')
     return {
       source: SOURCE,
       sourceId: mid,
-      name: decodeName(data.data.albumName || ''),
+      // 专辑名在 data.name（老的 albumName 字段已不返回），两个都兜一下
+      name: decodeName(data.data.name || data.data.albumName || ''),
       cover: String(data.data.albumPic || `https://y.gtimg.cn/music/photo_new/T002R300x300M000${mid}.jpg`)
         .replace(/^http:\/\//, 'https://'),
       songs,

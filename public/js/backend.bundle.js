@@ -1,5 +1,5 @@
 /* 由 tools/build-app.mjs 自动生成，请勿手动修改。
- * 源摘要: b80c0dc9e4e5f505
+ * 源摘要: edbbe12d3f51e733
  * 模块数: 25
  *
  * 这是给安卓壳用的后端展平版：把 src/ 的 ESM 后端打成单个 IIFE，
@@ -8649,7 +8649,7 @@ __modules["src/version.js"] = function (__exports, __require) {
  * 所以统一读这里，谁也别再各写各的。
  *
  * ── 两条版本线，别混 ──────────────────────────────────────────
- *   APP_VERSION      产品版本，人看的。改功能才动它。当前 V2.9
+ *   APP_VERSION      产品版本，人看的。改功能才动它。当前 V2.10
  *   APP_VERSION_CODE 整数构建号，Android 靠它判断「能不能覆盖安装」。
  *                    每次要发新版就 +1，**不能倒退、不能重复**，
  *                    否则手机上会报「应用未安装」（签名相同也装不上）。
@@ -8675,10 +8675,10 @@ __modules["src/version.js"] = function (__exports, __require) {
  */
 
 /** 产品版本（对外展示用）。每发一版升 0.1。 */
-const APP_VERSION = 'V2.9'
+const APP_VERSION = 'V2.10'
 
 /** Android versionCode：整数、单调递增、跨次发布不可重复。每发一版 +1。 */
-const APP_VERSION_CODE = 119
+const APP_VERSION_CODE = 120
 
 /** 人类可读的完整标识，日志/关于页用。 */
 const APP_ID = 'lxmusic'
@@ -8957,18 +8957,32 @@ __exports.default = {
     let page = 1
     let maxPage = 1
 
+    /*
+     * 专辑名 / 封面必须单独走 album/info。
+     *
+     * album/song 返回的每一条曲目里**没有** album_name / album_img（实测 2026-10-13：
+     * 那条记录只有 album_id 等取流字段），原先从 info[0] 取，永远取到空串 ——
+     * 专辑详情页就顶着「酷狗专辑 <id>」这种兜底名显示。多这一次请求换来真名 + 真封面。
+     * 拿不到也不影响列曲目，所以失败只当没名字，不抛。
+     */
+    try {
+      const r = await request(`http://mobilecdn.kugou.com/api/v3/album/info?albumid=${id}&version=8000`,
+        { headers: { 'User-Agent': UA_PC }, retry: 0, timeout: 8000 })
+      const d = r.json && r.json.data
+      if (d) {
+        name = decodeName(d.albumname || d.album_name || '')
+        const im = d.imgurl || d.album_img || d.img || ''
+        cover = im ? String(im).replace('{size}', '480') : ''
+      }
+    } catch { /* 拿不到名字不影响列曲目 */ }
+
     while (page <= Math.min(maxPage, 10) && songs.length < limit) {
       const url = `http://mobilecdn.kugou.com/api/v3/album/song?albumid=${id}&page=${page}`
         + `&pagesize=${pageSize}&version=8000&plat=0`
       const { json } = await request(url, { headers: { 'User-Agent': UA_PC }, retry: 1, timeout: 15000 })
       const info = json && json.data && json.data.info
       if (!Array.isArray(info) || !info.length) break
-      if (!name) {
-        name = decodeName(info[0].album_name || info[0].albumname || '')
-        const im = info[0].album_img || info[0].img || ''
-        cover = im ? String(im).replace('{size}', '480') : ''
-        maxPage = Math.ceil(safeInt(json.data.total) / pageSize) || 1
-      }
+      if (page === 1) maxPage = Math.ceil(safeInt(json.data.total) / pageSize) || 1
       for (const raw of info) {
         const s = this._playlistSongToSong(raw)
         if (s) songs.push(s)
@@ -9780,6 +9794,40 @@ async function searchMusicu(keyword, page, limit) {
   }
 }
 
+/**
+ * 专辑接口（fcg_v8_album_info_cp）的曲目是**扁平字段**，与搜索接口的嵌套形状
+ * 完全不同，不能直接喂给 filterSong —— 那边读的是 item.mid / item.name /
+ * item.file.size_128mp3，专辑条目里这些字段一个都不存在，结果就是「每一条都被
+ * filter(s => s.songmid) 丢掉」→ 点开专辑永远报「该 QQ 音乐专辑没有可用曲目」。
+ *
+ * 这里先把专辑条目归一化成搜索条目的形状，再交给 filterSong。归一化只做「搬字段」，
+ * 输出形状仍然只有 filterSong 一处定义，免得两套映射各自漂移。
+ *
+ * 实测字段对照（2026-10-13）：
+ *   songmid → mid          songname → name         songid → id
+ *   strMediaMid → file.media_mid
+ *   size128/320/flac → file.size_128mp3 / size_320mp3 / size_flac
+ *   singer / interval / albummid / albumname 与搜索接口同形，原样带走。
+ * 注意专辑接口**没有** size_hires（24bit），所以不搬 —— 硬编成 0 只会让上层
+ * 以为「有 24bit 资源」，那是假信息。
+ */
+function albumItemToSongItem(it) {
+  return {
+    mid: it.songmid,
+    id: it.songid,
+    name: it.songname,
+    interval: it.interval,
+    album: { mid: it.albummid, name: it.albumname },
+    singer: it.singer,
+    file: {
+      media_mid: it.strMediaMid || it.songmid,
+      size_128mp3: it.size128,
+      size_320mp3: it.size320,
+      size_flac: it.sizeflac,
+    },
+  }
+}
+
 function filterSong(item) {
   const file = item.file || {}
   const types = []
@@ -9983,12 +10031,13 @@ __exports.default = {
     const data = json || safeParse(text)
     const raw = data && data.data && data.data.list
     if (!Array.isArray(raw) || !raw.length) throw new Error('QQ音乐专辑曲目获取失败')
-    const songs = raw.slice(0, limit).map(filterSong).filter(s => s && s.songmid)
+    const songs = raw.slice(0, limit).map(albumItemToSongItem).map(filterSong).filter(s => s && s.songmid)
     if (!songs.length) throw new Error('该 QQ 音乐专辑没有可用曲目')
     return {
       source: SOURCE,
       sourceId: mid,
-      name: decodeName(data.data.albumName || ''),
+      // 专辑名在 data.name（老的 albumName 字段已不返回），两个都兜一下
+      name: decodeName(data.data.name || data.data.albumName || ''),
       cover: String(data.data.albumPic || `https://y.gtimg.cn/music/photo_new/T002R300x300M000${mid}.jpg`)
         .replace(/^http:\/\//, 'https://'),
       songs,

@@ -228,18 +228,32 @@ export default {
     let page = 1
     let maxPage = 1
 
+    /*
+     * 专辑名 / 封面必须单独走 album/info。
+     *
+     * album/song 返回的每一条曲目里**没有** album_name / album_img（实测 2026-10-13：
+     * 那条记录只有 album_id 等取流字段），原先从 info[0] 取，永远取到空串 ——
+     * 专辑详情页就顶着「酷狗专辑 <id>」这种兜底名显示。多这一次请求换来真名 + 真封面。
+     * 拿不到也不影响列曲目，所以失败只当没名字，不抛。
+     */
+    try {
+      const r = await request(`http://mobilecdn.kugou.com/api/v3/album/info?albumid=${id}&version=8000`,
+        { headers: { 'User-Agent': UA_PC }, retry: 0, timeout: 8000 })
+      const d = r.json && r.json.data
+      if (d) {
+        name = decodeName(d.albumname || d.album_name || '')
+        const im = d.imgurl || d.album_img || d.img || ''
+        cover = im ? String(im).replace('{size}', '480') : ''
+      }
+    } catch { /* 拿不到名字不影响列曲目 */ }
+
     while (page <= Math.min(maxPage, 10) && songs.length < limit) {
       const url = `http://mobilecdn.kugou.com/api/v3/album/song?albumid=${id}&page=${page}`
         + `&pagesize=${pageSize}&version=8000&plat=0`
       const { json } = await request(url, { headers: { 'User-Agent': UA_PC }, retry: 1, timeout: 15000 })
       const info = json && json.data && json.data.info
       if (!Array.isArray(info) || !info.length) break
-      if (!name) {
-        name = decodeName(info[0].album_name || info[0].albumname || '')
-        const im = info[0].album_img || info[0].img || ''
-        cover = im ? String(im).replace('{size}', '480') : ''
-        maxPage = Math.ceil(safeInt(json.data.total) / pageSize) || 1
-      }
+      if (page === 1) maxPage = Math.ceil(safeInt(json.data.total) / pageSize) || 1
       for (const raw of info) {
         const s = this._playlistSongToSong(raw)
         if (s) songs.push(s)

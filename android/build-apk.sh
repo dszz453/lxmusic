@@ -37,6 +37,18 @@ W() { cygpath -w "$1"; }                          # MSYS 路径 → Windows 路�
 LIST_WIN() { find "$@" | while read -r f; do cygpath -w "$f"; done; }
 
 APP_NAME="music-edge"
+# 2.11：修「搜专辑搜到了、点进去打不开 / 集数对不上」—— 两个 provider 的**响应形状不匹配**。
+#     ① QQ（tx）：专辑接口 fcg_v8_album_info_cp 回的是扁平字段
+#        （songmid / songname / size128 / strMediaMid），而 filterSong 是按**搜索接口**
+#        的嵌套形状写的（item.mid / item.name / item.file.size_128mp3）→ 每一条都被
+#        filter(s => s.songmid) 丢掉 → 点开任何 QQ 专辑都报「该 QQ 音乐专辑没有可用曲目」。
+#        修法：新增 albumItemToSongItem() 把专辑条目归一化成搜索条目形状再复用 filterSong，
+#        输出形状仍只有一处定义。实测「李哪吒上学记」专辑由「打不开」变为可列 411 首。
+#     ② 酷狗（kg）：album/song 的每条记录里**没有** album_name / album_img，
+#        原先从 info[0] 取名字 → 永远空串 → 专辑详情顶着「酷狗专辑 <id>」。
+#        修法：单独打 album/info 取 albumname + imgurl（失败只当没名字，不影响列曲目）。
+#     回归：test/album-providers.test.mjs（6 条，含两条「替身形状守卫」，
+#        防止 fixture 被改成「照着客户端代码看着像什么」的样子而把 bug 固化成预期）。
 # 2.10：修「酷狗/QQ 的歌播不出来」—— http 直链不再按域名白名单丢弃。
 #      升级为「一律乐观升级 https，探不通再退回原 http（仅安卓壳）」：
 #      实测酷狗《黄昏》13 个候选里只有 3 条 http://*.bdycdn.cn/... 真能出声，
