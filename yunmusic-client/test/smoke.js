@@ -392,6 +392,13 @@ const FAKE_PLUGIN_OK = `/*!
 const { EVENT_NAMES, on, send } = globalThis.lx
 on(EVENT_NAMES.request, ({ action, source, info }) => {
   if (action !== 'musicUrl') return Promise.reject(new Error('action not support: ' + action))
+  /*
+   * 把**收到的东西**记下来 —— 「插件到底拿到了什么 musicInfo」是本地插件能不能取流的
+   * 命门，而它恰恰是唯一在页面上看不出来的东西（加载成功、日志正常、就是解不出地址）。
+   * V2.13 的根因（喂的是裁剪过的瘦对象、没有 hash/songmid）就是靠这条抓出来的。
+   * 套 try/catch：Worker 路径下没有 window。
+   */
+  try { window.__lpSeenInfo = info && info.musicInfo } catch (e) { }
   return Promise.resolve('https://local.example.com/' + source + '/' + info.musicInfo.id + '.mp3')
 })
 send(EVENT_NAMES.inited, {
@@ -2930,6 +2937,142 @@ section('23. 本地插件与音源设置（V2.12）')
     'MainActivity 用 ACTION_GET_CONTENT 起文件选择器（不卡 MIME，.js 才选得中）')
   ok(/PLUGIN_MAX_BYTES/.test(act), '原生读插件脚本有大小上限（防误选大文件把内存顶爆）')
   ok(/\\uFEFF/.test(act), '原生会剥掉 UTF-8 BOM（否则脚本第一行是非法字符）')
+}
+
+/* ---- 23.15 喂给插件的 musicInfo 必须「取流可用」（V2.13 修）---- */
+/*
+ * 报障原文：「在一个服务端测试很好的插件，在手机端不能用」「没有一首歌能播放出来，
+ * 播放页面显示的是服务端」。
+ *
+ * 根因：服务端 `/api/search` 回给页面的是 `songForWeb()` **裁剪过**的对象 ——
+ * 只有 id/source/name/singer/albumName/interval/img，**没有 hash、没有 songmid**
+ * （取流必需的平台标识）。客户端却把它原样当 `musicInfo` 喂给插件。
+ * 实测 22 个内置插件里 9 个读 songmid、8 个读 hash，于是**全军覆没**：
+ * 插件加载正常、日志正常，就是永远解不出地址，每首歌都退回服务端。
+ *
+ * 而取流字段本来就在手里 —— 服务端 `encodeSongId()` 把它们一起塞进了 `song.id`
+ * （base64url 的 JSON）。服务端自己取流时就是先 `decodeSongId(id)` 再喂插件，
+ * 客户端照做即可。
+ *
+ * ⚠ 这里的 id **必须用服务端真编码器生成**（src/lib/songid.js），不能手搓一个
+ *   base64 串 —— 那又成了「替身照着自己的想象写形状」，正是这个 bug 当初漏过去的原因。
+ */
+let KG_ENCODED_ID = ''
+let WY_ENCODED_ID = ''
+{
+  const { pathToFileURL } = require('url')
+  // 双路径兜底：单仓库时在 <repo>/src/lib/，主仓库里 yunmusic-client 是子目录
+  const songidPath = [path.join(ROOT, '..', 'src', 'lib', 'songid.js'),
+    path.join(ROOT, '..', '..', 'src', 'lib', 'songid.js')].find(p => fs.existsSync(p))
+  ok(!!songidPath, '能找到服务端编码器 src/lib/songid.js（两端口径的唯一来源）')
+  const songidSrc = fs.readFileSync(songidPath, 'utf8')
+  // 形状守卫：编码器用的键名一变，下面的解码断言就成了自说自话
+  ;[['s', 'source'], ['i', 'songmid'], ['h', 'hash'], ['a', 'albumId'], ['m', 'mediaMid'],
+    ['n', 'name'], ['g', 'singer'], ['t', 'interval'], ['p', 'img']].forEach(([k, field]) =>
+      ok(new RegExp(k + ":\\s*song\\." + field).test(songidSrc),
+        'encodeSongId 里 ' + k + ' ← song.' + field + ' 仍在（改了就要同步改客户端的解码）'))
+
+  const { encodeSongId } = await import(pathToFileURL(songidPath).href)
+  const kgSong = {
+    source: 'kg', songmid: 'MID_1234', hash: 'HASH_ABCDEF', albumId: 'ALB_9',
+    mediaMid: 'MM_5', name: '稳稳的幸福', singer: '陈奕迅', interval: 245, img: 'https://cdn.example.com/x.jpg'
+  }
+  KG_ENCODED_ID = encodeSongId(kgSong)
+  WY_ENCODED_ID = encodeSongId({ source: 'wy', songmid: 'WY_88', name: '测试歌曲', singer: '测试歌手', interval: 245 })
+  ok(KG_ENCODED_ID && !/[+/=]/.test(KG_ENCODED_ID), '编码出来的 id 是 url-safe 的（不含 + / =）', KG_ENCODED_ID)
+
+  /*
+   * atob 替身：Node 的 Buffer 对非法 base64 极其宽容，而浏览器会抛。
+   * 这里按浏览器的严格度实现 —— 否则「垃圾 id 要安全兜底」那条断言会假绿。
+   */
+  const atobStrict = (s) => {
+    const t = String(s)
+    if (t.length % 4 !== 0 || !/^[A-Za-z0-9+/]*={0,2}$/.test(t)) throw new Error('InvalidCharacterError')
+    return Buffer.from(t, 'base64').toString('binary')
+  }
+  const c = vm.createContext({
+    console, JSON, String, Number, Object, Array, escape, decodeURIComponent,
+    window: { atob: atobStrict }, SONG_IN: null
+  })
+  vm.runInContext([extractFn(SCRIPT, 'lpDecodeSongId'), extractFn(SCRIPT, 'lpMusicInfo')].join('\n'), c)
+  const mi = (o) => { c.SONG_IN = o; return vm.runInContext('lpMusicInfo(SONG_IN)', c) }
+
+  const got = mi(Object.assign({}, SONG, { id: KG_ENCODED_ID }))
+  eq(got.hash, 'HASH_ABCDEF', 'musicInfo.hash 还原出来了（酷狗插件靠它取流）')
+  eq(got.songmid, 'MID_1234', 'musicInfo.songmid 还原出来了（9 个插件读它）')
+  eq(got.id, 'MID_1234', 'musicInfo.id 是**平台原生 id**，不是那串 base64')
+  eq(got.albumId, 'ALB_9', 'musicInfo.albumId 用的是原生 albumId（不是 songForWeb 里那个编码过的）')
+  eq(got.mediaMid, 'MM_5', 'musicInfo.mediaMid 还原出来了（QQ 插件要用）')
+  eq(got.name, '稳稳的幸福', '中文名 UTF-8 往返正确（atob + escape 那套就是为它）')
+  eq(got.singer, '陈奕迅', '中文歌手 UTF-8 往返正确')
+  eq(got.interval, 245, 'interval 保留')
+  eq(got.source, 'kg', 'source 以 id 里的为准')
+  eq(got.img, 'https://cdn.example.com/x.jpg', 'img 保留')
+
+  // 同义字段：各平台对「那一个 id」的叫法不同，都得指到同一个值
+  eq(got.mid, 'MID_1234', '别名 mid（QQ 口径）')
+  eq(got.rid, 'MID_1234', '别名 rid（酷我口径）')
+  eq(got.musicrid, 'MID_1234', '别名 musicrid（咪咕口径）')
+  eq(got.musicId, 'MID_1234', '别名 musicId')
+  eq(got.songId, 'MID_1234', '别名 songId')
+  eq(got.strMediaMid, 'MM_5', '别名 strMediaMid（QQ）')
+  eq(got.media_mid, 'MM_5', '别名 media_mid（QQ 旧写法）')
+  eq(got.album, '测试专辑', '别名 album 取专辑名')
+  eq(got.songName, '稳稳的幸福', '别名 songName 取歌名（以 id 里的为准，同 name）')
+  eq(JSON.stringify(got.types), '[]', 'types 置空 —— 与服务端 decodeSongId 的输出**同形**')
+  eq(got._types, null, '_types 置空 —— 同上')
+
+  // 兜底：解不出来时原样返回，绝不能抛（否则「非本服务端来源的歌」直接播不了）
+  const raw = { id: 's1', name: '测试歌曲', singer: '测试歌手', source: 'wy' }
+  const same = mi(raw)
+  eq(same.id, 's1', '解不出来的 id（老数据 / 极简写法）→ 原样返回，不抛')
+  eq(same.name, '测试歌曲', '原样返回时字段一个不少')
+
+  // 与服务端 decodeSongId 一样支持 `kg:HASH` 极简写法
+  const plain = mi({ id: 'kg:PLAINHASH', source: 'kg' })
+  eq(plain.songmid, 'PLAINHASH', '兼容 kg:HASH 极简 id')
+  eq(plain.hash, 'PLAINHASH', 'kg 极简写法下 hash 取同一个值（服务端同此口径）')
+
+  // 源码级守卫：两个调用点都必须包一层，别退回「直接把瘦对象喂进去」
+  ok(/musicInfo:\s*lpMusicInfo\(song\)/.test(NOCOMMENT), '取流调用点喂的是 lpMusicInfo(song)')
+  ok(/musicInfo:\s*lpMusicInfo\(t\.song\)/.test(NOCOMMENT), '跑分调用点喂的是 lpMusicInfo(t.song)')
+  ok(!/musicInfo:\s*song\b/.test(NOCOMMENT) && !/musicInfo:\s*t\.song\b/.test(NOCOMMENT),
+    '没有残留「把裁剪过的歌曲对象直接当 musicInfo」的调用点')
+}
+
+/* ---- 23.16 端到端：插件真的收到了带 hash/songmid 的 musicInfo ---- */
+{
+  // 开关打开 + 只启用「甲音源」（能解出地址的那个），乙音源关掉
+  await go('#/plugins')
+  await sleep(220)
+  const sw = $('#lpOn')
+  if (!sw.checked) { sw.checked = true; sw.dispatchEvent(new win.Event('change')); await sleep(260) }
+  $$('#lpList [data-lpen]').forEach((b, i) => {
+    const want = i === 0
+    if (b.checked !== want) { b.checked = want; b.dispatchEvent(new win.Event('change')) }
+  })
+  await sleep(260)
+
+  const savedId = SONG.id
+  SONG.id = WY_ENCODED_ID          // 服务端真编码器产出的 id
+  win.__lpSeenInfo = null
+  RESPONSES['/url'] = { ok: true, url: 'https://cdn.example.com/server.mp3', from: 'wy', verified: true }
+  await go('#/chart?source=wy&id=c1')
+  await sleep(120)
+  API_CALLS.length = 0
+  $('#view .song').dispatchEvent(new win.MouseEvent('click', { bubbles: true }))
+  await sleep(700)
+
+  const seen = win.__lpSeenInfo || {}
+  eq(seen.songmid, 'WY_88', '插件收到 musicInfo.songmid（修复前是 undefined）')
+  eq(seen.id, 'WY_88', '插件收到 musicInfo.id = 平台原生 id（修复前是那串 base64）')
+  ok('hash' in seen, '插件收到 musicInfo.hash 字段（修复前整个字段都不存在）')
+  eq(seen.name, '测试歌曲', '插件收到歌名')
+  eq($('#audio').src, 'https://local.example.com/wy/WY_88.mp3',
+    '插件按原生 id 拼出的地址真的被用上了（修复前这个 id 是 base64，插件拼出来必然是废链）')
+  eq(API_CALLS.filter(c => c.path === '/url').length, 0, '本地解出来了，没再问服务端')
+  eq($('#playerResolvedBy').textContent, '音源：甲音源', '音源标识显示本地插件名，不再是「服务端」')
+  SONG.id = savedId
 }
 
 /* ============================================================ */

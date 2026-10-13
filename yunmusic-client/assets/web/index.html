@@ -893,7 +893,7 @@ em{font-style:normal}
    * 以前它在抽屉菜单、关于页、顶栏文案里各写一遍，发版必然漏改几处
    * （实测发到 V2.3 时抽屉里还写着 V2.2），所以收口到这里。
    */
-  var CLIENT_VERSION = 'V2.12'
+  var CLIENT_VERSION = 'V2.13'
 
   /* ------------------------------ 兼容垫片 ------------------------------
      部分老设备的系统 WebView 停留在 Chrome 4x，缺少下面这些 ES6 方法。
@@ -1862,6 +1862,86 @@ em{font-style:normal}
   }
 
   /**
+   * 把「页面里的歌曲对象」还原成**插件要的 musicInfo**。
+   *
+   * ⚠ 这一步是本地插件能不能取流的命门。漏了它的症状是：
+   *   「同一个插件在服务端测得好好的，手机上所有歌都播不出来、每首都退回服务端」。
+   *
+   * 根因：服务端 `/api/search` 回给页面的是 `songForWeb()` **裁剪过**的对象 ——
+   *   只有 id / source / name / singer / albumName / interval / img / qualities，
+   *   **没有 hash、也没有 songmid**（那是取流必需的平台标识）。而插件要的正是它们：
+   *   实测 22 个内置插件里 9 个读 `musicInfo.songmid`、8 个读 `musicInfo.hash`、
+   *   还有读 mid / rid / musicrid / mediaMid 的。喂一个缺字段的对象进去，插件连
+   *   请求都拼不出来 —— 加载一切正常、日志一切正常，就是永远解不出地址。
+   *
+   * 而**字段本来就在手里**：服务端 `encodeSongId()`（src/lib/songid.js）把取流必需的
+   *   键一起塞进了 `song.id`（base64url 的 JSON：s/i/h/a/m/n/g/t/p）。服务端自己取流时
+   *   也是先 `decodeSongId(id)` 再喂插件 —— 客户端照做即可，不用再多问服务端一次
+   *   （那会让「服务端不可用时靠插件兜底」这件事重新依赖服务端）。
+   */
+  function lpDecodeSongId(id) {
+    var s = String(id == null ? '' : id)
+    if (!s) return null
+    // 与服务端 decodeSongId 一致：兼容 `kg:HASH` 这种极简写法
+    var plain = s.match(/^(kg|wy|kw|tx)[:：](.+)$/i)
+    if (plain) {
+      // 酷狗的「极简 id」就是它自己的 hash，服务端 decodeSongId 也是这么认的
+      var ps = plain[1].toLowerCase()
+      return { s: ps, i: plain[2], h: ps === 'kg' ? plain[2] : '' }
+    }
+    try {
+      var b64 = s.replace(/-/g, '+').replace(/_/g, '/')
+      while (b64.length % 4) b64 += '='
+      // atob 只认 latin1；先 escape 成 %XX 再 decodeURIComponent 才能还原 UTF-8 中文
+      var o = JSON.parse(decodeURIComponent(escape(window.atob(b64))))
+      if (!o || !o.s) return null
+      return o
+    } catch (e) { return null }
+  }
+
+  /** 解不出来（老数据 / 非本服务端来源）就**原样返回**，绝不抛出去影响播放 */
+  function lpMusicInfo(song) {
+    var d = lpDecodeSongId(song && song.id)
+    if (!d) return song
+    var mi = {}
+    for (var k in song) if (Object.prototype.hasOwnProperty.call(song, k)) mi[k] = song[k]
+    var sid = String(d.i || '')
+    mi.source = d.s || song.source
+    mi.songmid = sid
+    mi.id = sid || song.id
+    mi.hash = d.h || ''
+    mi.albumId = d.a || ''
+    mi.mediaMid = d.m || ''
+    if (d.n) mi.name = d.n
+    if (d.g) mi.singer = d.g
+    if (d.t) mi.interval = d.t
+    if (d.p) mi.img = d.p
+    /*
+     * 同义字段：同一个「平台 id」，各插件按自己平台的叫法取 ——
+     * QQ 用 mid / mediaMid / strMediaMid、酷我用 rid、咪咕用 musicrid / musicId。
+     * 都指到同一个值上，省得为每个平台各维护一份映射表。
+     * （types / _types 服务端的 decodeSongId 也不给，这里显式置空以保持**同形**：
+     *   客户端喂给插件的东西，要和服务端喂的一模一样。）
+     */
+    if (sid) {
+      if (!mi.mid) mi.mid = sid
+      if (!mi.rid) mi.rid = sid
+      if (!mi.musicrid) mi.musicrid = sid
+      if (!mi.musicId) mi.musicId = sid
+      if (!mi.songId) mi.songId = sid
+    }
+    if (mi.mediaMid) {
+      if (!mi.strMediaMid) mi.strMediaMid = mi.mediaMid
+      if (!mi.media_mid) mi.media_mid = mi.mediaMid
+    }
+    if (!mi.album) mi.album = mi.albumName || ''
+    if (!mi.songName) mi.songName = mi.name || ''
+    if (!mi.types) mi.types = []
+    if (mi._types === undefined) mi._types = null
+    return mi
+  }
+
+  /**
    * 用本地插件解析一首歌的地址。返回候选数组（形状与 /url 的 urls 一致）。
    *
    * 几个刻意的取舍：
@@ -1900,7 +1980,7 @@ em{font-style:normal}
             .then(function () { return lpEnsure(p.id, 8000) })
             .then(function (it) {
               if (!it) return null
-              return lpInvoke(p.id, song.source, 'musicUrl', { type: P.quality, musicInfo: song }, 20000)
+              return lpInvoke(p.id, song.source, 'musicUrl', { type: P.quality, musicInfo: lpMusicInfo(song) }, 20000)
             })
             .then(function (url) {
               if (url && typeof url === 'string' && /^https?:\/\//.test(url)) {
@@ -2255,7 +2335,7 @@ em{font-style:normal}
           var rec = acc[t.p.id]
           rec.total++
           return Promise.resolve()
-            .then(function () { return lpInvoke(t.p.id, t.source, 'musicUrl', { type: P.quality, musicInfo: t.song }, 20000) })
+            .then(function () { return lpInvoke(t.p.id, t.source, 'musicUrl', { type: P.quality, musicInfo: lpMusicInfo(t.song) }, 20000) })
             .then(function (url) {
               if (url && typeof url === 'string' && /^https?:\/\//.test(url)) {
                 rec.ok++
