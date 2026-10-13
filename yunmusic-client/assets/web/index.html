@@ -458,6 +458,27 @@ em{font-style:normal}
 }
 .switch input:checked + i{background:var(--brand)}
 .switch input:checked + i::after{transform:translateX(20px)}
+/*
+ * 「默认搜索源」列表（与 Web 管理页同一套 class 名，但交互换成 ↑↓ 按钮）。
+ * 用 grid 而不是 flex 排：序号列宽度固定，名字列吃掉剩余空间并在过长时省略号，
+ * 这样右移/下移按钮与开关永远贴在右边、不会因为平台名长短而错位。
+ */
+.srclist{display:flex;flex-direction:column;gap:6px}
+.srcrow{
+  display:grid;grid-template-columns:22px 1fr 30px 30px auto;align-items:center;gap:6px;
+  background:var(--bg-2,#f6f7f9);border-radius:var(--radius-sm,8px);padding:6px 8px;
+}
+.srcrow__no{font-size:12px;color:var(--text-3);text-align:center;font-variant-numeric:tabular-nums}
+.srcrow__name{font-size:13.5px;min-width:0;overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
+.srcrow__mv{
+  width:28px;height:28px;border:0;border-radius:8px;background:#fff;color:var(--text-2);
+  font-size:14px;line-height:1;cursor:pointer;
+}
+.srcrow__mv:disabled{opacity:.32;cursor:default}
+.srcrow__mv:not(:disabled):active{background:var(--brand);color:#fff}
+.srcfoot{display:flex;align-items:center;gap:10px;margin-top:10px}
+.srcfoot__state{flex:1 1 auto;font-size:11.5px;color:var(--text-3);line-height:1.5}
+.srcfoot__state.is-dirty{color:var(--brand)}
 .note{font-size:11.5px;color:var(--text-3);line-height:1.7}
 .note b{color:var(--text-2)}
 .errdetail{
@@ -893,7 +914,7 @@ em{font-style:normal}
    * 以前它在抽屉菜单、关于页、顶栏文案里各写一遍，发版必然漏改几处
    * （实测发到 V2.3 时抽屉里还写着 V2.2），所以收口到这里。
    */
-  var CLIENT_VERSION = 'V2.13'
+  var CLIENT_VERSION = 'V2.14'
 
   /* ------------------------------ 兼容垫片 ------------------------------
      部分老设备的系统 WebView 停留在 Chrome 4x，缺少下面这些 ES6 方法。
@@ -5578,6 +5599,8 @@ em{font-style:normal}
     bindBack()
     lpRenderBody()
     audioCacheRefreshStat()
+    // 「默认搜索源」是服务端设置，跟插件数据无关，单独拉（不阻塞插件清单渲染）
+    lpLoadSources(false)
     // 插件数据是懒加载的（约 760KB），进这一页才拉
     loadPluginData(function (err) {
       if (myToken !== routeToken) return
@@ -5595,11 +5618,13 @@ em{font-style:normal}
     var b = $('#lpBody')
     if (!b) return
     b.innerHTML = lpSwitchCard() + lpStatCard() + lpScoreCard() +
+      lpSourcesCard() +
       lpListCard() + lpImportCard() + lpCacheCard() +
       '<div class="note" style="padding:6px 2px 28px">' +
       '插件运行在独立的 Worker 里 —— 个别第三方脚本出错只会影响它自己，不会让应用崩溃。' +
       '</div>'
     lpBindBody()
+    lpSourcesBind()
   }
 
   function lpSwitchCard() {
@@ -5668,6 +5693,168 @@ em{font-style:normal}
   }
 
   function pad2(n) { return (n < 10 ? '0' : '') + n }
+
+  /* ---------------------------- 默认搜索源（可排序） ---------------------------- */
+  /*
+   * 服务端的「默认搜索源」决定**综合搜索 / 首页推荐 / AI 歌单匹配**查哪几个平台，
+   * 而**顺序就是优先级**（越靠前越先被查、结果越靠前）。Web 管理页一直有这一块，
+   * 客户端此前没有 —— 想改顺序只能去开网页，手机上够不着。
+   *
+   * ⚠ 交互**故意不照抄网页的拖拽**：网页那份是 mousedown/mousemove 的鼠标拖拽，
+   *   手机上要另写一整套触摸事件；而在一个可滚动的列表里做触摸拖拽，既要
+   *   elementFromPoint 又要边拖边挪 DOM，老 WebView 上极容易把滚动手势一起吃掉。
+   *   ↑↓ 按钮同样能表达「顺序 = 优先级」，行为确定、且能被 smoke 自测
+   *   （本项目没有真机也没有模拟器，拖拽写出来就是没测过的代码）。
+   *   真想要拖拽再加，别为此把这一页搞脆。
+   *
+   * ⚠ 只给**管理员**画：这是服务端全局设置，普通账号调 /admin/search-sources 会被
+   *   403 —— 画出来只会让人点一次、吃一个错误提示。
+   */
+  var SRC = { state: 'idle', err: '', active: [], order: [], byKey: {}, dirty: false, saving: false }
+
+  function lpLoadSources(force) {
+    if (SRC.state === 'loading') return
+    if (SRC.state === 'ready' && !force) return
+    SRC.state = 'loading'
+    SRC.err = ''
+    lpRenderBody()
+    api('/sources').then(function (d) {
+      d = d || {}
+      var all = []
+      var byKey = {}
+      var i, p
+      for (i = 0; i < (d.platforms || []).length; i++) { p = d.platforms[i]; if (p && p.key) { all.push(p); byKey[p.key] = p } }
+      for (i = 0; i < (d.pluginSources || []).length; i++) {
+        p = d.pluginSources[i]
+        // 只列声明了 musicSearch 的插件源 —— 勾一个不能搜的源，点了搜索没反应才是真的坑
+        // （与 Web 管理页同口径）。
+        if (!p || !p.key || !p.searchable) continue
+        all.push(p)
+        byKey[p.key] = p
+      }
+      // 列表按服务端的 order 渲染（含未勾选的平台）；order 里没提到的补在末尾。
+      // 不这么做的话「调完顺序一刷新又回去了」—— 那个坑 Web 管理页踩过一次。
+      var order = []
+      var fromServer = d.order && d.order.length ? d.order : []
+      for (i = 0; i < fromServer.length; i++) if (byKey[fromServer[i]]) order.push(fromServer[i])
+      for (i = 0; i < all.length; i++) if (order.indexOf(all[i].key) < 0) order.push(all[i].key)
+      SRC.byKey = byKey
+      SRC.order = order
+      SRC.active = (d.active || []).slice(0)
+      SRC.dirty = false
+      SRC.state = 'ready'
+      lpRenderBody()
+    }).catch(function (e) {
+      SRC.state = 'error'
+      SRC.err = (e && e.message) || '加载失败'
+      lpRenderBody()
+    })
+  }
+
+  function lpSourcesCard() {
+    if (!(user && user.isAdmin)) return ''
+    var head = '<div class="groupTitle" style="padding:14px 4px 8px">默认搜索源</div>'
+    if (SRC.state === 'idle' || SRC.state === 'loading') {
+      return head + '<div class="card-block" style="margin-bottom:12px">' +
+        '<div class="card-block__desc">正在读取…</div></div>'
+    }
+    if (SRC.state === 'error') {
+      return head + '<div class="card-block" style="margin-bottom:12px">' +
+        '<div class="card-block__desc">读取失败：' + esc(SRC.err) + '</div>' +
+        '<button class="btn btn--ghost btn--block" id="srcReload" style="margin-top:10px">重试</button>' +
+        '</div>'
+    }
+    var rows = ''
+    var last = SRC.order.length - 1
+    for (var i = 0; i < SRC.order.length; i++) {
+      var k = SRC.order[i]
+      var p = SRC.byKey[k] || { name: k }
+      var on = SRC.active.indexOf(k) >= 0
+      rows += '<div class="srcrow" data-key="' + esc(k) + '">' +
+        '<span class="srcrow__no">' + (i + 1) + '</span>' +
+        '<span class="srcrow__name">' + esc(p.name || k) + '</span>' +
+        '<button class="srcrow__mv" data-srcup="' + esc(k) + '"' + (i === 0 ? ' disabled' : '') + ' aria-label="上移">\u2191</button>' +
+        '<button class="srcrow__mv" data-srcdown="' + esc(k) + '"' + (i === last ? ' disabled' : '') + ' aria-label="下移">\u2193</button>' +
+        '<label class="switch"><input type="checkbox" data-srctog="' + esc(k) + '"' + (on ? ' checked' : '') + '><i></i></label>' +
+        '</div>'
+    }
+    return head +
+      '<div class="card-block" style="margin-bottom:12px">' +
+      '<div class="card-block__desc">越靠上的平台，在「综合搜索 / 首页推荐」里越先被查；' +
+      '右侧开关决定它是否参与。用 ↑↓ 调顺序，改完点右下角保存。</div>' +
+      '<div class="srclist" id="srcSort" style="margin-top:10px">' + rows + '</div>' +
+      '<div class="srcfoot">' +
+      '<span class="srcfoot__state' + (SRC.dirty ? ' is-dirty' : '') + '" id="srcState">' +
+      (SRC.dirty ? '有未保存的改动' : '顺序与开关改动后需保存') + '</span>' +
+      '<button class="btn btn--sm" id="srcSave"' + (SRC.dirty && !SRC.saving ? '' : ' disabled') + '>' +
+      (SRC.saving ? '保存中…' : '保存') + '</button>' +
+      '</div>' +
+      '<div class="note" style="margin-top:10px">全部取消会退回全部平台。' +
+      '这是<b>服务端</b>设置，保存后所有设备一起生效。</div>' +
+      '</div>'
+  }
+
+  function lpSourcesBind() {
+    var rl = $('#srcReload')
+    if (rl) rl.addEventListener('click', function () { lpLoadSources(true) })
+    $$('[data-srcup]').forEach(function (b) {
+      b.addEventListener('click', function () { lpSourcesMove(b.getAttribute('data-srcup'), -1) })
+    })
+    $$('[data-srcdown]').forEach(function (b) {
+      b.addEventListener('click', function () { lpSourcesMove(b.getAttribute('data-srcdown'), 1) })
+    })
+    $$('[data-srctog]').forEach(function (c) {
+      c.addEventListener('change', function () {
+        var k = c.getAttribute('data-srctog')
+        var i = SRC.active.indexOf(k)
+        if (c.checked) { if (i < 0) SRC.active.push(k) }
+        else if (i >= 0) SRC.active.splice(i, 1)
+        SRC.dirty = true
+        lpRenderBody()
+      })
+    })
+    var sv = $('#srcSave')
+    if (sv) sv.addEventListener('click', lpSourcesSave)
+  }
+
+  /** 把第 i 项与相邻项换位。越界直接返回（首行的 ↑ / 末行的 ↓ 本来就 disabled）。 */
+  function lpSourcesMove(key, dir) {
+    var i = SRC.order.indexOf(key)
+    var j = i + dir
+    if (i < 0 || j < 0 || j >= SRC.order.length) return
+    var t = SRC.order[i]
+    SRC.order[i] = SRC.order[j]
+    SRC.order[j] = t
+    SRC.dirty = true
+    lpRenderBody()
+  }
+
+  /*
+   * 保存：一次送两样，缺一不可（与 Web 管理页同口径）。
+   *   sources —— 勾选的平台，顺序就是搜索优先级（真正生效的那份）
+   *   order   —— 整列的完整顺序，含**没勾选**的平台（只影响界面排布）
+   * 只送 sources 的话，取消勾选某个平台再刷新它会自己蹦到队尾 —— 用户只会得出
+   * 「调了没用」的结论。
+   */
+  function lpSourcesSave() {
+    if (SRC.saving) return
+    SRC.saving = true
+    lpRenderBody()
+    api('/admin/search-sources', {
+      method: 'POST',
+      body: { sources: SRC.active.join(','), order: SRC.order.join(',') }
+    }).then(function (r) {
+      SRC.saving = false
+      SRC.dirty = false
+      if (r && r.active) SRC.active = r.active.slice(0)
+      toast('已保存默认搜索源：' + (SRC.active.length ? SRC.active.join(' / ') : '全部平台'))
+      lpRenderBody()
+    }).catch(function (e) {
+      SRC.saving = false
+      toast((e && e.message) || '保存失败')
+      lpRenderBody()
+    })
+  }
 
   function lpListCard() {
     var list = LP.list

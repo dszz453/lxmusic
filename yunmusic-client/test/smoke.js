@@ -547,7 +547,36 @@ const RESPONSES = {
       { name: '搜不到的歌', singer: '查无此人' },
       { name: '晴天', singer: '周杰伦' }
     ]
-  }
+  },
+  /*
+   * 默认搜索源。形状**照抄真实服务端**（src/server/api.js 的 /sources 分支）：
+   *   { ok, active, order, platforms:[{key,name,short,pluginSupported,plugins,qualities}],
+   *     pluginSources:[{key,name,short,actions,qualities,plugins,searchable}] }
+   *
+   * ⚠ 两处故意做「不一样」，否则测不出客户端有没有真按服务端来：
+   *   ① order 与 platforms 的自然顺序**不同**（platforms 是 kg 打头，order 是 wy 打头）——
+   *      客户端必须按 order 渲染，否则「调完顺序一刷新又回去」这个坑测不出来。
+   *   ② pluginSources 里放一条 searchable:false —— 它**不该**出现在列表里。
+   */
+  '/sources': {
+    ok: true,
+    active: ['wy', 'kg'],
+    order: ['wy', 'kg', 'kw', 'tx', 'mg', 'xm'],
+    platforms: [
+      { key: 'kg', name: '酷狗音乐', short: '酷狗', pluginSupported: true, plugins: ['甲音源'], qualities: ['128k'] },
+      { key: 'wy', name: '网易云音乐', short: '网易', pluginSupported: true, plugins: ['甲音源'], qualities: ['128k'] },
+      { key: 'kw', name: '酷我音乐', short: '酷我', pluginSupported: false, plugins: [], qualities: [] },
+      { key: 'tx', name: 'QQ音乐', short: 'QQ', pluginSupported: false, plugins: [], qualities: [] },
+      { key: 'mg', name: '咪咕音乐', short: '咪咕', pluginSupported: false, plugins: [], qualities: [] },
+      { key: 'xm', name: '喜马拉雅', short: '喜马', pluginSupported: false, plugins: [], qualities: [] }
+    ],
+    pluginSources: [
+      { key: 'qsvip', name: '汽水VIP', short: '汽水VIP', actions: ['musicUrl', 'musicSearch'], qualities: ['128k'], plugins: ['甲音源'], searchable: true },
+      { key: 'nosearch', name: '只取流不能搜', short: '只取流', actions: ['musicUrl'], qualities: ['128k'], plugins: ['甲音源'], searchable: false }
+    ]
+  },
+  // POST /admin/search-sources 回 { ok, active, order }（与真实服务端一致）
+  '/admin/search-sources': { ok: true, active: ['wy'], order: ['kg', 'wy', 'kw', 'tx', 'mg', 'xm'] }
 }
 
 function mockFetch(reqId, url, method, headers, body) {
@@ -3073,6 +3102,61 @@ let WY_ENCODED_ID = ''
   eq(API_CALLS.filter(c => c.path === '/url').length, 0, '本地解出来了，没再问服务端')
   eq($('#playerResolvedBy').textContent, '音源：甲音源', '音源标识显示本地插件名，不再是「服务端」')
   SONG.id = savedId
+}
+
+/* ---- 23.17 默认搜索源：排序 / 开关 / 保存（客户端补的 Web 端能力） ---- */
+{
+  await go('#/plugins')
+  await sleep(300)
+  const sortBox = $('#srcSort')
+  ok(!!sortBox, '「插件与音源」页有「默认搜索源」列表')
+  const rows = $$('#srcSort .srcrow')
+  // 6 个内置平台 + 1 个可搜的插件专有源（qsvip）；nosearch 不可搜，不该出现
+  eq(rows.length, 7, '列出内置六平台 + 可搜的插件专有源')
+  eq(rows.map(r => r.dataset.key).join(','), 'wy,kg,kw,tx,mg,xm,qsvip',
+    '按服务端 order 渲染（platforms 的自然顺序是 kg 打头，order 是 wy 打头）')
+  ok(!/nosearch/.test(sortBox.innerHTML), 'searchable:false 的插件源不列出来（勾了也搜不动）')
+  eq(rows[0].querySelector('.srcrow__no').textContent, '1', '第一行显示序号 1')
+  ok(rows[0].querySelector('[data-srcup]').disabled, '首行的「↑」禁用')
+  ok(rows[rows.length - 1].querySelector('[data-srcdown]').disabled, '末行的「↓」禁用')
+  eq(rows.filter(r => r.querySelector('[data-srctog]').checked).length, 2, '默认勾选服务端 active 的那 2 个')
+  eq($('#srcSave').disabled, true, '没有改动时「保存」是灰的')
+
+  // ① 下移第一行
+  const before = $$('#srcSort .srcrow').map(r => r.dataset.key)
+  $$('#srcSort .srcrow')[0].querySelector('[data-srcdown]')
+    .dispatchEvent(new win.MouseEvent('click', { bubbles: true }))
+  await sleep(60)
+  const after = $$('#srcSort .srcrow').map(r => r.dataset.key)
+  eq(after[0], before[1], '下移后原来的第二项排到了第一')
+  eq(after[1], before[0], '原来的第一项落到第二')
+  eq(after.length, before.length, '换位不增删行')
+  eq($('#srcSave').disabled, false, '有改动后「保存」点亮')
+  ok(/未保存/.test($('#srcState').textContent), '状态文案提示有未保存改动', $('#srcState').textContent)
+
+  // ② 取消勾选 kg
+  const kgRow = $$('#srcSort .srcrow').filter(r => r.dataset.key === 'kg')[0]
+  const kgTog = kgRow.querySelector('[data-srctog]')
+  kgTog.checked = false
+  kgTog.dispatchEvent(new win.Event('change'))
+  await sleep(60)
+
+  // ③ 保存：必须同时带上 sources 与 order
+  LAST_BODY = ''
+  const postsBefore = API_CALLS.filter(c => c.path === '/admin/search-sources').length
+  $('#srcSave').dispatchEvent(new win.MouseEvent('click', { bubbles: true }))
+  await sleep(250)
+  const saved = JSON.parse(LAST_BODY || '{}')
+  eq(saved.sources, 'wy', 'sources 只含仍勾选的平台')
+  ok(typeof saved.order === 'string' && saved.order.length > 0, 'order 也送出去了（只送 sources 会让未勾选项蹦到队尾）', LAST_BODY)
+  eq(saved.order.split(',')[0], after[0], 'order 的第一项 = 界面上第一项')
+  eq(saved.order.split(',').length, 7, 'order 是完整排列（含未勾选的平台）')
+  eq(API_CALLS.filter(c => c.path === '/admin/search-sources').length, postsBefore + 1, '保存只发一次请求')
+  ok(TOASTS.some(t => /已保存默认搜索源/.test(t)), '保存成功有明确提示', TOASTS.join(' | '))
+  eq($('#srcSave').disabled, true, '保存成功后按钮回到禁用')
+
+  // ④ 管理员闸门：普通账号不该看到这一块（服务端 /admin/search-sources 会 403）
+  ok(/user && user\.isAdmin/.test(HTML), '渲染前有管理员判断（普通账号不画这块）')
 }
 
 /* ============================================================ */
