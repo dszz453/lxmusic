@@ -2900,7 +2900,7 @@ section('23. 本地插件与音源设置（V2.12）')
     '本地解析带硬超时 6000ms（不能等 lpResolve 默认的 15 秒）')
 }
 
-/* ---- 23.13 跑分口径（源码级）：成功率 60% + 速度 40%，速度取中位数 ---- */
+/* ---- 23.13 跑分口径（源码级）：成功率 60% + 速度 40%，中位数；**按平台分别算** ---- */
 {
   const c = vm.createContext({ console, JSON, Date, Math, String, Number, Object, Array })
   vm.runInContext([
@@ -2909,47 +2909,87 @@ section('23. 本地插件与音源设置（V2.12）')
     'var SAVED = null',
     'var store = { set: function (k, v) { SAVED = v }, get: function () { return null } }',
     'function lpBuildList() { return [] }',
-    'function lpSetEnabled(id, on) { TURNED.push(id) }',
+    // ⚠ 替身要照抄真行为：真 lpSetEnabled 会把 LP.list 里那个插件的 enabled 改掉。
+    //    不照抄的话，「已勾上的不重复计入」这条永远测不出真假。
+    'function lpSetEnabled(id, on) {',
+    '  TURNED.push(id)',
+    '  for (var i = 0; i < LP.list.length; i++) if (LP.list[i].id === id) LP.list[i].enabled = !!on',
+    '}',
     'var TURNED = []',
+    extractFn(SCRIPT, 'lpScoreOne'),
     extractFn(SCRIPT, 'lpFinalizeScores'),
     extractFn(SCRIPT, 'lpAutoEnableFromScores')
   ].join('\n'), c)
-  const fin = (acc) => vm.runInContext('lpFinalizeScores(' + JSON.stringify(acc) + ', Date.now()).byId', c)
+  // ⚠ acc 是**两层**：acc[插件id][平台] = { ok, total, times }（分源评分的关键）
+  const fin = (acc) => vm.runInContext('lpFinalizeScores(' + JSON.stringify(acc) + ', Date.now())', c)
+  const byId = (acc) => fin(acc).byId
+  const W = (r) => ({ wy: r })   // 只在一个平台上测过
 
-  eq(fin({ A: { ok: 10, total: 10, times: [1000, 1000, 1000] } }).A.score, 100,
+  eq(byId({ A: W({ ok: 10, total: 10, times: [1000, 1000, 1000] }) }).A.score, 100,
     '全成功 + 中位 1.0s（≤1.5s 满分）→ 100 分')
-  eq(fin({ A: { ok: 10, total: 10, times: [1000] } }).A.rate, 100, 'rate 也写出来（列表要显示「实测 10/10 次成功」）')
-  eq(fin({ B: { ok: 0, total: 10, times: [] } }).B.score, 0, '一次都没成功 → 0 分（速度再快也没意义）')
-  eq(fin({ C: { ok: 5, total: 10, times: [1000, 2000, 3000, 4000, 9000] } }).C.ms, 3000,
+  eq(byId({ A: W({ ok: 10, total: 10, times: [1000] }) }).A.rate, 100, 'rate 也写出来（列表要显示「实测 10/10 次成功」）')
+  eq(byId({ B: W({ ok: 0, total: 10, times: [] }) }).B.score, 0, '一次都没成功 → 0 分（速度再快也没意义）')
+  eq(byId({ C: W({ ok: 5, total: 10, times: [1000, 2000, 3000, 4000, 9000] }) }).C.ms, 3000,
     '取**中位数**耗时（3000），不是均值')
-  eq(fin({ C: { ok: 5, total: 10, times: [1000, 2000, 3000, 4000, 9000] } }).C.score, 61,
+  eq(byId({ C: W({ ok: 5, total: 10, times: [1000, 2000, 3000, 4000, 9000] }) }).C.score, 61,
     '成功率 50%(×0.6) + 速度 (8000-3000)/6500(×0.4) → 61 分')
-  eq(fin({ D: { ok: 1, total: 1, times: [9000] } }).D.score, 60, '中位 ≥8s → 速度分归零，只剩成功率的 60 分')
-  eq(fin({ E: { ok: 1, total: 1, times: [1500] } }).E.score, 100, '中位正好 1.5s → 速度仍算满分（边界含在内）')
-  eq(fin({ F: { ok: 1, total: 1, times: [1000, 1000, 1000, 1000, 60000] } }).F.score, 100,
+  eq(byId({ D: W({ ok: 1, total: 1, times: [9000] }) }).D.score, 60, '中位 ≥8s → 速度分归零，只剩成功率的 60 分')
+  eq(byId({ E: W({ ok: 1, total: 1, times: [1500] }) }).E.score, 100, '中位正好 1.5s → 速度仍算满分（边界含在内）')
+  eq(byId({ F: W({ ok: 1, total: 1, times: [1000, 1000, 1000, 1000, 60000] }) }).F.score, 100,
     '一个超时样本不把整体拉垮（均值会被 60000 拉到 12800 → 0 分）')
-  ok(!!vm.runInContext('SAVED && SAVED.byId && typeof SAVED.at === "number"', c),
-    '跑分结果落盘并带时间戳（设置页要显示「上次跑分」）')
+  ok(!!vm.runInContext('SAVED && SAVED.bySource && SAVED.byId && typeof SAVED.at === "number"', c),
+    '跑分结果落盘：bySource + byId + 时间戳都写出去')
 
-  // 自动勾选：每平台只勾实测可用的前 2 名
+  /*
+   * ★ 分源评分（对齐 Web 管理页的 byPlatform）：
+   * 同一个插件在 wy 上 90 分、在 kg 上 0 分，两份**都要**留在结果里。
+   * 早先只留一个综合分，用户看着「90 分」却不知道它在 kg 上一次都没成功。
+   */
+  const mixed = fin({ P: { wy: { ok: 10, total: 10, times: [1000] }, kg: { ok: 0, total: 10, times: [] } } })
+  eq(mixed.bySource.wy.P.score, 100, 'bySource.wy.P —— wy 上 100 分')
+  eq(mixed.bySource.kg.P.score, 0, 'bySource.kg.P —— kg 上 0 分（各源**分开**记账）')
+  eq(mixed.byId.P.score, 100, '综合分取**最好的那个源**（100），不是平均（那会变成 50）')
+  eq(mixed.byId.P.bestSource, 'wy', '综合分记下 bestSource —— 列表要标明「最优：网易」')
+
+  // 一个平台都没测到的插件：记一条空成绩（列表显示「不可用」，而不是「未测」）
+  const empty = fin({ Q: {} })
+  eq(empty.byId.Q.score, 0, '没有任何平台数据 → 0 分')
+  eq(empty.byId.Q.bestSource, '', 'bestSource 为空（不瞎标一个源）')
+
+  /*
+   * 自动勾选：每平台只勾**该平台**实测可用的前 2 名。
+   * 这组数据是专门造的 —— p3 只在 kg 上排第二，按综合分它根本进不了前二，
+   * 只有「按源各算一份」才会把它勾上。
+   */
   vm.runInContext([
-    'LP.scores = { byId: { p1: { score: 90, ok: 3 }, p2: { score: 70, ok: 2 }, p3: { score: 50, ok: 1 }, p4: { score: 0, ok: 0 } } }',
+    'LP.scores = {',
+    '  bySource: {',
+    '    wy: { p1: { score: 90, ok: 3 }, p2: { score: 40, ok: 1 } },',
+    '    kg: { p1: { score: 10, ok: 0 }, p2: { score: 80, ok: 2 }, p3: { score: 70, ok: 2 } }',
+    '  },',
+    '  byId: { p1: { score: 90, ok: 3 }, p2: { score: 80, ok: 2 }, p3: { score: 70, ok: 2 } }',
+    '}',
     'LP.list = [',
-    '  { id: "p1", name: "一", enabled: false, sources: { wy: {} } },',
-    '  { id: "p2", name: "二", enabled: false, sources: { wy: {} } },',
-    '  { id: "p3", name: "三", enabled: false, sources: { wy: {} } },',
-    '  { id: "p4", name: "四", enabled: false, sources: { wy: {} } }',
+    '  { id: "p1", name: "一", enabled: false, sources: { wy: {}, kg: {} } },',
+    '  { id: "p2", name: "二", enabled: false, sources: { wy: {}, kg: {} } },',
+    '  { id: "p3", name: "三", enabled: false, sources: { kg: {} } }',
     ']',
     'TURNED = []'
   ].join('\n'), c)
-  const turned = vm.runInContext('lpAutoEnableFromScores()', c)
-  eq(turned.length, 2, '每平台只自动勾前 2 名（再多就是同一平台的重复源）')
-  eq(vm.runInContext('TURNED.join(",")', c), 'p1,p2', '按实测分数从高到低勾')
-  ok(!vm.runInContext('TURNED.indexOf("p4") >= 0', c), '实测 0 次成功的插件不会被勾上')
+  vm.runInContext('lpAutoEnableFromScores()', c)
+  eq(vm.runInContext('TURNED.join(",")', c), 'p1,p2,p3',
+    'wy 勾 p1/p2，kg 勾 p2/p3 —— p3 只在 kg 上排第二，用综合分是勾不上它的')
+  ok(!vm.runInContext('LP.list[0].enabled === false || LP.list[1].enabled === false', c),
+    '被勾上的插件 enabled 真的被置位了')
 
-  // 已经勾上的不重复计入
-  vm.runInContext('LP.list[0].enabled = true; TURNED = []', c)
-  eq(vm.runInContext('lpAutoEnableFromScores().length', c), 1, '已经勾上的不再重复计入（避免提示数字虚高）')
+  // 再跑一次：都勾上了 → 不重复计入
+  vm.runInContext('TURNED = []', c)
+  eq(vm.runInContext('lpAutoEnableFromScores().length', c), 0, '已经勾上的不再重复计入（避免提示数字虚高）')
+
+  // 旧版评分结果（只有 byId、没有 bySource）→ 不自动勾选
+  vm.runInContext('LP.scores = { byId: { p1: { score: 90, ok: 3 } } }; TURNED = []', c)
+  eq(vm.runInContext('lpAutoEnableFromScores().length', c), 0,
+    '旧版结果没有分源明细 → 不自动勾（宁可不勾，也别按错的分勾错源）')
 }
 
 /* ---- 23.14 原生桥接线：JS 调的每个方法，Java 侧都要真的有实现 ---- */
@@ -3262,6 +3302,89 @@ let WY_ENCODED_ID = ''
    */
   eq((CODE.match(/P\.candsLocal && retryViaServer\(\)/g) || []).length, 2,
     'error 处理与看门狗两处都接了「本地候选失败 → 改问服务端」')
+}
+
+/* ---- 23.19 分源评分：候选按「当前播放的源」排序 + 评分卡按源分栏（源码级） ---- */
+/*
+ * 老板要求：「手机端仿照 web 端，针对不同源的插件分别评分」。
+ * 光把分数分开**存**还不够 —— **取流排序必须按当前这个源来排**：
+ * 一个「wy 强、kg 弱」的插件若按综合分排，会一直被排到 kg 候选的最前面，
+ * 每次点 kg 的歌都先试它、先失败一次，才轮到真正能用的那个。
+ */
+{
+  const c = vm.createContext({ console, JSON, Date, Math, String, Number, Object, Array })
+  vm.runInContext([
+    'var LP = { list: [], scores: null }',
+    'var LP_SRC_SHORT = { wy: "网易", kg: "酷狗", kw: "酷我", tx: "QQ", mg: "咪咕", xm: "喜马" }',
+    'var SCORE = { tab: "" }',
+    'function esc(s) { return String(s) }',
+    extractFn(SCRIPT, 'lpSrcShort'),
+    extractFn(SCRIPT, 'lpScoreForSource'),
+    extractFn(SCRIPT, 'lpPerSourceText'),
+    extractFn(SCRIPT, 'lpCandidates'),
+    extractFn(SCRIPT, 'lpScoreRankRows'),
+    extractFn(SCRIPT, 'lpScoreRank')
+  ].join('\n'), c)
+  const set = (code) => vm.runInContext(code, c)
+  const get = (code) => vm.runInContext(code, c)
+
+  /*
+   * 两个插件都支持 wy + kg：甲在 wy 上 90 分、在 kg 上 0 分；乙正好相反。
+   * 按源排序的结果必须**两个源完全相反** —— 这就是「分源评分」的意义所在。
+   */
+  set([
+    'var A = { id: "a", name: "甲", enabled: true, sources: { wy: {}, kg: {} },',
+    '  score: { score: 90, ok: 3, total: 3, ms: 1000, rate: 100, bestSource: "wy" },',
+    '  scoreBySource: { wy: { score: 90, ok: 3, total: 3 }, kg: { score: 0, ok: 0, total: 3 } } }',
+    'var B = { id: "b", name: "乙", enabled: true, sources: { wy: {}, kg: {} },',
+    '  score: { score: 80, ok: 3, total: 3, ms: 1000, rate: 100, bestSource: "kg" },',
+    '  scoreBySource: { wy: { score: 0, ok: 0, total: 3 }, kg: { score: 80, ok: 3, total: 3 } } }',
+    'LP.list = [A, B]'
+  ].join('\n'))
+
+  const ids = (src) => get('lpCandidates("' + src + '").map(function (p) { return p.id }).join(",")')
+  eq(ids('wy'), 'a,b', 'wy 上按 wy 的分排：甲(90) 在 乙(0) 前面')
+  eq(ids('kg'), 'b,a', 'kg 上按 kg 的分排：乙(80) 在 甲(0) 前面 —— 换个源名次就反过来')
+
+  // 该源没有分数 → 退回综合分（比「当 0 分」合理）
+  eq(get('lpScoreForSource({ score: { score: 55 } }, "kg")'), 55, '该平台没测过 → 退回综合分')
+  // 实测 0 分必须**用 0**，不能因为是假值就跳过
+  eq(get('lpScoreForSource({ scoreBySource: { kg: { score: 0 } } }, "kg")'), 0,
+    '该平台实测 0 分 → 用 0（不能因为 0 是假值就退回综合分）')
+  // 连综合分都没有 → -1（未测，排最后）
+  eq(get('lpScoreForSource({}, "kg")'), -1, '完全没跑过分 → -1')
+
+  set('LP.list = [{ id: "c", name: "丙", enabled: true, sources: { wy: {} } }, A]')
+  eq(ids('wy'), 'a,c', '没跑过分的插件排在跑过分的后面')
+
+  eq(get('lpPerSourceText(A)'), '网易 90 分 · 酷狗 不可用',
+    '插件行要能一眼看出「它在哪个源上能用」')
+
+  // 评分卡：按源分栏排行
+  set([
+    'LP.scores = { bySource: {',
+    '  wy: { a: { score: 90, ok: 3, total: 3, ms: 1000 }, b: { score: 0, ok: 0, total: 3, ms: 0 } },',
+    '  kg: { b: { score: 80, ok: 3, total: 3, ms: 1200 }, a: { score: 0, ok: 0, total: 3, ms: 0 } }',
+    '} }',
+    'LP.list = [A, B]'
+  ].join('\n'))
+  const wyHtml = get('lpScoreRankRows("wy")')
+  ok(/甲/.test(wyHtml) && /乙/.test(wyHtml), 'wy 那一栏两个插件都在')
+  ok(wyHtml.indexOf('甲') < wyHtml.indexOf('乙'), 'wy 栏里甲(90) 排在乙(0) 前面')
+  const kgHtml = get('lpScoreRankRows("kg")')
+  ok(kgHtml.indexOf('乙') < kgHtml.indexOf('甲'), 'kg 栏里乙(80) 排在甲(0) 前面')
+  ok(/不可用/.test(kgHtml), '0 次成功显示「不可用」而不是「0 分」')
+  ok(!/网易 90 分/.test(wyHtml), '排行行不重复贴各源明细（那行文本是插件列表用的）')
+  ok(/没有插件参与评分/.test(get('lpScoreRankRows("tx")')), '该源没有插件 → 明确提示，而不是空列表')
+
+  // 平台 chips：两个源都画出来，默认停在第一个
+  const chips = get('lpScoreRank()')
+  ok(/data-scoretab="wy"/.test(chips) && /data-scoretab="kg"/.test(chips), '平台 chips 两个源都在')
+  ok(/is-active/.test(chips), '默认选中一个平台')
+  eq(get('SCORE.tab'), 'wy', '默认停在第一个平台')
+  set('SCORE.tab = "kg"')
+  ok(/data-scoretab="kg"[^>]*is-active|is-active[^>]*data-scoretab="kg"/.test(get('lpScoreRank()')),
+    '用户选过的平台在重渲染后仍然是选中态')
 }
 
 /* ============================================================ */

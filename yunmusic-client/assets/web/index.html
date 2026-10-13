@@ -476,6 +476,15 @@ em{font-style:normal}
 }
 .srcrow__mv:disabled{opacity:.32;cursor:default}
 .srcrow__mv:not(:disabled):active{background:var(--brand);color:#fff}
+/* 评分排行行：序号 / 插件名 / 分数（三列，别复用 .srcrow 的 5 列网格） */
+.scorerow{
+  display:grid;grid-template-columns:22px 1fr auto;align-items:center;gap:8px;
+  background:var(--bg-2,#f6f7f9);border-radius:var(--radius-sm,8px);padding:7px 8px;
+}
+.scorerow__no{font-size:12px;color:var(--text-3);text-align:center;font-variant-numeric:tabular-nums}
+.scorerow__main{min-width:0}
+.scorerow__name{font-size:13.5px;min-width:0;overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
+.scorerow__meta{font-size:11px;color:var(--text-3);margin-top:2px}
 .srcfoot{display:flex;align-items:center;gap:10px;margin-top:10px}
 .srcfoot__state{flex:1 1 auto;font-size:11.5px;color:var(--text-3);line-height:1.5}
 .srcfoot__state.is-dirty{color:var(--brand)}
@@ -914,7 +923,7 @@ em{font-style:normal}
    * 以前它在抽屉菜单、关于页、顶栏文案里各写一遍，发版必然漏改几处
    * （实测发到 V2.3 时抽屉里还写着 V2.2），所以收口到这里。
    */
-  var CLIENT_VERSION = 'V2.15'
+  var CLIENT_VERSION = 'V2.16'
 
   /* ------------------------------ 兼容垫片 ------------------------------
      部分老设备的系统 WebView 停留在 Chrome 4x，缺少下面这些 ES6 方法。
@@ -1393,6 +1402,20 @@ em{font-style:normal}
       var inst = LP.inst[out[k].id]
       if (inst && inst.sources) out[k].sources = inst.sources
       if (LP.scores && LP.scores.byId && LP.scores.byId[out[k].id]) out[k].score = LP.scores.byId[out[k].id]
+      /*
+       * 各平台**各自的**分数，跟着插件对象一起带出来。
+       * 候选排序（lpCandidates）要按「当前播放的那个源」排，插件行也要显示各源明细 ——
+       * 每次都去 LP.scores.bySource 里翻一遍既啰嗦又容易漏，挂到对象上最省事。
+       */
+      if (LP.scores && LP.scores.bySource) {
+        var bySrc = {}
+        for (var sk in LP.scores.bySource) {
+          if (!Object.prototype.hasOwnProperty.call(LP.scores.bySource, sk)) continue
+          var one = LP.scores.bySource[sk][out[k].id]
+          if (one) bySrc[sk] = one
+        }
+        out[k].scoreBySource = bySrc
+      }
     }
     LP.list = out
     return out
@@ -1871,15 +1894,48 @@ em{font-style:normal}
       if (Array.isArray(acts) && acts.indexOf('musicUrl') < 0) continue
       out.push(p)
     }
-    // 排序：跑分高的先 → 跑分相同（或都没分）的按清单原序。
+    // 排序：**该平台**跑分高的先 → 同分（或都没分）的按清单原序。
     // 没跑过分的排在跑过分的后面 —— 一份实测过的数据总比「不知道好不好」可信。
     out.sort(function (a, b) {
-      var sa = a.score && typeof a.score.score === 'number' ? a.score.score : -1
-      var sb = b.score && typeof b.score.score === 'number' ? b.score.score : -1
+      var sa = lpScoreForSource(a, source)
+      var sb = lpScoreForSource(b, source)
       if (sa !== sb) return sb - sa
       return 0
     })
     return out
+  }
+
+  /** 平台短名（评分卡 chips 与插件行明细用）。 */
+  var LP_SRC_SHORT = { wy: '网易', kg: '酷狗', kw: '酷我', tx: 'QQ', mg: '咪咕', xm: '喜马' }
+  function lpSrcShort(key) { return LP_SRC_SHORT[key] || key }
+
+  /**
+   * 这个插件在**指定平台**上的实测分。
+   *
+   * ⚠ 为什么不能直接用综合分：一个插件在 wy 上 90 分、在 kg 上 0 分，综合分是 90；
+   *   拿它去排 kg 的候选，会把一个在 kg 上根本取不到流的插件排到最前面 ——
+   *   用户每次点 kg 的歌都先试它、先失败一次才轮到能用的那个。
+   *   Web 管理页是按平台各排一份的（`byPlatform`），这里对齐它。
+   * 该平台没有分数时退回综合分；连综合分都没有返回 -1（未测，排最后）。
+   */
+  function lpScoreForSource(p, source) {
+    var bySrc = p.scoreBySource && p.scoreBySource[source]
+    if (bySrc && typeof bySrc.score === 'number') return bySrc.score
+    if (p.score && typeof p.score.score === 'number') return p.score.score
+    return -1
+  }
+
+  /** 各平台分数一行文本：`网易 85 分 · 酷狗 60 分 · QQ 不可用`（没跑过则返回空串） */
+  function lpPerSourceText(p) {
+    var m = p.scoreBySource
+    if (!m) return ''
+    var parts = []
+    for (var k in m) {
+      if (!Object.prototype.hasOwnProperty.call(m, k)) continue
+      var r = m[k]
+      parts.push(lpSrcShort(k) + ' ' + (r.ok ? (r.score + ' 分') : '不可用'))
+    }
+    return parts.join(' · ')
   }
 
   /**
@@ -2368,14 +2424,22 @@ em{font-style:normal}
         }
         if (!tasks.length) throw new Error('没有可测的组合（插件都没声明支持这些平台）')
 
+        /*
+         * 累加器按 **(插件, 平台) 两层**记账 —— 这是「分源评分」的关键。
+         * 早先按插件一个桶汇总：一个插件在 wy 上 90 分、在 kg 上 0 分，混起来是 45 分，
+         * 既看不出它到底在哪个源上能用，候选排序还会把它在 kg 上错排到前面。
+         * Web 管理页是按平台各算一份的（byPlatform），这里对齐它。
+         */
         var acc = {}
-        for (var k = 0; k < LP.list.length; k++) acc[LP.list[k].id] = { ok: 0, total: 0, times: [] }
+        for (var k = 0; k < LP.list.length; k++) acc[LP.list[k].id] = {}
         var total = tasks.length
         var finished = 0
 
         return lpMapLimit(tasks, 4, function (t) {
           var started = Date.now()
-          var rec = acc[t.p.id]
+          var bySrc = acc[t.p.id]
+          if (!bySrc[t.source]) bySrc[t.source] = { ok: 0, total: 0, times: [] }
+          var rec = bySrc[t.source]
           rec.total++
           return Promise.resolve()
             .then(function () { return lpInvoke(t.p.id, t.source, 'musicUrl', { type: P.quality, musicInfo: lpMusicInfo(t.song) }, 20000) })
@@ -2401,29 +2465,67 @@ em{font-style:normal}
     })
   }
 
+  /** 单条记录的评分口径：成功率 60% + 速度 40%（速度取中位数耗时）。 */
+  function lpScoreOne(r) {
+    var rate = r.total ? (r.ok / r.total) : 0
+    var ms = 0
+    if (r.times.length) {
+      var sorted = r.times.slice().sort(function (a, b) { return a - b })
+      ms = sorted[Math.floor(sorted.length / 2)]   // 中位数：比均值抗「一个超时把整体拉垮」
+    }
+    var speed = 0
+    if (r.ok > 0) {
+      if (ms <= 1500) speed = 1
+      else if (ms >= 8000) speed = 0
+      else speed = (8000 - ms) / 6500
+    }
+    return {
+      score: Math.round((rate * 0.6 + speed * 0.4) * 100),
+      ok: r.ok, total: r.total, ms: ms, rate: Math.round(rate * 100)
+    }
+  }
+
+  /**
+   * 把 (插件 × 平台) 的原始计数收成评分表。
+   *
+   * 产出两份 —— **按源分开**正是这次改动的核心（对齐 Web 管理页的 `byPlatform`）：
+   *   `bySource[平台][插件id]` —— 该插件在**该平台**上的实测分。
+   *                              候选排序、自动勾选都读这一份。
+   *   `byId[插件id]`           —— 综合分 = **各平台里最好的那一份**，另带 `bestSource`。
+   *
+   * ⚠ 为什么综合分取「最好」而不是「平均」：插件只要有一个平台好用就有价值。
+   *   取平均会把「wy 90 分 + kg 0 分」压成 45 分，看起来像两个源都不行 ——
+   *   而真相是它在 wy 上完全可用，只有 kg 那条路不通。
+   */
   function lpFinalizeScores(acc, t0) {
+    var bySource = {}
     var byId = {}
     var ids = Object.keys(acc)
     for (var i = 0; i < ids.length; i++) {
-      var r = acc[ids[i]]
-      var rate = r.total ? (r.ok / r.total) : 0
-      var ms = 0
-      if (r.times.length) {
-        var sorted = r.times.slice().sort(function (a, b) { return a - b })
-        ms = sorted[Math.floor(sorted.length / 2)]   // 中位数：比均值抗「一个超时把整体拉垮」
+      var id = ids[i]
+      var bySrc = acc[id] || {}
+      var srcs = Object.keys(bySrc)
+      var best = null
+      for (var j = 0; j < srcs.length; j++) {
+        var src = srcs[j]
+        var rec = lpScoreOne(bySrc[src])
+        if (!bySource[src]) bySource[src] = {}
+        bySource[src][id] = rec
+        // 同分时保留先出现的那个源（Object.keys 顺序稳定，结果可复现）
+        if (!best || rec.score > best.rec.score) best = { rec: rec, source: src }
       }
-      var speed = 0
-      if (r.ok > 0) {
-        if (ms <= 1500) speed = 1
-        else if (ms >= 8000) speed = 0
-        else speed = (8000 - ms) / 6500
-      }
-      byId[ids[i]] = {
-        score: Math.round((rate * 0.6 + speed * 0.4) * 100),
-        ok: r.ok, total: r.total, ms: ms, rate: Math.round(rate * 100)
+      if (best) {
+        byId[id] = {
+          score: best.rec.score, ok: best.rec.ok, total: best.rec.total,
+          ms: best.rec.ms, rate: best.rec.rate, bestSource: best.source
+        }
+      } else {
+        // 一个平台都没测到（插件没声明支持任何探针平台）—— 记一条空成绩，
+        // 列表上显示「不可用」而不是「未测」，免得用户以为漏跑了
+        byId[id] = { score: 0, ok: 0, total: 0, ms: 0, rate: 0, bestSource: '' }
       }
     }
-    var s = { at: Date.now(), cost: Date.now() - t0, byId: byId }
+    var s = { at: Date.now(), cost: Date.now() - t0, bySource: bySource, byId: byId }
     LP.scores = s
     store.set(LP_KEYS.scores, s)
     lpBuildList()
@@ -2438,16 +2540,21 @@ em{font-style:normal}
    * 只勾前两名 —— 再多就是同一平台的重复源，收益递减而失败面翻倍。
    */
   function lpAutoEnableFromScores() {
-    if (!LP.scores || !LP.scores.byId) return []
+    // 分源评分后，「能不能在这个源上用」看的是**该源**的分数 —— 没有 bySource
+    // 说明是旧版结果（只存了综合分），这时不自动勾：宁可不勾，也别按错的分勾错源。
+    if (!LP.scores || !LP.scores.bySource) return []
     var sources = ['wy', 'kg', 'tx', 'kw', 'mg']
     var turned = []
     for (var i = 0; i < sources.length; i++) {
       var src = sources[i]
+      var bySrc = LP.scores.bySource[src] || {}
       var cands = []
       for (var j = 0; j < LP.list.length; j++) {
         var p = LP.list[j]
         if (!p.sources || !p.sources[src]) continue
-        var sc = LP.scores.byId[p.id]
+        // 用**这个平台**的分数选 —— 用综合分会让「wy 强、kg 弱」的插件把 kg 的
+        // 名额也占掉，而它在 kg 上一次都没成功过
+        var sc = bySrc[p.id]
         if (!sc || !sc.ok) continue
         cands.push({ p: p, s: sc.score })
       }
@@ -5756,6 +5863,16 @@ em{font-style:normal}
       '</div>'
   }
 
+  /*
+   * 评分卡：**按平台分开看**（对齐 Web 管理页的「插件调度顺序」）。
+   *
+   * 一个插件在不同平台上的表现可以天差地别（wy 上 90 分、kg 上 0 分很常见），
+   * 只给一个综合分等于把这份差异抹掉 —— 用户看着「85 分」却不知道它到底在哪个
+   * 源上能用。所以这里跟 Web 管理页一样：上面一排平台 chips，切到哪个平台就看
+   * 那个平台上的插件排行。
+   */
+  var SCORE = { tab: '' }
+
   function lpScoreCard() {
     var s = LP.scores
     var desc
@@ -5763,21 +5880,80 @@ em{font-style:normal}
       desc = '正在实测各插件在本机的取流表现…不阻塞听歌，可以先去别处。'
     } else if (!s) {
       desc = '还没跑过分。评分是<b>在本机上实测</b>出来的 —— 插件好不好用取决于你这条网络，别人测的分数参考价值有限。'
+    } else if (!s.bySource) {
+      desc = '这份评分是旧版跑的（只有综合分、没有分平台明细），重新跑一次就能按平台分开看。'
     } else {
       var when = new Date(s.at)
       var n = 0
       for (var k in s.byId) if (Object.prototype.hasOwnProperty.call(s.byId, k)) n++
+      var nsrc = 0
+      for (var q in s.bySource) if (Object.prototype.hasOwnProperty.call(s.bySource, q)) nsrc++
       desc = '上次跑分：' + (when.getMonth() + 1) + '月' + when.getDate() + '日 ' +
         pad2(when.getHours()) + ':' + pad2(when.getMinutes()) +
-        '，用时 ' + Math.round((s.cost || 0) / 1000) + ' 秒，覆盖 ' + n + ' 个插件。'
+        '，用时 ' + Math.round((s.cost || 0) / 1000) + ' 秒，覆盖 ' + n + ' 个插件 / ' + nsrc + ' 个平台。'
     }
+    var badge = s
+      ? (s.bySource ? '<span class="pill pill--brand">已有结果</span>' : '<span class="pill pill--warn">待重跑</span>')
+      : '<span class="pill">未跑分</span>'
     return '<div class="card-block" style="margin-bottom:12px">' +
-      '<div class="card-block__head"><div class="card-block__name">插件评分</div>' +
-      (s ? '<span class="pill pill--brand">已有结果</span>' : '<span class="pill">未跑分</span>') + '</div>' +
+      '<div class="card-block__head"><div class="card-block__name">插件评分</div>' + badge + '</div>' +
       '<div class="card-block__desc" id="lpScoreDesc">' + desc + '</div>' +
-      '<button class="btn btn--ghost btn--block" id="lpScoreBtn" style="margin-top:10px"' + (LP.scoring ? ' disabled' : '') + '>' +
+      lpScoreRank() +
+      '<button class="btn btn--ghost btn--block" id="lpScoreBtn" style="margin-top:12px"' + (LP.scoring ? ' disabled' : '') + '>' +
       (LP.scoring ? '正在跑分…' : (s ? '重新跑分' : '开始跑分')) + '</button>' +
       '</div>'
+  }
+
+  /**
+   * 评分卡下半：平台 chips + 该平台上的插件排行。
+   * 每个平台只列**在该平台跑过**的插件（没声明支持这个平台的插件不该出现在这里）。
+   */
+  function lpScoreRank() {
+    var s = LP.scores
+    if (!s || !s.bySource) return ''
+    var srcs = []
+    for (var k in s.bySource) if (Object.prototype.hasOwnProperty.call(s.bySource, k)) srcs.push(k)
+    if (!srcs.length) return '<div class="note" style="margin-top:10px">这次跑分没有测到任何平台。</div>'
+    // 默认停在第一个平台；用户点过就以用户选的为准（重渲染/重跑分都不跳回）
+    if (!SCORE.tab || srcs.indexOf(SCORE.tab) < 0) SCORE.tab = srcs[0]
+    var chips = ''
+    for (var i = 0; i < srcs.length; i++) {
+      chips += '<button class="chip' + (srcs[i] === SCORE.tab ? ' is-active' : '') +
+        '" data-scoretab="' + esc(srcs[i]) + '">' + esc(lpSrcShort(srcs[i])) + '</button>'
+    }
+    return '<div class="chips" style="padding:12px 0 8px">' + chips + '</div>' +
+      '<div class="srclist" id="lpScoreRank">' + lpScoreRankRows(SCORE.tab) + '</div>'
+  }
+
+  function lpScoreRankRows(src) {
+    var bySrc = (LP.scores.bySource || {})[src] || {}
+    var list = []
+    for (var i = 0; i < LP.list.length; i++) {
+      var p = LP.list[i]
+      var r = bySrc[p.id]
+      if (!r) continue                       // 该插件没在这个平台跑过
+      list.push({ p: p, r: r })
+    }
+    if (!list.length) return '<div class="note">「' + esc(lpSrcShort(src)) + '」上没有插件参与评分。</div>'
+    list.sort(function (a, b) { return b.r.score - a.r.score })
+    var out = ''
+    for (var k = 0; k < list.length; k++) {
+      var it = list[k]
+      var r = it.r
+      var cls = !r.ok ? 'pill--bad' : (r.score >= 60 ? 'pill--ok' : 'pill--warn')
+      var meta = r.ok
+        ? (r.ok + '/' + r.total + ' 次成功' + (r.ms ? ' · ' + (r.ms / 1000).toFixed(1) + 's' : ''))
+        : '一次都没成功'
+      out += '<div class="scorerow">' +
+        '<span class="scorerow__no">' + (k + 1) + '</span>' +
+        '<div class="scorerow__main">' +
+        '<div class="scorerow__name">' + esc(it.p.name) + (it.p.enabled ? '' : '（未启用）') + '</div>' +
+        '<div class="scorerow__meta">' + meta + '</div>' +
+        '</div>' +
+        '<span class="pill ' + cls + '">' + (r.ok ? (r.score + ' 分') : '不可用') + '</span>' +
+        '</div>'
+    }
+    return out
   }
 
   function pad2(n) { return (n < 10 ? '0' : '') + n }
@@ -5965,7 +6141,9 @@ em{font-style:normal}
     var pill
     if (sc) {
       var cls = !sc.ok ? 'pill--bad' : (sc.score >= 60 ? 'pill--ok' : 'pill--warn')
-      pill = '<span class="pill ' + cls + '">' + (sc.ok ? (sc.score + ' 分') : '不可用') + '</span>'
+      var tip = sc.bestSource ? ('最优：' + lpSrcShort(sc.bestSource)) : ''
+      pill = '<span class="pill ' + cls + '"' + (tip ? ' title="' + esc(tip) + '"' : '') + '>' +
+        (sc.ok ? (sc.score + ' 分') : '不可用') + '</span>'
     } else {
       pill = '<span class="pill">未测</span>'
     }
@@ -5978,7 +6156,13 @@ em{font-style:normal}
     if (it && it.state === 'failed') meta += '<br><span style="color:var(--brand)">' + esc(it.error) + '</span>'
     else if (it && it.state === 'ready') meta += ' · 已就绪'
     else if (it && it.state === 'loading') meta += ' · 加载中…'
-    if (sc && sc.total) meta += '<br>实测 ' + sc.ok + '/' + sc.total + ' 次成功' + (sc.ms ? '，中位 ' + (sc.ms / 1000).toFixed(1) + 's' : '')
+    if (sc && sc.total) {
+      meta += '<br>最优 ' + (sc.bestSource ? esc(lpSrcShort(sc.bestSource)) + ' ' : '') +
+        sc.ok + '/' + sc.total + ' 次成功' + (sc.ms ? '，中位 ' + (sc.ms / 1000).toFixed(1) + 's' : '')
+    }
+    // 各平台**分别**的实测分 —— 一眼看出「它在哪个源上能用」（对齐 Web 管理页的分平台视图）
+    var per = lpPerSourceText(p)
+    if (per) meta += '<br>' + esc(per)
 
     return '<div class="card-block" style="margin-bottom:8px">' +
       '<div class="card-block__head">' +
@@ -6039,6 +6223,14 @@ em{font-style:normal}
 
     var sb = $('#lpScoreBtn')
     if (sb) sb.addEventListener('click', lpRunScoreUI)
+
+    // 评分卡的平台 chips：切平台看该平台的插件排行（对齐 Web 管理页的 tab）
+    $$('[data-scoretab]').forEach(function (b) {
+      b.addEventListener('click', function () {
+        SCORE.tab = b.getAttribute('data-scoretab')
+        lpRenderBody()
+      })
+    })
 
     $$('[data-lpen]').forEach(function (c) {
       c.addEventListener('change', function () {
