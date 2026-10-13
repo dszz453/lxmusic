@@ -259,7 +259,7 @@ public class MainActivity extends Activity {
 
         // 应用标题
         TextView tvTitle = new TextView(this);
-        tvTitle.setText("云音乐 V2.11");
+        tvTitle.setText("云音乐 V2.12");
         tvTitle.setTextColor(Color.WHITE);
         tvTitle.setTextSize(17);
         tvTitle.setTypeface(null, Typeface.BOLD);
@@ -511,6 +511,98 @@ public class MainActivity extends Activity {
                 }
             }
         });
+    }
+
+    /* ============================ 本地插件：从文件导入 ============================ */
+
+    private static final int REQ_PICK_PLUGIN = 9002;
+    /** 插件脚本大小上限。正常插件几十到几百 KB，4MB 足够，也防住「误选了别的大文件」 */
+    private static final long PLUGIN_MAX_BYTES = 4L * 1024 * 1024;
+
+    /**
+     * 唤起系统文件选择器挑一个插件脚本（由 YunBridge.pickPluginFile 调用）。
+     *
+     * 这里**故意放宽类型限制**而不是只给 text/javascript：.js 在各家文件管理器里
+     * 被报成的 MIME 五花八门（text/plain、application/javascript、
+     * application/octet-stream 都有），卡 MIME 会让文件变灰选不中 ——
+     * 用户只会觉得「这功能坏了」。放宽选择范围、选完自己校验内容更稳。
+     */
+    public void startPluginFilePicker() {
+        Intent i = new Intent(Intent.ACTION_GET_CONTENT);
+        i.addCategory(Intent.CATEGORY_OPENABLE);
+        i.setType("*/*");
+        startActivityForResult(i, REQ_PICK_PLUGIN);
+    }
+
+    @Override
+    protected void onActivityResult(int requestCode, int resultCode, Intent data) {
+        super.onActivityResult(requestCode, resultCode, data);
+        if (requestCode != REQ_PICK_PLUGIN) return;
+        if (bridge == null) return;
+        // 用户取消：静默返回。这里若回一句「读取失败」纯属莫名其妙。
+        if (resultCode != RESULT_OK || data == null || data.getData() == null) return;
+        final android.net.Uri uri = data.getData();
+        new Thread(new Runnable() {
+            @Override
+            public void run() {
+                readPluginFile(uri);
+            }
+        }).start();
+    }
+
+    /** 读插件脚本文本。**必须走原生**：几百 KB 的源码经 JS 桥来回传容易被截断。 */
+    private void readPluginFile(android.net.Uri uri) {
+        String name = queryDisplayName(uri);
+        java.io.InputStream is = null;
+        try {
+            is = getContentResolver().openInputStream(uri);
+            if (is == null) throw new java.io.IOException("无法打开所选文件");
+            java.io.ByteArrayOutputStream bos = new java.io.ByteArrayOutputStream();
+            byte[] buf = new byte[16384];
+            int n;
+            long total = 0L;
+            while ((n = is.read(buf)) > 0) {
+                total += n;
+                if (total > PLUGIN_MAX_BYTES) throw new java.io.IOException("文件过大（超过 4MB），确认选的是插件脚本");
+                bos.write(buf, 0, n);
+            }
+            String text = new String(bos.toByteArray(), "UTF-8");
+            // 有些编辑器会把 UTF-8 BOM 也存进去，留着会让脚本第一行变成非法字符
+            if (text.length() > 0 && text.charAt(0) == '\uFEFF') text = text.substring(1);
+            if (text.trim().isEmpty()) throw new java.io.IOException("文件是空的");
+            bridge.onPluginFilePicked(name, text, null);
+        } catch (Throwable t) {
+            String msg = t.getMessage();
+            bridge.onPluginFilePicked(name, null, (msg == null || msg.isEmpty()) ? "读取失败" : msg);
+        } finally {
+            try {
+                if (is != null) is.close();
+            } catch (Throwable ignored) {
+            }
+        }
+    }
+
+    /** 从 content:// 里取显示名（取不到就退一个占位名，别让页面显示「未命名」） */
+    private String queryDisplayName(android.net.Uri uri) {
+        android.database.Cursor c = null;
+        try {
+            c = getContentResolver().query(uri, null, null, null, null);
+            if (c != null && c.moveToFirst()) {
+                int idx = c.getColumnIndex(android.provider.OpenableColumns.DISPLAY_NAME);
+                if (idx >= 0) {
+                    String n = c.getString(idx);
+                    if (n != null && !n.trim().isEmpty()) return n;
+                }
+            }
+        } catch (Throwable ignored) {
+        } finally {
+            try {
+                if (c != null) c.close();
+            } catch (Throwable ignored) {
+            }
+        }
+        String s = uri == null ? null : uri.getLastPathSegment();
+        return (s == null || s.trim().isEmpty()) ? "plugin.js" : s;
     }
 
     /** 异步回调 HTTP 成功 */

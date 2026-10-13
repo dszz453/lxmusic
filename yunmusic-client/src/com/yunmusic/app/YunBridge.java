@@ -373,6 +373,321 @@ public class YunBridge {
         }
     }
 
+    /* ============================ 音频字节缓存 ============================ */
+
+    /**
+     * 音频**字节**缓存（缓存的是歌本身，不是解析出来的地址）。
+     *
+     * ── 为什么必须落在原生 ────────────────────────────────────────
+     * 页面跑在 file:// 源下：`fetch()` 被同源策略拦，`httpFetch` 走的是
+     * BufferedReader + InputStreamReader，音频流会被当文本读成乱码。
+     * 只有 Java 侧的 HttpURLConnection 能把字节老老实实写进磁盘，
+     * 页面播放时拿一个绝对路径做 `audio.src = file:///...` 直接用。
+     *
+     * ── 为什么不维护索引文件 ──────────────────────────────────────
+     * 索引与实际文件一旦不同步（下载中断、用户清了应用数据），就会出现
+     * 「索引说有、文件没有」的**假命中**：点歌直接报错，还看不出为什么。
+     * 直接扫目录反而自愈，几百个文件也就几毫秒。
+     * 文件名 = md5(键) + 扩展名，键由页面给（平台_歌曲id_音质），
+     * 哈希一下是为了让 id 里的 `/` `?` 之类字符不至于把路径搞坏。
+     *
+     * ── 淘汰口径 ──────────────────────────────────────────────────
+     * 命中时把 mtime 刷新成「现在」，于是 mtime 天然就是「最近使用时间」，
+     * 超上限时按 mtime 从旧到新删。不需要额外的 LRU 结构。
+     */
+    private static File audioCacheDir;
+
+    /** 单文件上限：野地址（或服务端给了个巨大的流）别把用户磁盘写满 */
+    private static final long AUDIO_MAX_FILE_BYTES = 128L * 1024 * 1024;
+
+    private synchronized File audioCacheDir() {
+        if (audioCacheDir == null) {
+            File d = new File(activity.getFilesDir(), "audiocache");
+            if (!d.exists()) d.mkdirs();
+            audioCacheDir = d;
+        }
+        return audioCacheDir;
+    }
+
+    /**
+     * 查这首有没有缓存。命中回本地绝对路径，没有回 null。
+     *
+     * 同步返回 —— 页面在 loadCurrent() 里要立刻决定「放本地还是去解析」，
+     * 走异步回调反而会把「秒开」这个唯一的价值给等没了。
+     */
+    @JavascriptInterface
+    public String audioCacheGet(final String key) {
+        if (key == null || key.isEmpty()) return null;
+        try {
+            final String h = md5Hex(key);
+            File[] files = audioCacheDir().listFiles();
+            if (files == null) return null;
+            for (File f : files) {
+                if (!f.isFile()) continue;
+                if (!f.getName().startsWith(h + ".")) continue;
+                if (f.getName().endsWith(".part")) continue;   // 半截文件不算命中
+                if (f.length() <= 0) continue;
+                f.setLastModified(System.currentTimeMillis()); // 兼作 LRU 的「最近使用」
+                return f.getAbsolutePath();
+            }
+        } catch (Throwable ignored) {
+        }
+        return null;
+    }
+
+    /** 让原生把这歌下下来存进缓存（异步，不阻塞播放；失败静默，不影响当前播放） */
+    @JavascriptInterface
+    public void audioCachePut(final String key, final String urlStr, final long limitBytes) {
+        if (key == null || key.isEmpty() || urlStr == null || urlStr.isEmpty()) return;
+        new Thread(new Runnable() {
+            @Override
+            public void run() {
+                doAudioCachePut(key, urlStr, limitBytes);
+            }
+        }).start();
+    }
+
+    private void doAudioCachePut(String key, String urlStr, long limitBytes) {
+        File part = null;
+        HttpURLConnection conn = null;
+        InputStream is = null;
+        OutputStream os = null;
+        try {
+            if (audioCacheGet(key) != null) return;      // 已经有了（可能是别的扩展名）
+            final String h = md5Hex(key);
+            part = new File(audioCacheDir(), h + ".part");
+
+            conn = (HttpURLConnection) new URL(urlStr).openConnection();
+            conn.setConnectTimeout(15000);
+            conn.setReadTimeout(60000);
+            conn.setInstanceFollowRedirects(true);
+            conn.setRequestProperty("User-Agent", "Mozilla/5.0 (Linux; Android) YunMusic/2.12");
+            int code = conn.getResponseCode();
+            if (code < 200 || code >= 300) return;
+
+            String ctype = conn.getContentType();
+            if (ctype != null) {
+                String c = ctype.toLowerCase(java.util.Locale.US);
+                // 上游出错时常回一个 HTML 错误页 / JSON；存下来只会变成
+                // 「明明缓存了却播不出来」这种最难查的故障
+                if (c.contains("text/html") || c.contains("application/json") || c.contains("text/plain")) return;
+            }
+            long total = conn.getContentLength();
+            if (total > AUDIO_MAX_FILE_BYTES) return;
+
+            is = conn.getInputStream();
+            os = new FileOutputStream(part);
+            byte[] buf = new byte[64 * 1024];
+            long done = 0L;
+            int n;
+            while ((n = is.read(buf)) > 0) {
+                done += n;
+                if (done > AUDIO_MAX_FILE_BYTES) return;  // 没给 Content-Length 的野地址
+                os.write(buf, 0, n);
+            }
+            os.flush();
+            if (done < 1024) return;                      // 太小，多半是错误页
+            closeQuietly(os);
+            os = null;
+            closeQuietly(is);
+            is = null;
+
+            File dst = new File(audioCacheDir(), h + audioExtOf(urlStr, ctype));
+            if (!part.renameTo(dst)) {                    // 跨挂载点等情况下 rename 会失败
+                writeAllBytes(dst, readAllBytes(part));
+                part.delete();
+            }
+            part = null;
+            audioCacheTrimSync(limitBytes);
+        } catch (Throwable ignored) {
+        } finally {
+            closeQuietly(is);
+            closeQuietly(os);
+            if (part != null && part.exists()) part.delete();
+            if (conn != null) conn.disconnect();
+        }
+    }
+
+    /** 按上限裁剪缓存（同步；内部也会顺手清掉残留的 .part） */
+    private void audioCacheTrimSync(long limitBytes) {
+        try {
+            File dir = audioCacheDir();
+            File[] files = dir.listFiles();
+            if (files == null) return;
+            java.util.ArrayList<File> list = new java.util.ArrayList<File>();
+            long total = 0L;
+            for (File f : files) {
+                if (!f.isFile()) continue;
+                if (f.getName().endsWith(".part")) {
+                    f.delete();       // 下载中断留下的半截文件，一律不留
+                    continue;
+                }
+                list.add(f);
+                total += f.length();
+            }
+            if (limitBytes <= 0 || total <= limitBytes) return;
+            java.util.Collections.sort(list, new java.util.Comparator<File>() {
+                @Override
+                public int compare(File a, File b) {
+                    return Long.compare(a.lastModified(), b.lastModified());
+                }
+            });
+            for (File f : list) {
+                if (total <= limitBytes) break;
+                long len = f.length();
+                if (f.delete()) total -= len;
+            }
+        } catch (Throwable ignored) {
+        }
+    }
+
+    @JavascriptInterface
+    public void audioCacheTrim(final long limitBytes) {
+        new Thread(new Runnable() {
+            @Override
+            public void run() {
+                audioCacheTrimSync(limitBytes);
+            }
+        }).start();
+    }
+
+    /** 统计当前占用，回 window.onNativeAudioCacheStat({bytes}) */
+    @JavascriptInterface
+    public void audioCacheStat() {
+        new Thread(new Runnable() {
+            @Override
+            public void run() {
+                notifyAudioCacheStat(audioCacheBytesSync());
+            }
+        }).start();
+    }
+
+    private long audioCacheBytesSync() {
+        long total = 0L;
+        try {
+            File[] files = audioCacheDir().listFiles();
+            if (files == null) return 0L;
+            for (File f : files) {
+                if (f.isFile() && !f.getName().endsWith(".part")) total += f.length();
+            }
+        } catch (Throwable ignored) {
+        }
+        return total;
+    }
+
+    /** 清空缓存，回 window.onNativeAudioCacheCleared({bytes}) —— bytes 是释放掉的量 */
+    @JavascriptInterface
+    public void audioCacheClear() {
+        new Thread(new Runnable() {
+            @Override
+            public void run() {
+                long freed = 0L;
+                try {
+                    File[] files = audioCacheDir().listFiles();
+                    if (files != null) {
+                        for (File f : files) {
+                            if (!f.isFile()) continue;
+                            long len = f.length();
+                            if (f.delete()) freed += len;
+                        }
+                    }
+                } catch (Throwable ignored) {
+                }
+                notifyAudioCacheCleared(freed);
+            }
+        }).start();
+    }
+
+    private void notifyAudioCacheStat(final long bytes) {
+        mainHandler.post(new Runnable() {
+            @Override
+            public void run() {
+                activity.runJs("if(window.onNativeAudioCacheStat) { window.onNativeAudioCacheStat({bytes:"
+                        + bytes + "}); }");
+            }
+        });
+    }
+
+    private void notifyAudioCacheCleared(final long bytes) {
+        mainHandler.post(new Runnable() {
+            @Override
+            public void run() {
+                activity.runJs("if(window.onNativeAudioCacheCleared) { window.onNativeAudioCacheCleared({bytes:"
+                        + bytes + "}); }");
+            }
+        });
+    }
+
+    /** 从地址（优先）或响应头里猜一个音频扩展名 —— 播放器认扩展名更省事 */
+    private static String audioExtOf(String url, String contentType) {
+        String s = url == null ? "" : url.toLowerCase(java.util.Locale.US);
+        int q = s.indexOf('?');
+        if (q >= 0) s = s.substring(0, q);
+        String[] exts = {".flac", ".m4a", ".mp4", ".ape", ".wav", ".aac", ".ogg", ".mp3"};
+        for (String e : exts) {
+            if (s.endsWith(e)) return e;
+        }
+        if (contentType != null) {
+            String c = contentType.toLowerCase(java.util.Locale.US);
+            if (c.contains("flac")) return ".flac";
+            if (c.contains("mp4") || c.contains("m4a")) return ".m4a";
+            if (c.contains("ogg")) return ".ogg";
+            if (c.contains("wav")) return ".wav";
+            if (c.contains("aac")) return ".aac";
+        }
+        return ".mp3";
+    }
+
+    /* ============================ 本地插件导入 ============================ */
+
+    /**
+     * 让用户从手机里挑一个插件脚本（.js）。
+     *
+     * 为什么不让页面用 `<input type=file>` 自己读：壳里跑的是 file:// 源，
+     * 这个入口在部分 WebView 上唤不起文件选择器；而且插件脚本动辄几百 KB，
+     * 走 JS 桥来回传长字符串有被截断的风险。交给原生：选完直接读成文本，
+     * 用 window.onNativePluginFile({name, content}) 一次回给页面。
+     */
+    @JavascriptInterface
+    public void pickPluginFile() {
+        mainHandler.post(new Runnable() {
+            @Override
+            public void run() {
+                try {
+                    activity.startPluginFilePicker();
+                } catch (Throwable t) {
+                    String msg = t.getMessage();
+                    notifyPluginFile(null, null, (msg == null || msg.isEmpty()) ? "无法打开文件选择器" : msg);
+                }
+            }
+        });
+    }
+
+    /** 由 MainActivity 在选完文件（或读取失败）后回调 */
+    public void onPluginFilePicked(String name, String content, String error) {
+        notifyPluginFile(name, content, error);
+    }
+
+    private void notifyPluginFile(String name, String content, String error) {
+        try {
+            JSONObject o = new JSONObject();
+            if (name != null) o.put("name", name);
+            if (error != null) o.put("error", error);
+            else o.put("content", content == null ? "" : content);
+            /*
+             * U+2028 / U+2029 在 JSON 里是合法字符，但在 JS 源码的字符串字面量里
+             * 是**换行符** —— 直接把 JSON 塞进 evaluateJavascript 会被解析成换行，
+             * 整条脚本语法错误、静默失效。org.json 不转义这两个字符，只能自己补。
+             * 转义后仍是合法 JSON（\u2028 是标准转义），页面侧读到的内容一模一样。
+             */
+            String json = o.toString()
+                    .replace("\u2028", "\\u2028")
+                    .replace("\u2029", "\\u2029");
+            activity.runJs("if(window.onNativePluginFile) { window.onNativePluginFile(" + json + "); }");
+        } catch (Throwable ignored) {
+        }
+    }
+
     /* ============================ 原生外壳显隐 ============================ */
 
     /**
@@ -510,7 +825,7 @@ public class YunBridge {
             conn.setReadTimeout(20000);
             conn.setInstanceFollowRedirects(true);
             conn.setRequestProperty("User-Agent",
-                    "Mozilla/5.0 (Linux; Android) YunMusic/2.11");
+                    "Mozilla/5.0 (Linux; Android) YunMusic/2.12");
             // 部分图床看 Referer，缺了会返回 403；这里补上自身 origin 就够了
             try {
                 URL u = new URL(urlStr);

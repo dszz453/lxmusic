@@ -109,8 +109,8 @@ OUTPUT_DIR="${OUTPUT_DIR:-$PROJECT_DIR/../outputs}"
 
 # ---------------------------------------------------------------- 版本号
 # 用户规则：从 V2.0 起步，每发一版 +0.1
-VERSION_NAME="V2.11"
-VERSION_CODE=310
+VERSION_NAME="V2.12"
+VERSION_CODE=320
 FINAL_APK="$OUTPUT_DIR/云音乐-$VERSION_NAME.apk"
 
 # 只清理本次构建的中间产物。

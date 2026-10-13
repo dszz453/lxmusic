@@ -100,9 +100,18 @@ function blankOut(src) {
 }
 
 /* ------------------------------ 源码抽取 ------------------------------ */
-const scriptMatch = HTML.match(/<script[^>]*>([\s\S]*?)<\/script>/)
-if (!scriptMatch) { console.error('致命：index.html 里找不到 <script> 块'); process.exit(1) }
-const SCRIPT = scriptMatch[1]
+/*
+ * ⚠ 取**最长**的那个 script 块，而不是第一个。
+ *
+ * index.html 里除了主体脚本，还有 `<script src="lxcore.js"></script>` 这种
+ * 只带 src 的空块，且它排在主体脚本**之前**。用「第一个」去匹配会拿到空字符串，
+ * 后面所有 extractFn 都会「找不到函数」—— 报错信息看着像源码缺函数，
+ * 其实测试根本没读到源码。
+ */
+const scriptBlocks = [...HTML.matchAll(/<script[^>]*>([\s\S]*?)<\/script>/g)].map(m => m[1])
+if (!scriptBlocks.length) { console.error('致命：index.html 里找不到 <script> 块'); process.exit(1) }
+const SCRIPT = scriptBlocks.reduce((a, b) => (b.length > a.length ? b : a), '')
+if (!SCRIPT.trim()) { console.error('致命：index.html 的 <script> 块是空的'); process.exit(1) }
 const CODE = blankOut(SCRIPT)      // 只含代码，注释/字符串已置空（位置不变）
 
 /**
@@ -358,6 +367,93 @@ const SONG = {
   albumName: '测试专辑', interval: 245, source: 'wy', sourceName: '网易云音乐'
 }
 
+/* ══════════════ 本地插件（V2.12）用的替身 ══════════════
+ *
+ * 为什么要替身：jsdom 里既没有 Worker 也没有 URL.createObjectURL（实测都是 undefined），
+ * 而真实的 plugins.data.js 是 760KB —— 既不该在自测里解析，也没法从 file:// 源加载。
+ * 所以：
+ *   · window.LXCore      → 一个最小可用的替身，只为让 LP.runtime 为真、
+ *                          并让「主线程降级」那条路真的跑起来（jsdom 里 Worker 探测必然失败）
+ *   · window.LX_BUNDLED_PLUGINS → 两个小插件：一个能取流、一个必然失败
+ *   · 原生桥             → 补上 audioCache* / pickPluginFile（真机上由 YunBridge 实现）
+ *
+ * ⚠ 替身必须照着**真实协议**写（`globalThis.lx` 的 on/send/EVENT_NAMES、inited 里声明
+ *   sources），否则测的是替身自己的行为。这份文件头上已经为「替身写错形状」栽过一次
+ *   （/album 的扁平 list），这里不再犯。
+ */
+
+/** 能正常取流的替身插件（只声明网易云） */
+const FAKE_PLUGIN_OK = `/*!
+ * @name 甲音源
+ * @version 1.0.0
+ * @author 测试
+ * @description 替身插件：声明网易云，取流固定回一个地址
+ */
+const { EVENT_NAMES, on, send } = globalThis.lx
+on(EVENT_NAMES.request, ({ action, source, info }) => {
+  if (action !== 'musicUrl') return Promise.reject(new Error('action not support: ' + action))
+  return Promise.resolve('https://local.example.com/' + source + '/' + info.musicInfo.id + '.mp3')
+})
+send(EVENT_NAMES.inited, {
+  status: true,
+  sources: {
+    wy: { name: '网易云音乐', type: 'music', actions: ['musicUrl'], qualitys: ['320k'] }
+  }
+})
+`
+
+/** 一定解不出地址的替身插件 —— 用来验证「本地失败自动退回服务端」 */
+const FAKE_PLUGIN_BAD = `/*!
+ * @name 乙音源
+ * @version 1.0.0
+ * @author 测试
+ * @description 替身插件：声明网易云，但取流永远失败
+ */
+const { EVENT_NAMES, on, send } = globalThis.lx
+on(EVENT_NAMES.request, () => Promise.reject(new Error('这个插件解不出来')))
+send(EVENT_NAMES.inited, {
+  status: true,
+  sources: {
+    wy: { name: '网易云音乐', type: 'music', actions: ['musicUrl'], qualitys: ['320k'] }
+  }
+})
+`
+
+const FAKE_LXCORE = {
+  // 内容无所谓：jsdom 没有 URL.createObjectURL，探测在创建 Worker 之前就失败了
+  WORKER_SRC: '/* 替身 Worker 源码 */',
+  SOURCE_DIGEST: 'test000000000000',
+  TARGET: 'es2017',
+  crypto: {
+    utf8Encode(s) {
+      const out = []
+      for (let i = 0; i < String(s).length; i++) out.push(String(s).charCodeAt(i) & 0xff)
+      return Uint8Array.from(out)
+    },
+    md5() { return 'stubmd5' },
+    randomBytes(n) { return new Uint8Array(Number(n) || 16) },
+    aesEncryptRaw() { return new Uint8Array(0) },
+    aesDecryptRaw() { return new Uint8Array(0) },
+    rsaEncryptRaw() { return new Uint8Array(0) }
+  },
+  util: {
+    createBufferShim() {
+      return {
+        from(v) { return v },
+        bufToString(b) { return String(b) },
+        isBuffer() { return false }
+      }
+    },
+    bufToString(b) { return String(b) },
+    inflateRaw() { return Promise.resolve(new Uint8Array(0)) },
+    deflateRaw() { return Promise.resolve(new Uint8Array(0)) }
+  }
+}
+
+/** 音频缓存 + 插件文件选择的原生桥状态（真机上由 YunBridge 实现） */
+const AC = { hit: null, keys: [], puts: [], trims: [], clears: 0, stats: 0, bytes: 0 }
+const PF = { calls: 0 }
+
 const RESPONSES = {
   '/me': { user: { username: 'admin', isAdmin: true } },
   '/login': { token: 'tk', user: { username: 'admin', isAdmin: true } },
@@ -468,7 +564,9 @@ function mockFetch(reqId, url, method, headers, body) {
   if (payload && payload.__status) { status = payload.__status; payload = payload.__body }
   const res = payload === undefined
     ? { status: 200, body: JSON.stringify({ ok: true, list: [] }) }
-    : { status: status, body: JSON.stringify(payload) }
+    // 字符串载荷**原样返回**，不做 JSON 包装 —— 插件脚本就是这种形态（一个 .js 文件）。
+    // 包装成 JSON 字符串再让客户端解，测的就不是真实链路了。
+    : { status: status, body: typeof payload === 'string' ? payload : JSON.stringify(payload) }
   setTimeout(() => {
     if (typeof win.onNativeHttpCallback === 'function') {
       win.onNativeHttpCallback({ reqId: reqId, status: res.status, body: res.body })
@@ -492,6 +590,13 @@ async function boot() {
     pretendToBeVisual: true,
     virtualConsole: vc,
     beforeParse(w) {
+      // 本地插件运行时（真机上由 lxcore.js 提供；jsdom 里没法从 file:// 源加载）
+      w.LXCore = FAKE_LXCORE
+      // 插件数据（真机上由 plugins.data.js 懒加载提供）
+      w.LX_BUNDLED_PLUGINS = [
+        { id: 'fake-ok', name: '甲音源', url: '', script: FAKE_PLUGIN_OK },
+        { id: 'fake-bad', name: '乙音源', url: '', script: FAKE_PLUGIN_BAD }
+      ]
       w.YunBridge = {
         showToast(msg) { TOASTS.push(String(msg)) },
         // 记录每次同步的完整入参：锁屏/控制中心要的是「封面 + 时长 + 进度」，
@@ -534,7 +639,35 @@ async function boot() {
               win.onNativeImage({ reqId: reqId, url: url, dataUrl: 'data:image/png;base64,IMG' + IMG_CALLS.length })
             }
           }, 0)
-        }
+        },
+        /*
+         * 音频缓存（V2.12）。真机上是 Java 侧的 HttpURLConnection 落盘，
+         * 这里只把「键长什么样、有没有被查、什么时候落盘」记下来。
+         * audioCacheGet 是**同步**返回路径的（页面靠它决定要不要跳过解析），
+         * 所以命中与否用一个开关控制：AC.hit。
+         */
+        audioCacheGet(key) { AC.keys.push(key); return AC.hit },
+        audioCachePut(key, url, limitBytes) { AC.puts.push({ key: key, url: url, limitBytes: limitBytes }) },
+        audioCacheTrim(limitBytes) { AC.trims.push(limitBytes) },
+        audioCacheClear() {
+          AC.clears++
+          setTimeout(function () {
+            if (typeof win.onNativeAudioCacheCleared === 'function') {
+              win.onNativeAudioCacheCleared({ bytes: AC.bytes })
+            }
+          }, 0)
+        },
+        audioCacheStat() {
+          AC.stats++
+          setTimeout(function () {
+            if (typeof win.onNativeAudioCacheStat === 'function') {
+              win.onNativeAudioCacheStat({ bytes: AC.bytes })
+            }
+          }, 0)
+        },
+        // 插件文件选择（V2.12）。真机上是 ACTION_GET_CONTENT + 原生读文本；
+        // 测试自己调 win.onNativePluginFile(...) 来扮演「用户选了文件」。
+        pickPluginFile() { PF.calls++ }
       }
       w.onerror = function (msg, src, line, col, err) {
         LOGS.push('window.onerror: ' + (err && err.stack || msg))
@@ -556,7 +689,23 @@ async function boot() {
   return dom
 }
 
+/*
+ * 客户端从 V2.12 起有一层「直链缓存」（默认开，见 index.html 的 lpUrlCacheGet/Set）：
+ * 同一首 `source:id:quality` 解析过一次就存 20 分钟，避免二次点歌再走一遍本地插件。
+ *
+ * ⚠ 测试里每一段都会换 `RESPONSES['/url']` 的替身响应，但缓存不会跟着换 ——
+ * 于是下一段读到的是上一段留下的旧地址，看起来像「客户端取错了源」，
+ * 其实是被测代码完全正确、替身换了缓存没换。
+ * 每次导航（`go()`）就是「进入一个新场景」的边界，在这里把缓存清掉最省事也最准确。
+ *
+ * 只影响播放解析（resolveUrl）；下载走 `/url?fast=0`，不读这层缓存。
+ */
+function clearUrlCache() {
+  try { win.localStorage.removeItem('ym.lp.urlcache') } catch (e) { }
+}
+
 async function go(hash) {
+  clearUrlCache()
   win.location.hash = hash
   await sleep(60)
 }
@@ -2265,7 +2414,526 @@ section('22. 「关于」页显示服务端版本号')
 }
 
 /* ============================================================ */
-section('23. 全局异常检查')
+section('23. 本地插件与音源设置（V2.12）')
+
+/* ---- 23.1 「我的」页入口 ---- */
+{
+  await go('#/mine')
+  await sleep(80)
+  const entry = $$('.menu-item').filter(a => /插件与音源/.test(a.textContent))
+  eq(entry.length, 1, '「我的」页有且只有一个「插件与音源」入口')
+  eq(entry[0].getAttribute('href'), '#/plugins', '入口指向 #/plugins')
+  ok(!!entry[0].querySelector('.menu-item__ico'), '入口带图标块（与其它菜单项一致）')
+  ok(/走服务端/.test(entry[0].textContent), '默认关闭时副标题说明「走服务端解析」', entry[0].textContent.trim())
+}
+
+/* ---- 23.2 设置页结构 ---- */
+{
+  await go('#/plugins')
+  await sleep(200)
+  ok(!!$('#lpBody'), '插件设置页渲染出来了')
+  ok(!!$('#lpOn'), '有总开关（#lpOn）')
+  eq($('#lpOn').checked, false, '默认是关的（不偷偷走本地插件）')
+  ok(!!$('#lpRuntimeMode'), '写明了插件在哪儿求值')
+  ok(/主线程降级|独立 Worker|待检测/.test($('#lpRuntimeMode').textContent),
+    '运行方式给出明确取值', $('#lpRuntimeMode').textContent)
+  ok(!!$('#lpScoreBtn') && !!$('#lpScoreDesc'), '有跑分按钮与说明')
+  ok(!!$('#lpList'), '有插件列表')
+  eq($$('#lpList [data-lpen]').length, 2, '两个内置插件都在列表里')
+  eq($$('#lpList [data-lpen]').filter(c => c.checked).length, 0, '内置插件默认**全不勾**')
+  ok(!!$('#lpUrl') && !!$('#lpImportUrl'), '有「从地址导入」')
+  ok(!!$('#lpText') && !!$('#lpImportText'), '有「从文本导入」')
+  ok(!!$('#lpImportFile'), '有「从手机文件选择」')
+  ok(!!$('#lpCacheUrl') && $('#lpCacheUrl').checked, '直链缓存默认开')
+  ok(!!$('#lpCacheAudio') && $('#lpCacheAudio').checked, '音频缓存默认开')
+  ok(!!$('#lpCacheSize'), '显示音频缓存当前占用')
+  eq($$('#lpBody [data-lplimit]').length, 4, '容量上限有 4 档')
+  ok(!!$('#lpCacheClear'), '有「清空音频缓存」')
+  ok(!/data-lpen="fake-ok"[^>]* checked/.test(HTML), '内置插件的「默认不勾」不是靠运行时改的（模板里就没有 checked）')
+}
+
+/* ---- 23.3 插件启停持久化 ---- */
+{
+  const row = $$('#lpList [data-lpen]')[0]
+  row.checked = true
+  row.dispatchEvent(new win.Event('change'))
+  await sleep(150)
+  eq(JSON.parse(win.localStorage.getItem('ym.lp.enabled') || '{}')['fake-ok'], true,
+    '勾选后写进 ym.lp.enabled')
+  await go('#/plugins')
+  await sleep(200)
+  eq($$('#lpList [data-lpen]')[0].checked, true, '重进页面仍然勾着（持久化生效）')
+  const r2 = $$('#lpList [data-lpen]')[0]
+  r2.checked = false
+  r2.dispatchEvent(new win.Event('change'))
+  await sleep(150)
+  eq(JSON.parse(win.localStorage.getItem('ym.lp.enabled'))['fake-ok'], false, '取消勾选也持久化')
+}
+
+/* ---- 23.4 开关打开 → 首次自动跑分 → 按实测自动勾选 ---- */
+{
+  TOASTS.length = 0
+  const sw = $('#lpOn')
+  sw.checked = true
+  sw.dispatchEvent(new win.Event('change'))
+  await sleep(1800)
+  eq(JSON.parse(win.localStorage.getItem('ym.lp.on')), true, '开关打开后持久化 ym.lp.on=true')
+  ok(TOASTS.some(t => /首次启用/.test(t)), '第一次启用会提示「正在实测各插件」', TOASTS.join(' | '))
+
+  const sc = JSON.parse(win.localStorage.getItem('ym.lp.scores') || 'null')
+  ok(!!sc && !!sc.byId, '首次启用自动跑了一轮分，结果落盘到 ym.lp.scores')
+  // 下面几条用「取不到就给空对象」的写法：跑分没跑成时应当**报红**，
+  // 而不是抛 TypeError 把整个自测脚本带走（那会看不到其余断言的结果）。
+  const scOk = ((sc && sc.byId) || {})['fake-ok'] || {}
+  const scBad = ((sc && sc.byId) || {})['fake-bad'] || {}
+  eq(scOk.ok, 1, '甲音源实测成功 1 次')
+  eq(scOk.total, 1, '甲音源分母 1（探针只覆盖它声明的网易云）')
+  ok(scOk.score >= 80, '甲音源拿到高分（成功率 100% + 速度快）', String(scOk.score))
+  eq(scBad.ok, 0, '乙音源实测 0 次成功')
+  eq(scBad.total, 1, '失败的那次也进分母（否则「0/0」会被算成 100%）')
+  eq(scBad.score, 0, '一次都没成功 → 0 分')
+
+  const en = JSON.parse(win.localStorage.getItem('ym.lp.enabled') || '{}')
+  eq(en['fake-ok'], true, '跑分后自动勾上实测可用的插件')
+  eq(en['fake-bad'] === true, false, '实测不可用的插件不会被自动勾上')
+
+  // 跑分完成后按钮恢复可用、说明改成「上次跑分」
+  await sleep(150)
+  ok(!!$('#lpScoreBtn') && !$('#lpScoreBtn').disabled, '跑分结束后按钮可再点（手动重跑）')
+  const scoreDesc = $('#lpScoreDesc') ? $('#lpScoreDesc').textContent : '(节点不在)'
+  ok(/上次跑分/.test(scoreDesc), '跑分说明变成「上次跑分…」', scoreDesc)
+  ok(/（1\/\d+ 已启用）/.test($('#lpBody').textContent), '列表标题反映「1/N 已启用」',
+    ($('#lpBody').textContent.match(/插件（[^）]*）/) || [''])[0])
+}
+
+/* ---- 23.5 开关打开时，取流走本地插件 ---- */
+{
+  RESPONSES['/url'] = { ok: true, url: 'https://cdn.example.com/server.mp3', from: 'wy', verified: true }
+  await go('#/chart?source=wy&id=c1')
+  await sleep(80)
+  API_CALLS.length = 0
+  $('#view .song').dispatchEvent(new win.MouseEvent('click', { bubbles: true }))
+  await sleep(500)
+  const a = $('#audio')
+  eq(a.src, 'https://local.example.com/wy/s1.mp3', '开关打开时用本地插件给的地址')
+  eq(API_CALLS.filter(c => c.path === '/url').length, 0, '本地解出来了就不必再问服务端')
+  eq($('#playerResolvedBy').textContent, '音源：甲音源', '音源标识显示本地插件名')
+  eq($('#playerArtist').textContent, '测试歌手  ·  网易云音乐', '歌手那一行仍是歌曲所属平台（两处口径不串味）')
+}
+
+/* ---- 23.6 本地插件全都解不出来 → 自动退回服务端兜底 ---- */
+{
+  // 只留那个必然失败的插件
+  await go('#/plugins')
+  await sleep(200)
+  const c0 = $$('#lpList [data-lpen]')[0]
+  c0.checked = false
+  c0.dispatchEvent(new win.Event('change'))
+  await sleep(120)
+  const c1 = $$('#lpList [data-lpen]')[1]
+  c1.checked = true
+  c1.dispatchEvent(new win.Event('change'))
+  await sleep(200)
+
+  TOASTS.length = 0
+  RESPONSES['/url'] = { ok: true, url: 'https://cdn.example.com/server.mp3', from: 'wy', verified: true }
+  await go('#/chart?source=wy&id=c1')
+  await sleep(80)
+  API_CALLS.length = 0
+  $('#view .song').dispatchEvent(new win.MouseEvent('click', { bubbles: true }))
+  await sleep(600)
+  eq($('#audio').src, 'https://cdn.example.com/server.mp3', '本地插件全解不出来 → 自动退回服务端')
+  eq(API_CALLS.filter(c => c.path === '/url').length, 1, '确实问了一次服务端（不是哑掉）')
+  ok(TOASTS.some(t => /本地插件没解出地址/.test(t)),
+    '明确告诉用户这次是服务端救回来的（否则只会觉得「插件白开了」）', TOASTS.join(' | '))
+}
+
+/* ---- 23.7 关掉开关 → 一律走服务端 ---- */
+{
+  await go('#/plugins')
+  await sleep(200)
+  TOASTS.length = 0
+  const sw = $('#lpOn')
+  sw.checked = false
+  sw.dispatchEvent(new win.Event('change'))
+  await sleep(150)
+  eq(JSON.parse(win.localStorage.getItem('ym.lp.on')), false, '关掉后持久化 ym.lp.on=false')
+  ok(TOASTS.some(t => /全部走服务端/.test(t)), '关掉时明确提示改走服务端', TOASTS.join(' | '))
+
+  RESPONSES['/url'] = { ok: true, url: 'https://cdn.example.com/server2.mp3', from: 'wy', verified: true }
+  await go('#/chart?source=wy&id=c1')
+  await sleep(80)
+  API_CALLS.length = 0
+  $('#view .song').dispatchEvent(new win.MouseEvent('click', { bubbles: true }))
+  await sleep(400)
+  eq($('#audio').src, 'https://cdn.example.com/server2.mp3', '开关关掉 → 一律走服务端（本地插件不参与）')
+  eq(API_CALLS.filter(c => c.path === '/url').length, 1, '关掉后取流只问服务端')
+}
+
+/* ---- 23.8 缓存选项：容量档位 / 直链缓存 / 清空 ---- */
+{
+  await go('#/plugins')
+  await sleep(200)
+
+  const chip = $$('#lpBody [data-lplimit]').filter(c => c.getAttribute('data-lplimit') === '1000')[0]
+  chip.dispatchEvent(new win.MouseEvent('click', { bubbles: true }))
+  await sleep(150)
+  eq(JSON.parse(win.localStorage.getItem('ym.lp.cache')).limitMb, 1000, '容量档位选择持久化')
+  eq(AC.trims[AC.trims.length - 1], 1000 * 1024 * 1024, '改容量后立刻让原生按新上限裁剪')
+
+  // 关掉直链缓存 → 必须把已有记录一并清掉，否则那些地址还会被用
+  win.localStorage.setItem('ym.lp.urlcache', JSON.stringify({ 'wy:s1:320k': { at: Date.now(), v: { url: 'stale' } } }))
+  const cu = $('#lpCacheUrl')
+  cu.checked = false
+  cu.dispatchEvent(new win.Event('change'))
+  await sleep(150)
+  eq(win.localStorage.getItem('ym.lp.urlcache'), null, '关掉直链缓存时清掉已有记录')
+  eq(JSON.parse(win.localStorage.getItem('ym.lp.cache')).url, false, '直链缓存开关持久化')
+  ok(TOASTS.some(t => /已关闭直链缓存/.test(t)), '关掉直链缓存有提示')
+
+  const ca = $('#lpCacheAudio')
+  ca.checked = false
+  ca.dispatchEvent(new win.Event('change'))
+  await sleep(120)
+  eq(JSON.parse(win.localStorage.getItem('ym.lp.cache')).audio, false, '音频缓存开关持久化')
+  ca.checked = true
+  ca.dispatchEvent(new win.Event('change'))
+  await sleep(120)
+
+  // 清空：调原生 + 按释放量提示
+  AC.bytes = 12345678
+  TOASTS.length = 0
+  $('#lpCacheClear').dispatchEvent(new win.MouseEvent('click', { bubbles: true }))
+  await sleep(250)
+  eq(AC.clears, 1, '「清空音频缓存」调到了原生')
+  ok(TOASTS.some(t => /已清空 11\.8 MB 音频缓存/.test(t)), '按实际释放量提示', TOASTS.join(' | '))
+  ok(/当前还没有缓存文件/.test($('#lpCacheSize').textContent), '清空后占用归零')
+
+  // 「当前占用」走的是原生统计回调
+  AC.bytes = 2048
+  AC.stats = 0
+  await go('#/mine')
+  await go('#/plugins')
+  await sleep(250)
+  ok(AC.stats >= 1, '进设置页会向原生问一次占用')
+  ok(/2 KB/.test($('#lpCacheSize').textContent), '占用按原生回的值显示', $('#lpCacheSize').textContent)
+  AC.bytes = 0
+}
+
+/* ---- 23.9 音频缓存命中 → 直接放本地文件，完全不联网 ---- */
+{
+  await go('#/plugins')
+  await sleep(200)
+  AC.hit = '/data/user/0/com.yunmusic.app/files/audiocache/deadbeef.mp3'
+  AC.keys.length = 0
+  RESPONSES['/url'] = { ok: true, url: 'https://cdn.example.com/server3.mp3', from: 'wy', verified: true }
+  await go('#/chart?source=wy&id=c1')
+  await sleep(80)
+  API_CALLS.length = 0
+  $('#view .song').dispatchEvent(new win.MouseEvent('click', { bubbles: true }))
+  await sleep(350)
+  eq($('#audio').src, 'file://' + AC.hit, '音频缓存命中 → 直接放本地文件（补上 file:// 前缀，不靠根相对 URL 碰巧对）')
+  eq(API_CALLS.filter(c => c.path === '/url').length, 0, '命中时连服务端都不用问')
+  eq(AC.keys[AC.keys.length - 1], 'wy_s1_320k', '缓存键 = 平台_歌曲id_音质（不随时间变）')
+
+  // 放的是本地文件时，听完不必再交给原生「缓存」一遍
+  AC.puts.length = 0
+  Object.defineProperty($('#audio'), 'duration', { configurable: true, value: 245 })
+  $('#audio').dispatchEvent(new win.Event('ended'))
+  await sleep(200)
+  eq(AC.puts.length, 0, '已经在放本地文件 → 不再重复落盘')
+  AC.hit = null
+}
+
+/* ---- 23.10 整首听完才把音频交给原生落盘 ---- */
+{
+  RESPONSES['/url'] = { ok: true, url: 'https://cdn.example.com/full-song.mp3', from: 'wy', verified: true }
+  await go('#/chart?source=wy&id=c1')
+  await sleep(80)
+  $('#view .song').dispatchEvent(new win.MouseEvent('click', { bubbles: true }))
+  await sleep(400)
+  const a = $('#audio')
+  eq(a.src, 'https://cdn.example.com/full-song.mp3', '（前置）这一首是联网取的（开关仍是关的）')
+  // jsdom 的 duration 恒为 0，会被判成「试听片段」而走换源分支 —— 先摆成完整时长
+  Object.defineProperty(a, 'duration', { configurable: true, value: 245 })
+  AC.puts.length = 0
+  a.dispatchEvent(new win.Event('ended'))
+  await sleep(200)
+  eq(AC.puts.length, 1, '整首听完才落盘（中途切歌不留半截文件）')
+  // 取不到就用空对象：落盘没发生时应当**报红**，而不是把自测脚本带走
+  const put0 = AC.puts[0] || {}
+  eq(put0.key, 'wy_s1_320k', '落盘用的键与查询一致')
+  eq(put0.url, 'https://cdn.example.com/full-song.mp3', '交给原生的是刚才播的那条地址')
+  eq(put0.limitBytes, 1000 * 1024 * 1024, '落盘时带上当前容量上限，原生据此裁剪')
+}
+
+/* ---- 23.11 导入插件：文本 / 地址 / 手机文件 + 删除 ---- */
+{
+  const imported = () => JSON.parse(win.localStorage.getItem('ym.lp.imported') || '[]')
+  await go('#/plugins')
+  await sleep(200)
+  const base = $$('#lpList [data-lpen]').length
+
+  // ① 文本
+  $('#lpText').value = FAKE_PLUGIN_OK.replace('甲音源', '丙音源')
+  TOASTS.length = 0
+  $('#lpImportText').dispatchEvent(new win.MouseEvent('click', { bubbles: true }))
+  await sleep(250)
+  eq(imported().length, 1, '文本导入写进了 ym.lp.imported')
+  eq($$('#lpList [data-lpen]').length, base + 1, '列表里多了一行')
+  ok(imported()[0].id.indexOf('user:') === 0, '导入的插件 id 带 user: 前缀（不与内置撞车）', imported()[0].id)
+  eq($$('#lpList [data-lpen]')[base].checked, true, '用户主动导入的插件默认就勾上')
+  ok(/丙音源/.test(viewText()), '列表里显示的是脚本 @name 解析出来的名字')
+  ok(TOASTS.some(t => /已导入/.test(t)), '导入成功有提示', TOASTS.join(' | '))
+
+  // ② 同一份再导一次 → 覆盖而不是新增
+  $('#lpText').value = FAKE_PLUGIN_OK.replace('甲音源', '丙音源')
+  $('#lpImportText').dispatchEvent(new win.MouseEvent('click', { bubbles: true }))
+  await sleep(200)
+  eq(imported().length, 1, '同一份脚本重复导入是**覆盖**，不会长出两份')
+
+  // ③ 太短的内容要拒绝（防止把乱七八糟的文本当插件存进去）
+  TOASTS.length = 0
+  $('#lpText').value = 'alert(1)'
+  $('#lpImportText').dispatchEvent(new win.MouseEvent('click', { bubbles: true }))
+  await sleep(150)
+  eq(imported().length, 1, '内容太短不写入')
+  ok(TOASTS.some(t => /导入失败/.test(t)), '拒绝时给出原因', TOASTS.join(' | '))
+
+  // ④ 从地址导入（走原生桥 httpFetch）
+  RESPONSES['/remote-plugin.js'] = FAKE_PLUGIN_OK.replace('甲音源', '丁音源')
+  $('#lpUrl').value = 'https://plug.example.com/remote-plugin.js'
+  TOASTS.length = 0
+  $('#lpImportUrl').dispatchEvent(new win.MouseEvent('click', { bubbles: true }))
+  await sleep(400)
+  eq(imported().length, 2, '从地址导入成功')
+  ok(/丁音源/.test(viewText()), '下载回来的插件进了列表')
+  ok(imported().some(p => /plug\.example\.com/.test(p.url || '')), '记下了来源地址（便于日后更新）')
+
+  // 非 http 地址要挡住
+  TOASTS.length = 0
+  $('#lpUrl').value = 'ftp://x/y.js'
+  $('#lpImportUrl').dispatchEvent(new win.MouseEvent('click', { bubbles: true }))
+  await sleep(150)
+  ok(TOASTS.some(t => /http\/https/.test(t)), '非 http(s) 地址直接挡住', TOASTS.join(' | '))
+
+  // ⑤ 从手机文件选择：先让原生「选到」一个文件
+  PF.calls = 0
+  $('#lpImportFile').dispatchEvent(new win.MouseEvent('click', { bubbles: true }))
+  await sleep(120)
+  eq(PF.calls, 1, '「从手机文件选择」调到了原生 pickPluginFile')
+  win.onNativePluginFile({ name: 'wuxing.js', content: FAKE_PLUGIN_BAD.replace('乙音源', '戊音源') })
+  await sleep(250)
+  eq(imported().length, 3, '原生回调回来的内容也进得去')
+  ok(/戊音源/.test(viewText()), '文件里的插件显示出来了')
+
+  // 原生报错要如实转达
+  TOASTS.length = 0
+  win.onNativePluginFile({ name: 'x.js', error: '文件过大（超过 4MB）' })
+  await sleep(150)
+  ok(TOASTS.some(t => /读取文件失败.*4MB/.test(t)), '原生读取失败的原因如实转达', TOASTS.join(' | '))
+  win.onNativePluginFile({ name: 'empty.js', content: '' })
+  await sleep(150)
+  ok(TOASTS.some(t => /文件是空的/.test(t)), '空文件给出明确提示')
+
+  // ⑥ 删除
+  const dels = $$('#lpList [data-lpdel]')
+  eq(dels.length, 3, '导入的插件都带删除按钮（内置的没有）')
+  dels[0].dispatchEvent(new win.MouseEvent('click', { bubbles: true }))
+  await sleep(200)
+  eq(imported().length, 2, '删除后从 ym.lp.imported 里移除')
+  eq($$('#lpList [data-lpdel]').length, 2, '列表同步更新')
+}
+
+/* ---- 23.12 resolveUrl：本地优先 + 失败退回（源码级，逐条钉住优先级） ---- */
+{
+  const c = vm.createContext({
+    console, Promise, JSON, Date, Math, String, Number, Object, Array, encodeURIComponent
+  })
+  vm.runInContext([
+    'var LP = { on: true, runtime: true, stat: { local: 0, server: 0 }, lastFrom: "" }',
+    'var P = { quality: "320k" }',
+    'var LOG = []',
+    'var HIT = null',
+    'function lpUrlKey(s) { return s.source + ":" + s.id + ":" + P.quality }',
+    'function lpUrlCacheGet(k) { LOG.push("cacheGet:" + k); return HIT }',
+    'function lpUrlCacheSet(k, v) { LOG.push("cacheSet") }',
+    'function lpSaveStat() {}',
+    'function toast(m) { LOG.push("toast:" + m) }',
+    'var LOCAL = null, LOCAL_REJECT = false',
+    // ⚠ 必须返回**数组**：resolveUrl 读的是 lpCandidates(...).length，
+    //    返回数字的话 .length 是 undefined，会被判成「没有候选」而漏掉提示
+    'function lpCandidates(src) { LOG.push("cands:" + src); return CAND_N ? [{ id: "p1" }] : [] }',
+    'var CAND_N = 1',
+    'function lpResolve(song) { LOG.push("local"); return LOCAL_REJECT ? Promise.reject(new Error("插件全挂了")) : Promise.resolve(LOCAL) }',
+    'var SERVER = { url: "https://srv/a.mp3", from: "wy" }, SERVER_REJECT = false',
+    'function api(p) { LOG.push("api:" + p); return SERVER_REJECT ? Promise.reject(new Error("服务端也挂了")) : Promise.resolve(SERVER) }',
+    extractFn(SCRIPT, 'resolveUrl')
+  ].join('\n'), c)
+  const set = (code) => vm.runInContext(code, c)
+  const get = (code) => vm.runInContext(code, c)
+  const reset = () => set('LOG = []; HIT = null; LP.on = true; LP.stat = { local: 0, server: 0 }; LP.lastFrom = "";' +
+    ' LOCAL = null; LOCAL_REJECT = false; SERVER_REJECT = false; P.quality = "320k"; CAND_N = 1')
+  const run = () => vm.runInContext('resolveUrl({ source: "wy", id: "s1" })', c)
+
+  // ① 本地成功 → 不碰服务端
+  reset()
+  set('LOCAL = [{ url: "https://local/1.mp3", from: "plugin:甲" }, { url: "https://local/2.mp3", from: "plugin:乙" }]')
+  let r = await run()
+  eq(r.local, true, '本地插件解出来了 → 结果标记为本地')
+  eq(r.url, 'https://local/1.mp3', '首选是本地第一条')
+  eq(r.urls.length, 2, '本地候选全带上（片段换源要用）')
+  eq(r.from, 'plugin:甲', 'from 直接沿用插件名')
+  ok(!get('LOG').some(x => /^api:/.test(x)), '本地成功时**不**再问服务端')
+  eq(get('LP.stat.local'), 1, '统计记一次本地取流')
+
+  // ② 本地没结果 → 退服务端，并说清楚
+  reset()
+  set('LOCAL = []')
+  r = await run()
+  eq(r.local, false, '本地全军覆没 → 结果是服务端的')
+  eq(r.url, 'https://srv/a.mp3', '退回服务端拿到的地址')
+  eq(get('LP.stat.server'), 1, '统计记一次服务端取流')
+  ok(get('LOG').some(x => /^toast:本地插件没解出地址/.test(x)), '明确告诉用户「已改用服务端」')
+
+  // ③ 开关关掉 → 根本不碰本地
+  reset()
+  set('LP.on = false; LOCAL = [{ url: "https://local/1.mp3" }]')
+  r = await run()
+  eq(r.local, false, '开关关掉 → 走服务端')
+  ok(!get('LOG').some(x => x === 'local'), '开关关掉时**根本不调**本地插件')
+
+  // ④ 插件抛异常（不是「没结果」）也要兜住
+  // ⚠ 这里必须自己 try/catch：抛出去会让整个自测脚本中断，后面的断言全都看不到结果
+  reset()
+  set('LOCAL_REJECT = true')
+  let err4 = ''
+  try { r = await run() } catch (e) { err4 = e.message }
+  eq(err4, '', '插件抛异常不该从 resolveUrl 抛出去（否则上层直接退代理流、不走服务端兜底）')
+  eq(r && r.local, false, '插件抛异常也退回服务端，不能把整首判死')
+  ok(get('LOG').some(x => /^toast:本地插件没解出地址/.test(x)), '抛异常这条路也会提示')
+
+  // ④' 开关开着但一个插件都没勾 → 那不叫「本地失败」，别乱提示
+  reset()
+  set('CAND_N = 0; LOCAL = []')
+  r = await run()
+  eq(r.local, false, '没有可试的插件 → 走服务端')
+  ok(!get('LOG').some(x => /^toast:本地插件没解出地址/.test(x)),
+    '没勾任何插件时不提示「本地插件没解出地址」（那不是失败，是没开）')
+
+  // ⑤ 直链缓存命中 → 两条路都不走
+  reset()
+  set('HIT = { url: "https://cached/x.mp3", local: true }')
+  r = await run()
+  eq(r.url, 'https://cached/x.mp3', '直链缓存命中 → 直接用')
+  ok(!get('LOG').some(x => x === 'local' || /^api:/.test(x)), '缓存命中时既不调本地也不调服务端')
+  eq(get('LP.lastFrom'), 'local', '缓存里记的是本地结果 → 来源标成 local')
+  set('HIT = { url: "https://cached/y.mp3", local: false }')
+  await run()
+  eq(get('LP.lastFrom'), 'server', '缓存里记的是服务端结果 → 来源标成 server')
+
+  // ⑥ 两边都挂 → 如实抛出（上层据此退代理流）
+  reset()
+  set('LOCAL = []; SERVER_REJECT = true')
+  let threw = ''
+  try { await run() } catch (e) { threw = e.message }
+  ok(/服务端也挂了/.test(threw), '两边都失败 → 如实抛出，不吞掉', threw)
+
+  // ⑦ 缓存键必须含音质：换音质不能拿到上一档的地址
+  reset()
+  set('P.quality = "128k"')
+  await run()
+  eq(get('LOG').filter(x => /^cacheGet:/.test(x))[0], 'cacheGet:wy:s1:128k',
+    '缓存键带上音质（换音质不会拿到上一档的地址）')
+}
+
+/* ---- 23.13 跑分口径（源码级）：成功率 60% + 速度 40%，速度取中位数 ---- */
+{
+  const c = vm.createContext({ console, JSON, Date, Math, String, Number, Object, Array })
+  vm.runInContext([
+    'var LP = { scores: null, list: [] }',
+    'var LP_KEYS = { scores: "ym.lp.scores", enabled: "ym.lp.enabled" }',
+    'var SAVED = null',
+    'var store = { set: function (k, v) { SAVED = v }, get: function () { return null } }',
+    'function lpBuildList() { return [] }',
+    'function lpSetEnabled(id, on) { TURNED.push(id) }',
+    'var TURNED = []',
+    extractFn(SCRIPT, 'lpFinalizeScores'),
+    extractFn(SCRIPT, 'lpAutoEnableFromScores')
+  ].join('\n'), c)
+  const fin = (acc) => vm.runInContext('lpFinalizeScores(' + JSON.stringify(acc) + ', Date.now()).byId', c)
+
+  eq(fin({ A: { ok: 10, total: 10, times: [1000, 1000, 1000] } }).A.score, 100,
+    '全成功 + 中位 1.0s（≤1.5s 满分）→ 100 分')
+  eq(fin({ A: { ok: 10, total: 10, times: [1000] } }).A.rate, 100, 'rate 也写出来（列表要显示「实测 10/10 次成功」）')
+  eq(fin({ B: { ok: 0, total: 10, times: [] } }).B.score, 0, '一次都没成功 → 0 分（速度再快也没意义）')
+  eq(fin({ C: { ok: 5, total: 10, times: [1000, 2000, 3000, 4000, 9000] } }).C.ms, 3000,
+    '取**中位数**耗时（3000），不是均值')
+  eq(fin({ C: { ok: 5, total: 10, times: [1000, 2000, 3000, 4000, 9000] } }).C.score, 61,
+    '成功率 50%(×0.6) + 速度 (8000-3000)/6500(×0.4) → 61 分')
+  eq(fin({ D: { ok: 1, total: 1, times: [9000] } }).D.score, 60, '中位 ≥8s → 速度分归零，只剩成功率的 60 分')
+  eq(fin({ E: { ok: 1, total: 1, times: [1500] } }).E.score, 100, '中位正好 1.5s → 速度仍算满分（边界含在内）')
+  eq(fin({ F: { ok: 1, total: 1, times: [1000, 1000, 1000, 1000, 60000] } }).F.score, 100,
+    '一个超时样本不把整体拉垮（均值会被 60000 拉到 12800 → 0 分）')
+  ok(!!vm.runInContext('SAVED && SAVED.byId && typeof SAVED.at === "number"', c),
+    '跑分结果落盘并带时间戳（设置页要显示「上次跑分」）')
+
+  // 自动勾选：每平台只勾实测可用的前 2 名
+  vm.runInContext([
+    'LP.scores = { byId: { p1: { score: 90, ok: 3 }, p2: { score: 70, ok: 2 }, p3: { score: 50, ok: 1 }, p4: { score: 0, ok: 0 } } }',
+    'LP.list = [',
+    '  { id: "p1", name: "一", enabled: false, sources: { wy: {} } },',
+    '  { id: "p2", name: "二", enabled: false, sources: { wy: {} } },',
+    '  { id: "p3", name: "三", enabled: false, sources: { wy: {} } },',
+    '  { id: "p4", name: "四", enabled: false, sources: { wy: {} } }',
+    ']',
+    'TURNED = []'
+  ].join('\n'), c)
+  const turned = vm.runInContext('lpAutoEnableFromScores()', c)
+  eq(turned.length, 2, '每平台只自动勾前 2 名（再多就是同一平台的重复源）')
+  eq(vm.runInContext('TURNED.join(",")', c), 'p1,p2', '按实测分数从高到低勾')
+  ok(!vm.runInContext('TURNED.indexOf("p4") >= 0', c), '实测 0 次成功的插件不会被勾上')
+
+  // 已经勾上的不重复计入
+  vm.runInContext('LP.list[0].enabled = true; TURNED = []', c)
+  eq(vm.runInContext('lpAutoEnableFromScores().length', c), 1, '已经勾上的不再重复计入（避免提示数字虚高）')
+}
+
+/* ---- 23.14 原生桥接线：JS 调的每个方法，Java 侧都要真的有实现 ---- */
+{
+  const fsp = require('fs')
+  const pth = require('path')
+  const APP = pth.join(__dirname, '..', 'src', 'com', 'yunmusic', 'app')
+  const bridge = fsp.readFileSync(pth.join(APP, 'YunBridge.java'), 'utf8')
+  const act = fsp.readFileSync(pth.join(APP, 'MainActivity.java'), 'utf8')
+
+  const called = [...new Set([...SCRIPT.matchAll(/YunBridge\.(\w+)\s*\(/g)].map(m => m[1]))]
+  ok(called.length >= 10, '从 index.html 里抠到了 YunBridge 的调用点', called.join(','))
+  const impl = new Set(
+    [...bridge.matchAll(/@JavascriptInterface\s+public\s+[\w$.<>\[\]]+\s+(\w+)\s*\(/g)].map(m => m[1]))
+  const missing = called.filter(n => !impl.has(n))
+  eq(missing.length, 0, 'JS 调用的每个 YunBridge 方法在 Java 侧都有 @JavascriptInterface 实现', missing.join(','))
+
+  // V2.12 新增的这几个必须都在（少一个就是「功能静默失效」，不会报错）
+  ;['audioCacheGet', 'audioCachePut', 'audioCacheTrim', 'audioCacheClear', 'audioCacheStat', 'pickPluginFile']
+    .forEach(n => ok(impl.has(n), 'YunBridge 实现了 ' + n))
+
+  ok(/audioCacheGet\s*\(/.test(bridge) && /public String audioCacheGet/.test(bridge),
+    'audioCacheGet 是**同步**返回路径的（页面靠它决定要不要跳过解析）')
+  ok(/doAudioCachePut/.test(bridge) && /FileOutputStream/.test(bridge),
+    '音频缓存用字节流写盘（不是 httpFetch 那套按 UTF-8 读文本 —— 二进制会成乱码）')
+  ok(/audiocache/.test(bridge), '音频缓存落在 App 私有目录 audiocache/')
+  ok(/\.part/.test(bridge), '落盘先写 .part 再改名（半截文件不会被当成命中）')
+
+  ok(/onActivityResult/.test(act) && /REQ_PICK_PLUGIN/.test(act), 'MainActivity 接了文件选择的结果回调')
+  ok(/startPluginFilePicker/.test(act) && /ACTION_GET_CONTENT/.test(act),
+    'MainActivity 用 ACTION_GET_CONTENT 起文件选择器（不卡 MIME，.js 才选得中）')
+  ok(/PLUGIN_MAX_BYTES/.test(act), '原生读插件脚本有大小上限（防误选大文件把内存顶爆）')
+  ok(/\\uFEFF/.test(act), '原生会剥掉 UTF-8 BOM（否则脚本第一行是非法字符）')
+}
+
+/* ============================================================ */
+section('24. 全局异常检查')
 ok(LOGS.length === 0, '全程无未捕获 JS 异常', LOGS.slice(0, 5).join(' | '))
 
 try { dom.window.close() } catch (e) {}

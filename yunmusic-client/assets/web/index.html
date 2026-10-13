@@ -855,6 +855,25 @@ em{font-style:normal}
   <audio id="audio" preload="metadata"></audio>
 </div>
 
+<!--
+  本地插件运行时 —— 由 `node tools/build-client-lxcore.mjs` 从
+  src/lib/crypto.js + src/lib/util.js + public/js/lxworker.js 打包而来
+  （与服务端、网页版共用同一份源码，免得两边修 bug 不同步）。
+
+  为什么必须**先于**下面那段主体脚本：页面在取流时要能立刻判断
+  「本地插件这条路走不走得通」，而不是等它加载完再补一次。
+
+  ⚠ 它可能加载失败，而且是**静默**的：运行时里含 BigInt 语法（只有
+  lx.utils.crypto.rsaEncrypt 用得到），Chrome 67 以下的 WebView 连解析都过不去。
+  这是有意为之 —— 与其为了老设备把 BigInt 抠掉（要拆模块，代价大得多），
+  不如让它在支持的设备上可用、在不支持的设备上整体不可用。
+  页面侧统一用 `window.LXCore` 存不存在来判定，并把「本地插件」开关置灰说明原因；
+  服务端取流这条路完全不受影响。
+
+  插件数据（22 个、约 760KB）**不在这里引入**：只有真正要用本地插件时才
+  动态加载，见下面的 loadPluginData()。
+-->
+<script src="lxcore.js"></script>
 <script>
 /* ==========================================================================
    云音乐 · 原生壳前端（自研实现，版式与交互对标网易云音乐 App）
@@ -874,7 +893,7 @@ em{font-style:normal}
    * 以前它在抽屉菜单、关于页、顶栏文案里各写一遍，发版必然漏改几处
    * （实测发到 V2.3 时抽屉里还写着 V2.2），所以收口到这里。
    */
-  var CLIENT_VERSION = 'V2.11'
+  var CLIENT_VERSION = 'V2.12'
 
   /* ------------------------------ 兼容垫片 ------------------------------
      部分老设备的系统 WebView 停留在 Chrome 4x，缺少下面这些 ES6 方法。
@@ -1159,6 +1178,1168 @@ em{font-style:normal}
     else entry.resolve({ status: data.status, body: data.body })
   }
 
+  /* ============================ 本地插件 ============================ */
+  /*
+   * 把落雪（LX）插件搬到**本机**跑。
+   *
+   * 原来客户端只会问远端要地址（`/api/url`），插件跑在服务端。服务端那条线路不通、
+   * 或者服务端没开某个插件时，本机就一点办法都没有。这里补上第二条路：
+   * 开关打开 → 本地插件优先解析，全都失败再退回服务端兜底（用户明确要的行为）。
+   *
+   * ⚠ 为什么插件必须放 Worker 里跑，而不是直接 new Function：
+   *   内置插件里有重度混淆的（自研字节码解释器）。实测 pdone-lx 在求值阶段会把
+   *   JS 引擎**直接搞死** —— 不抛异常、try/catch 拦不住、连退出钩子都不触发。
+   *   在主线程求值就等于「一个第三方插件能把整个 App 变成白屏」。
+   *   放 Worker 里，崩也只崩那一个 Worker，页面活着。
+   *
+   * ⚠ 为什么 Worker 用 Blob 而不是 new Worker('lxworker.js')：
+   *   页面是 file:// 源，`new Worker('file://...')` 会被同源策略直接拒掉
+   *   （"Script at 'file://...' cannot be accessed from origin 'null'"）。
+   *   只能把源码塞进 Blob 再 createObjectURL。这条路在少数 WebView 上也可能不通，
+   *   所以另有一条「主线程 + 黑名单」的降级路径，见 lpStart()。
+   *
+   * 运行时的加密/编码垫片来自 window.LXCore（由 tools/build-client-lxcore.mjs
+   * 从服务端同一份源码打包），这里不重复实现。
+   */
+
+  /**
+   * 主线程降级时**必须**排除的插件 —— 它们求值就会杀死 JS 引擎。
+   * 名单与服务端 src/generated/plugin-skip.js 同源（tools/plugin-prescreen.mjs 生成）。
+   * Worker 路径下不需要它（崩的是 Worker），只有降级路径才用得上。
+   */
+  var LP_SKIP = ['pdone-lx']
+
+  var LP = {
+    // 总开关。true = 本地插件优先（失败退回服务端）；false = 只用服务端。
+    on: false,
+    // lxcore.js 有没有加载成功（老 WebView 上可能整个文件解析失败）
+    runtime: !!window.LXCore,
+    // Worker 能不能用。为 false 时走主线程降级（带 LP_SKIP 黑名单）
+    worker: false,
+    // 插件数据（plugins.data.js）是否已加载
+    data: false,
+    _loading: false,
+    _wait: [],
+    // 全部插件：内置 + 用户导入
+    list: [],
+    // 跑分结果 { at, bySource, byId }；null = 从没跑过
+    scores: null,
+    scoring: false,
+    // 插件实例：id -> { worker|host, ready, error, meta, sources, seq, pending }
+    inst: {},
+    // 缓存设置
+    cache: { url: true, audio: true, limitMb: 500 },
+    // 最近一次取流是谁给的（本地 / 服务端），页面用来显示来源
+    lastFrom: '',
+    // 本地/服务端各取了多少次，设置页显示，也方便排查
+    stat: { local: 0, server: 0 }
+  }
+
+  var LP_KEYS = {
+    on: 'ym.lp.on',
+    enabled: 'ym.lp.enabled',     // { id: bool }
+    imported: 'ym.lp.imported',   // [{id,name,url,script}]
+    scores: 'ym.lp.scores',
+    cache: 'ym.lp.cache',
+    stat: 'ym.lp.stat'
+  }
+
+  function lpRestore() {
+    LP.on = store.get(LP_KEYS.on, false) === true
+    var c = store.get(LP_KEYS.cache, null)
+    if (c && typeof c === 'object') {
+      LP.cache = {
+        url: c.url !== false,
+        audio: c.audio !== false,
+        limitMb: Math.max(50, Math.min(4096, Number(c.limitMb) || 500))
+      }
+    }
+    var s = store.get(LP_KEYS.scores, null)
+    if (s && typeof s === 'object' && s.byId) LP.scores = s
+    var st = store.get(LP_KEYS.stat, null)
+    if (st && typeof st === 'object') LP.stat = { local: Number(st.local) || 0, server: Number(st.server) || 0 }
+  }
+
+  function lpSaveCache() { store.set(LP_KEYS.cache, LP.cache) }
+  function lpSaveStat() { store.set(LP_KEYS.stat, LP.stat) }
+
+  /** 从插件源码头部的 `@name / @version / @author` 注释里抠元信息 */
+  function lpParseMeta(script) {
+    var head = String(script).slice(0, 4000)
+    var block = head.match(/\/\*\*([\s\S]*?)\*\//) || head.match(/\/\*([\s\S]*?)\*\//)
+    var region = block ? block[1] : head
+    var meta = {}
+    var lines = region.split('\n')
+    for (var i = 0; i < lines.length; i++) {
+      var m = lines[i].match(/@(\w+)\s+(.*)/)
+      if (!m) continue
+      var key = m[1].toLowerCase()
+      if (key === 'name' || key === 'version' || key === 'author' || key === 'description' || key === 'homepage' || key === 'repository') {
+        meta[key] = m[2].trim().replace(/\*\/\s*$/, '').trim()
+      }
+    }
+    return {
+      name: meta.name || '未命名音源',
+      version: meta.version || '1.0.0',
+      author: meta.author || '未知',
+      description: meta.description || '',
+      homepage: meta.homepage || meta.repository || ''
+    }
+  }
+
+  /** 简易稳定哈希，给导入的插件生成 id（插件源码很长，只取头尾算，够用且快） */
+  function lpHash(str) {
+    var s = String(str)
+    var h = 5381
+    var probe = s.slice(0, 4000) + '\u0000' + s.slice(-4000) + '\u0000' + s.length
+    for (var i = 0; i < probe.length; i++) h = ((h << 5) + h + probe.charCodeAt(i)) >>> 0
+    return h.toString(36)
+  }
+
+  /**
+   * 懒加载插件数据（plugins.data.js，约 760KB）。
+   *
+   * 为什么不写成 `<script src="plugins.data.js">`：绝大多数用户不会开本地插件，
+   * 静态引入等于让每个人每次冷启动都白解析 760KB。只有第一次真正要用时才插进来。
+   * 多个调用方并发时会排队，不会重复插。
+   */
+  function loadPluginData(cb) {
+    if (LP.data) { if (cb) cb(null); return }
+    // 宿主已经把插件数据注进来了（自测里换成小替身，或将来做成内联版）：
+    // 不必再插一次 script，也就不会因为取不到文件而永远等不到回调。
+    // 真实设备上不会命中这条 —— plugins.data.js 只由下面动态插入。
+    if (Array.isArray(window.LX_BUNDLED_PLUGINS)) { LP.data = true; if (cb) cb(null); return }
+    if (cb) LP._wait.push(cb)
+    if (LP._loading) return
+    LP._loading = true
+    var s = document.createElement('script')
+    s.src = 'plugins.data.js'
+    s.onload = function () { LP.data = true; lpFlushDataWait(null) }
+    s.onerror = function () { lpFlushDataWait(new Error('插件数据文件加载失败')) }
+    document.head.appendChild(s)
+  }
+
+  function lpFlushDataWait(err) {
+    LP._loading = false
+    var q = LP._wait
+    LP._wait = []
+    for (var i = 0; i < q.length; i++) { try { q[i](err) } catch (e) { } }
+  }
+
+  /**
+   * 组装插件清单：内置 + 用户导入，并把启停状态并进来。
+   *
+   * 导入的插件 id 统一加 `user:` 前缀 —— 否则用户导入一份与内置同名的插件时，
+   * 两者的 id 会撞在一起（内置 id 来自 build.mjs 的文件名），启停状态互相覆盖，
+   * 表现是「启用了导入的那个，结果内置那个也亮了」。
+   */
+  function lpBuildList() {
+    var enabled = store.get(LP_KEYS.enabled, {}) || {}
+    var imported = store.get(LP_KEYS.imported, []) || []
+    var out = []
+    var builtin = (window.LX_BUNDLED_PLUGINS || [])
+    for (var i = 0; i < builtin.length; i++) {
+      var b = builtin[i]
+      if (!b || !b.script) continue
+      out.push({
+        id: b.id, name: b.name || '', url: b.url || '', script: b.script,
+        origin: 'builtin',
+        // 默认**全部关闭**：22 个插件里不少是同一平台的重复源，全开会把取流拖慢，
+        // 而且用户第一次开这个功能时还没跑过分，不知道该信谁。跑分后会提示开哪些。
+        enabled: enabled[b.id] === true
+      })
+    }
+    for (var j = 0; j < imported.length; j++) {
+      var u = imported[j]
+      if (!u || !u.script) continue
+      var uid = u.id.indexOf('user:') === 0 ? u.id : ('user:' + u.id)
+      out.push({
+        id: uid, name: u.name || '', url: u.url || '', script: u.script,
+        origin: 'user',
+        enabled: enabled[uid] !== false   // 用户主动导入的，默认就开
+      })
+    }
+    for (var k = 0; k < out.length; k++) {
+      out[k].meta = lpParseMeta(out[k].script)
+      if (!out[k].name) out[k].name = out[k].meta.name
+      out[k].bytes = out[k].script.length
+      /*
+       * 已经加载过的插件：把平台声明带回来。
+       * lpBuildList 是**重建**清单（每次导入 / 删除 / 跑分完都会调），新建的对象上
+       * 没有 sources —— 不补回来的话，「哪些插件支持哪些平台」会被当场抹掉，
+       * 候选筛选立刻失效（表现是「刚才还能播，删个插件之后本地插件就全失灵了」）。
+       */
+      var inst = LP.inst[out[k].id]
+      if (inst && inst.sources) out[k].sources = inst.sources
+      if (LP.scores && LP.scores.byId && LP.scores.byId[out[k].id]) out[k].score = LP.scores.byId[out[k].id]
+    }
+    LP.list = out
+    return out
+  }
+
+  function lpById(id) {
+    for (var i = 0; i < LP.list.length; i++) if (LP.list[i].id === id) return LP.list[i]
+    return null
+  }
+
+  /** 已启用的插件（按 id） */
+  function lpEnabledIds() {
+    var out = []
+    for (var i = 0; i < LP.list.length; i++) if (LP.list[i].enabled) out.push(LP.list[i].id)
+    return out
+  }
+
+  function lpSetEnabled(id, on) {
+    var p = lpById(id)
+    if (!p) return
+    p.enabled = !!on
+    var map = store.get(LP_KEYS.enabled, {}) || {}
+    map[id] = !!on
+    store.set(LP_KEYS.enabled, map)
+  }
+
+  function lpRemove(id) {
+    var imported = store.get(LP_KEYS.imported, []) || []
+    var next = []
+    for (var i = 0; i < imported.length; i++) {
+      var uid = imported[i].id.indexOf('user:') === 0 ? imported[i].id : ('user:' + imported[i].id)
+      if (uid !== id) next.push(imported[i])
+    }
+    store.set(LP_KEYS.imported, next)
+    lpStop(id)
+    lpBuildList()
+  }
+
+  function lpImport(script, url, name) {
+    var s = String(script || '').trim()
+    if (!s) throw new Error('插件内容为空')
+    if (s.length < 200) throw new Error('内容太短，看着不像插件脚本')
+    var meta = lpParseMeta(s)
+    var id = 'user:' + lpHash(s)
+    /*
+     * 显示名优先用插件自己声明的 @name，`name` 只当兜底。
+     * 从文件导入时传进来的是**文件名**（如 lx-music-source.js），拿它当显示名
+     * 既长又认不出是哪个源；插件头部的 @name 才是它想让人看到的名字。
+     */
+    var label = meta.name || name || ''
+    var imported = store.get(LP_KEYS.imported, []) || []
+    var replaced = false
+    for (var i = 0; i < imported.length; i++) {
+      var uid = imported[i].id.indexOf('user:') === 0 ? imported[i].id : ('user:' + imported[i].id)
+      if (uid === id) {
+        imported[i] = { id: id, name: label, url: url || imported[i].url || '', script: s }
+        replaced = true
+        break
+      }
+    }
+    if (!replaced) imported.push({ id: id, name: label, url: url || '', script: s })
+    store.set(LP_KEYS.imported, imported)
+    lpBuildList()
+    return { id: id, replaced: replaced, meta: meta }
+  }
+
+  /* ------------------------------ 插件的 HTTP 通道 ------------------------------ */
+
+  function lpToBytes(v) {
+    if (v == null) return new Uint8Array(0)
+    if (v instanceof Uint8Array) return v
+    if (v instanceof ArrayBuffer) return new Uint8Array(v)
+    if (ArrayBuffer.isView(v)) return new Uint8Array(v.buffer, v.byteOffset, v.byteLength)
+    if (typeof v === 'string') return window.LXCore.crypto.utf8Encode(v)
+    if (Array.isArray(v)) return Uint8Array.from(v)
+    return window.LXCore.crypto.utf8Encode(String(v))
+  }
+
+  function lpNormMode(mode) {
+    return String(mode || 'cbc').toLowerCase().indexOf('ecb') >= 0 ? 'ecb' : 'cbc'
+  }
+
+  function lpFormEncode(obj) {
+    var parts = []
+    for (var k in obj) {
+      if (!Object.prototype.hasOwnProperty.call(obj, k)) continue
+      parts.push(encodeURIComponent(k) + '=' + encodeURIComponent(obj[k] == null ? '' : obj[k]))
+    }
+    return parts.join('&')
+  }
+
+  /**
+   * 插件发起 HTTP 的唯一出口 —— 走原生桥（YunBridge.httpFetch）。
+   *
+   * 为什么必须走原生：各音乐源站基本不回 ACAO 头，页面在 file:// 源下直接
+   * fetch 会被同源策略拦掉；而且很多直链还绑 UA / Referer，只有原生那层
+   * 才能如实把请求头带出去。网页版（public/js/lxplugin.js）这里是转发给
+   * 服务端代理，壳里没有服务端，所以直接落到原生。
+   *
+   * ⚠ 原生桥回的是**文本**（Java 侧按 UTF-8 读成 String）。插件取流只读 JSON，
+   *   所以够用；但别拿它去下音频二进制 —— 那条路是 downloadSong。
+   */
+  function lpHttp(url, options, callback) {
+    options = options || {}
+    var method = String(options.method || 'get').toUpperCase()
+    var headers = {}
+    for (var hk in (options.headers || {})) {
+      if (Object.prototype.hasOwnProperty.call(options.headers, hk)) headers[hk] = options.headers[hk]
+    }
+    var body = null
+    if (options.form) {
+      body = lpFormEncode(options.form)
+      if (!lpHasHeader(headers, 'content-type')) headers['Content-Type'] = 'application/x-www-form-urlencoded'
+    } else if (options.formData) {
+      // 原生桥不带 multipart。降级成 urlencoded —— 本项目插件基本只用 form，
+      // 与网页版 public/js/native.js 的处理一致。
+      body = lpFormEncode(options.formData)
+      if (!lpHasHeader(headers, 'content-type')) headers['Content-Type'] = 'application/x-www-form-urlencoded'
+    } else if (options.body !== undefined && options.body !== null) {
+      body = typeof options.body === 'string' ? options.body : JSON.stringify(options.body)
+      if (!lpHasHeader(headers, 'content-type')) headers['Content-Type'] = 'application/json'
+    }
+
+    var cancelled = false
+    var timeout = Number(options.timeout) > 0 ? Number(options.timeout) : 15000
+    nativeHttp(url, method, headers, body, timeout).then(function (res) {
+      if (cancelled) return
+      var text = res.body == null ? '' : String(res.body)
+      var parsed = text
+      if (options.json !== false) { try { parsed = JSON.parse(text) } catch (e) { /* 保留原文 */ } }
+      try { callback(null, { statusCode: res.status, status: res.status, headers: {}, raw: text, body: parsed }, parsed) } catch (e) { }
+    }).catch(function (e) {
+      if (cancelled) return
+      try { callback(e, null, null) } catch (e2) { }
+    })
+    return function cancel() { cancelled = true }
+  }
+
+  function lpHasHeader(headers, name) {
+    var lower = String(name).toLowerCase()
+    for (var k in headers) if (Object.prototype.hasOwnProperty.call(headers, k) && k.toLowerCase() === lower) return true
+    return false
+  }
+
+  /* ------------------------------ 主线程降级用的 LX 宿主 ------------------------------ */
+  /**
+   * 复刻 lxworker.js 里的 globalThis.lx（协议必须逐字对齐，否则插件读不到 utils）。
+   * 只在 Worker 不可用时才走这条路 —— 插件直接跑在页面线程里，风险见 LP 顶部注释。
+   */
+  function lpMakeHost() {
+    var C = window.LXCore.crypto
+    var U = window.LXCore.util
+    var B = U.createBufferShim()
+    var handlers = {}
+    var state = { inited: null, updateAlert: null }
+    var lx = {
+      version: '2.0.0',
+      env: 'desktop',
+      EVENT_NAMES: { request: 'request', inited: 'inited', updateAlert: 'updateAlert' },
+      currentScriptInfo: null,
+      on: function (name, fn) { if (typeof fn === 'function') handlers[name] = fn },
+      send: function (name, data) {
+        if (name === 'inited') state.inited = data || null
+        else if (name === 'updateAlert') { if (!state.updateAlert) state.updateAlert = data || null }
+      },
+      request: function (url, options, cb) { return lpHttp(url, options || {}, cb) },
+      utils: {
+        buffer: {
+          from: function (v, e) { return B.from(v, e) },
+          bufToString: function (b, f) { return U.bufToString(b, f) }
+        },
+        crypto: {
+          md5: function (s) { return C.md5(typeof s === 'string' ? s : U.bufToString(s)) },
+          randomBytes: function (n) { return B.from(C.randomBytes(Number(n) || 16)) },
+          aesEncrypt: function (buf, mode, key, iv) {
+            return B.from(C.aesEncryptRaw(lpToBytes(buf), lpToBytes(key), lpNormMode(mode), iv ? lpToBytes(iv) : undefined))
+          },
+          aesDecrypt: function (buf, mode, key, iv) {
+            return B.from(C.aesDecryptRaw(lpToBytes(buf), lpToBytes(key), lpNormMode(mode), iv ? lpToBytes(iv) : undefined))
+          },
+          rsaEncrypt: function (buf, key) { return B.from(C.rsaEncryptRaw(lpToBytes(buf), U.bufToString(key, 'utf8'))) }
+        },
+        zlib: {
+          inflate: function (buf) { return U.inflateRaw(lpToBytes(buf)).then(function (o) { return B.from(o) }) },
+          deflate: function (buf) { return U.deflateRaw(lpToBytes(buf)).then(function (o) { return B.from(o) }) }
+        }
+      }
+    }
+    return { lx: lx, handlers: handlers, state: state }
+  }
+
+  /* ------------------------------ Worker 探测与启动 ------------------------------ */
+
+  /**
+   * 探一次 Blob Worker 能不能用。
+   *
+   * 为什么要「探」而不是「试着创建就算成功」：`file://` 源下有些 WebView
+   * 允许 `new Worker(blobUrl)` 返回一个对象，但脚本**根本不会被执行** ——
+   * 没有任何异常，只是永远收不到消息。所以判据是「能不能收到 ready 握手」。
+   */
+  function lpProbeWorker(cb) {
+    if (!LP.runtime || !window.LXCore.WORKER_SRC) return cb(false)
+    var url, w
+    try {
+      url = URL.createObjectURL(new Blob([window.LXCore.WORKER_SRC], { type: 'application/javascript' }))
+      w = new Worker(url)
+    } catch (e) { return cb(false) }
+    var done = false
+    var timer = setTimeout(function () { finish(false) }, 2500)
+    function finish(ok) {
+      if (done) return
+      done = true
+      clearTimeout(timer)
+      try { w.terminate() } catch (e) { }
+      try { URL.revokeObjectURL(url) } catch (e) { }
+      cb(ok)
+    }
+    w.onmessage = function (ev) {
+      var m = ev && ev.data
+      if (m && m.type === 'ready') finish(true)
+    }
+    w.onerror = function () { finish(false) }
+  }
+
+  /**
+   * 探一次「Blob Worker 能不能用」，结果缓存住，整场只探一次。
+   *
+   * ⚠ 这里以前是**写好了却没有任何调用点**：lpProbeWorker 一直在，但没人调它，
+   *   于是 LP.worker 恒为 false，所有插件都在**主线程**里求值 ——
+   *   「插件跑在独立 Worker 里、个别脚本出错只影响它自己」这条隔离等于没做。
+   *   代价是实打实的：pdone-lx 这类脚本求值时会直接杀死 JS 引擎（不抛异常、
+   *   try/catch 拦不住），隔离在的时候它只是自己加载失败，隔离没了就是整个应用白屏。
+   *   （同一类「桥写好了没接线」的问题，test/client-wiring.test.mjs 的文件头里记过一次。）
+   *
+   * 判据是「能不能收到 Worker 的 ready 握手」而不是「new Worker 有没有抛异常」：
+   * file:// 源下有些 WebView 允许创建成功但脚本根本不执行 —— 无异常、永远收不到消息。
+   */
+  var lpWorkerProbe = null   // null = 还没探过；Promise<boolean> = 探过了
+
+  function lpEnsureWorkerProbe() {
+    if (lpWorkerProbe) return lpWorkerProbe
+    lpWorkerProbe = new Promise(function (resolve) {
+      if (!LP.runtime || !window.LXCore || !window.LXCore.WORKER_SRC) return resolve(false)
+      try {
+        lpProbeWorker(function (ok) {
+          LP.worker = !!ok
+          resolve(!!ok)
+        })
+      } catch (e) {
+        LP.worker = false
+        resolve(false)
+      }
+    })
+    return lpWorkerProbe
+  }
+
+  /**
+   * 确保某插件的实例已就绪。返回 Promise<inst|null>。
+   *
+   * 状态机：idle → loading → ready / failed。
+   * `failed` 是**终态**：同一个插件加载失败过就不再反复重试 ——
+   * 每次取流都拿一个坏插件去试一遍，会让「跳下一首」变成一件很慢的事。
+   * 用户可以在设置页点「重新加载」把它清回 idle。
+   *
+   * ⚠ 必须**先等 Worker 探测出结果**再决定在哪儿求值：插件一旦在主线程求值完，
+   *   就没有「再搬到 Worker 里」这一说了，隔离性是不可逆的。
+   */
+  function lpEnsure(id, timeoutMs) {
+    return lpEnsureWorkerProbe().then(function () {
+      return lpEnsureNow(id, timeoutMs)
+    })
+  }
+
+  function lpEnsureNow(id, timeoutMs) {
+    return new Promise(function (resolve) {
+      var it = LP.inst[id]
+      if (it && it.state === 'ready') return resolve(it)
+      if (it && it.state === 'failed') return resolve(null)
+      if (it && it.state === 'loading') { it.waiters.push(resolve); return }
+      var p = lpById(id)
+      if (!p) return resolve(null)
+      it = LP.inst[id] = { state: 'loading', waiters: [resolve], plugin: p, meta: p.meta, sources: null, error: '', seq: 0, pending: {} }
+      lpStartInstance(it, timeoutMs || 12000)
+    })
+  }
+
+  function lpSettle(it, ok, error) {
+    it.state = ok ? 'ready' : 'failed'
+    if (!ok) it.error = error || '加载失败'
+    /*
+     * ⚠ 插件声明的平台必须写回**清单条目**（p.sources），不能只留在实例上（it.sources）。
+     *   候选筛选（lpCandidates）、跑分（lpScoreAll）、自动勾选（lpAutoEnableFromScores）、
+     *   列表展示（lpRow）读的全是 p.sources。
+     *   漏了这一步的表现是：插件加载**成功**、日志一切正常，但永远选不中它 ——
+     *   开关打开也永远退回服务端，跑分永远报「没有可测的组合」。不报错，只是功能没了。
+     */
+    if (ok && it.sources && it.plugin) it.plugin.sources = it.sources
+    var ws = it.waiters
+    it.waiters = []
+    for (var i = 0; i < ws.length; i++) { try { ws[i](ok ? it : null) } catch (e) { } }
+  }
+
+  function lpStartInstance(it, timeoutMs) {
+    var p = it.plugin
+    // 主线程降级时，黑名单里的插件**绝不能**求值 —— 它们会直接杀死 JS 引擎。
+    var needFallback = !LP.worker
+    if (needFallback && LP_SKIP.indexOf(p.id) >= 0) {
+      return lpSettle(it, false, '该插件会杀死 JS 引擎，仅在 Worker 可用时才能加载')
+    }
+    if (LP.worker) {
+      try {
+        lpStartWorker(it, timeoutMs)
+        return
+      } catch (e) {
+        // 创建失败就降级，别让一个插件把整条路堵死
+        LP.worker = false
+      }
+    }
+    lpStartInline(it, timeoutMs)
+  }
+
+  function lpStartWorker(it, timeoutMs) {
+    var url = URL.createObjectURL(new Blob([window.LXCore.WORKER_SRC], { type: 'application/javascript' }))
+    var w = new Worker(url)
+    it.worker = w
+    it.blobUrl = url
+    var settled = false
+    var timer = setTimeout(function () {
+      if (settled) return
+      settled = true
+      lpSettle(it, false, '插件加载超时（' + Math.round(timeoutMs / 1000) + 's）')
+    }, timeoutMs)
+
+    w.onmessage = function (ev) {
+      var m = (ev && ev.data) || {}
+      if (m.type === 'ready') return
+      if (m.type === 'loaded') {
+        if (settled) return
+        settled = true
+        clearTimeout(timer)
+        it.sources = m.sources || {}
+        it.meta = m.meta || it.meta
+        it.updateAlert = m.updateAlert || null
+        lpSettle(it, true)
+        return
+      }
+      if (m.type === 'http') { lpWorkerHttp(it, w, m); return }
+      if (m.type === 'result') { lpTakePending(it, m.id, null, m.result); return }
+      if (m.type === 'error') {
+        if (m.stage === 'load' || !settled) {
+          if (settled) return
+          settled = true
+          clearTimeout(timer)
+          lpSettle(it, false, m.error || '插件报错')
+          return
+        }
+        lpTakePending(it, m.id, new Error(m.error || '插件调用失败'), null)
+        return
+      }
+    }
+    w.onerror = function (e) {
+      if (settled) return
+      settled = true
+      clearTimeout(timer)
+      lpSettle(it, false, (e && e.message) || 'Worker 内部错误')
+    }
+    w.postMessage({ type: 'load', id: it.plugin.id, script: it.plugin.script, initTimeout: 8000 })
+  }
+
+  /** Worker 把请求转发回主线程 —— 由这里真正发出去，再把结果投回去 */
+  function lpWorkerHttp(it, w, m) {
+    lpHttp(m.url, m.options || {}, function (err, resp, body) {
+      var result
+      if (err) result = { error: (err && err.message) || String(err) }
+      else result = { status: resp.status, raw: resp.raw, body: body, headers: resp.headers || {} }
+      try { w.postMessage({ type: 'httpResponse', id: m.id, result: result }) } catch (e) { }
+    })
+  }
+
+  function lpTakePending(it, id, err, value) {
+    var e = it.pending[id]
+    if (!e) return
+    delete it.pending[id]
+    clearTimeout(e.timer)
+    if (err) e.reject(err)
+    else e.resolve(value)
+  }
+
+  /** 主线程降级：直接在页面线程里求值（风险见 LP 顶部注释） */
+  function lpStartInline(it, timeoutMs) {
+    var host = lpMakeHost()
+    it.host = host
+    var prev = window.lx
+    window.lx = host.lx
+    try {
+      var fn = new Function(String(it.plugin.script))
+      fn.call(window)
+    } catch (e) {
+      window.lx = prev
+      return lpSettle(it, false, (e && e.message) || '插件求值失败')
+    }
+    // 相当多插件的 inited 是在 Promise 链里异步发出的（典型：先拉一次源信息
+    // 再声明 sources），所以这里必须等一等，不能同步读完就判死刑。
+    var t0 = Date.now()
+    var limit = Math.min(Number(timeoutMs) || 8000, 15000)
+    ;(function tick() {
+      if (host.state.inited && host.state.inited.sources) {
+        it.sources = host.state.inited.sources
+        it.updateAlert = host.state.updateAlert || null
+        window.lx = prev
+        return lpSettle(it, true)
+      }
+      if (Date.now() - t0 >= limit) {
+        window.lx = prev
+        return lpSettle(it, false, '脚本未发送 inited 事件或未声明 sources')
+      }
+      setTimeout(tick, 50)
+    })()
+  }
+
+  /** 调用插件的一个 action。返回 Promise（resolve 结果值，reject 错误） */
+  function lpInvoke(id, source, action, info, timeoutMs) {
+    return new Promise(function (resolve, reject) {
+      var it = LP.inst[id]
+      if (!it || it.state !== 'ready') return reject(new Error('插件未就绪'))
+      var timeout = Number(timeoutMs) || 20000
+      if (it.worker) {
+        var mid = 'i' + (++it.seq)
+        it.pending[mid] = {
+          resolve: resolve, reject: reject,
+          timer: setTimeout(function () {
+            delete it.pending[mid]
+            reject(new Error('插件调用超时'))
+          }, timeout)
+        }
+        try { it.worker.postMessage({ type: 'invoke', id: mid, source: source, action: action, info: info }) }
+        catch (e) { delete it.pending[mid]; reject(e) }
+        return
+      }
+      // 主线程降级：直接调 handler
+      var handler = it.host && it.host.handlers && it.host.handlers.request
+      if (typeof handler !== 'function') return reject(new Error('插件未注册 request 处理器'))
+      var settled = false
+      var timer = setTimeout(function () { if (!settled) { settled = true; reject(new Error('插件调用超时')) } }, timeout)
+      Promise.resolve().then(function () { return handler({ source: source, action: action, info: info }) })
+        .then(function (v) { if (!settled) { settled = true; clearTimeout(timer); resolve(v) } })
+        .catch(function (e) { if (!settled) { settled = true; clearTimeout(timer); reject(e) } })
+    })
+  }
+
+  function lpStop(id) {
+    var it = LP.inst[id]
+    if (!it) return
+    try { if (it.worker) it.worker.terminate() } catch (e) { }
+    try { if (it.blobUrl) URL.revokeObjectURL(it.blobUrl) } catch (e) { }
+    delete LP.inst[id]
+  }
+
+  /** 把所有实例清掉重来（设置页的「重新加载」用） */
+  function lpReset() {
+    for (var id in LP.inst) if (Object.prototype.hasOwnProperty.call(LP.inst, id)) lpStop(id)
+    LP.inst = {}
+  }
+
+  /* ------------------------------ 候选插件与取流 ------------------------------ */
+
+  /** 某平台上有哪些**已启用**的插件支持取流 */
+  function lpCandidates(source) {
+    var out = []
+    for (var i = 0; i < LP.list.length; i++) {
+      var p = LP.list[i]
+      if (!p.enabled) continue
+      var info = p.sources && p.sources[source]
+      if (!info) continue
+      var acts = info.actions
+      if (Array.isArray(acts) && acts.indexOf('musicUrl') < 0) continue
+      out.push(p)
+    }
+    // 排序：跑分高的先 → 跑分相同（或都没分）的按清单原序。
+    // 没跑过分的排在跑过分的后面 —— 一份实测过的数据总比「不知道好不好」可信。
+    out.sort(function (a, b) {
+      var sa = a.score && typeof a.score.score === 'number' ? a.score.score : -1
+      var sb = b.score && typeof b.score.score === 'number' ? b.score.score : -1
+      if (sa !== sb) return sb - sa
+      return 0
+    })
+    return out
+  }
+
+  /**
+   * 用本地插件解析一首歌的地址。返回候选数组（形状与 /url 的 urls 一致）。
+   *
+   * 几个刻意的取舍：
+   *  · **并发**发起而不是串行 —— 串行试 4 个插件、每个最坏 20 秒，用户要干等一分多钟。
+   *  · 第一条结果到手后给 **800ms 聚合窗口**：既不为一条慢候选干等，又能把同一瞬间
+   *    就绪的其他候选一起收进来。多候选是「播一段就跳下一首」修复的前提
+   *    （见 useNextFullCandidate —— 片段要靠换同曲的下一条候选来救）。
+   *  · 只取前 4 个候选插件。22 个插件里同平台的重复源很多，全试一遍收益递减，
+   *    却会把首播拖到不可接受。
+   */
+  function lpResolve(song, opts) {
+    opts = opts || {}
+    return new Promise(function (resolve) {
+      var cands = lpCandidates(song.source)
+      if (!cands.length) return resolve([])
+      var picked = cands.slice(0, Number(opts.max) || 4)
+      var out = []
+      var left = picked.length
+      var done = false
+      var grace = 0
+      var hard = setTimeout(function () { finish() }, Number(opts.hardMs) || 15000)
+      function finish() {
+        if (done) return
+        done = true
+        if (grace) clearTimeout(grace)
+        clearTimeout(hard)
+        resolve(out)
+      }
+      function push(c) {
+        out.push(c)
+        if (!grace) grace = setTimeout(finish, 800)
+      }
+      for (var i = 0; i < picked.length; i++) {
+        (function (p, idx) {
+          Promise.resolve()
+            .then(function () { return lpEnsure(p.id, 8000) })
+            .then(function (it) {
+              if (!it) return null
+              return lpInvoke(p.id, song.source, 'musicUrl', { type: P.quality, musicInfo: song }, 20000)
+            })
+            .then(function (url) {
+              if (url && typeof url === 'string' && /^https?:\/\//.test(url)) {
+                push({ url: url, from: 'plugin:' + ((p.meta && p.meta.name) || p.name), size: 0, trial: false, rank: idx })
+              }
+            })
+            .catch(function () { /* 单个插件失败不影响其他候选 */ })
+            .then(function () { if (--left <= 0) finish() })
+        })(picked[i], i)
+      }
+    })
+  }
+
+  /**
+   * 预热：后台把**所有已启用**的插件逐个加载起来。
+   *
+   * 为什么值得做：插件加载（求值 + 拉源信息）动辄 2~5 秒，如果等用户点歌时才做，
+   * 首播就会卡这一下。开关一打开就先烘着，之后取流就是即时的。
+   * 并发压到 2 —— 同时开一堆 Worker 在低端机上会把内存顶爆（每个插件几十到几百 KB
+   * 的源码 + 解析后的 AST）。
+   *
+   * ⚠ 不能按「已启用 **且支持某平台**」来筛（曾经就是那么写的）：插件支持哪些平台
+   *   是它 inited 时才声明的，加载之前 `p.sources` 是空的 —— 拿它去筛一个都筛不出来，
+   *   预热等于没做，首播照样干等 2~5 秒。要预热就按「已启用」这一个条件。
+   */
+  function lpWarm() {
+    if (!LP.on || !LP.runtime) return
+    var uniq = []
+    var seen = {}
+    for (var i = 0; i < LP.list.length; i++) {
+      var p = LP.list[i]
+      if (!p.enabled || seen[p.id]) continue
+      seen[p.id] = 1
+      uniq.push(p.id)
+    }
+    var cursor = 0
+    function next() {
+      if (cursor >= uniq.length) return
+      var id = uniq[cursor++]
+      var it = LP.inst[id]
+      if (it && (it.state === 'ready' || it.state === 'loading' || it.state === 'failed')) return next()
+      lpEnsure(id, 10000).then(function () { next() }, function () { next() })
+    }
+    // 并发 2 条泳道
+    next()
+    next()
+  }
+
+  /**
+   * 并发受限的 map：同时最多跑 limit 个。
+   *
+   * 为什么要限：跑分要逐个把插件加载起来（每个几十到几百 KB 源码 + 解析结果），
+   * 一次性全开在低端机上会把内存顶爆；不限并发就是「功能能用但机器扛不住」。
+   * 单个任务抛错不影响其他任务（这也是跑分能继续的原因）。
+   */
+  function lpMapLimit(items, limit, fn) {
+    var cursor = 0
+    function lane() {
+      if (cursor >= items.length) return Promise.resolve()
+      var item = items[cursor++]
+      return Promise.resolve()
+        .then(function () { return fn(item) })
+        .catch(function () { })
+        .then(lane)
+    }
+    var lanes = []
+    var n = Math.max(1, Math.min(Number(limit) || 1, items.length))
+    for (var i = 0; i < n; i++) lanes.push(lane())
+    return Promise.all(lanes)
+  }
+
+  /* ------------------------------ 直链缓存 ------------------------------ */
+  /**
+   * 缓存「解析出来的地址」，而不是音频字节。
+   *
+   * ⚠ 它只是个**短期加速**：音乐源给的直链基本都带时效（几十分钟到几小时），
+   *   还大量绑 IP / UA。所以 TTL 压到 20 分钟，过期即弃 —— 缓存一个已经烂掉的
+   *   地址比不缓存更糟（表现是「点了没反应」，还看不出为什么）。
+   *   真正省流量的字节缓存是另一套，见缓存设置里的「音频缓存」。
+   */
+  var LP_URL_TTL = 20 * 60 * 1000
+  var LP_URL_MAX = 120
+
+  function lpUrlKey(song) { return song.source + ':' + song.id + ':' + P.quality }
+
+  function lpUrlCacheGet(key) {
+    if (!LP.cache.url) return null
+    var all = store.get('ym.lp.urlcache', null)
+    if (!all) return null
+    var e = all[key]
+    if (!e || !e.v || (Date.now() - (e.at || 0)) > LP_URL_TTL) return null
+    return e.v
+  }
+
+  function lpUrlCacheSet(key, v) {
+    if (!LP.cache.url || !v) return
+    var all = store.get('ym.lp.urlcache', null)
+    if (!all || typeof all !== 'object') all = {}
+    var keys = Object.keys(all)
+    if (keys.length >= LP_URL_MAX) {
+      // 简单裁剪：按时间排掉最旧的一半。不做 LRU，不值得为这点收益引入复杂度。
+      keys.sort(function (a, b) { return (all[a].at || 0) - (all[b].at || 0) })
+      for (var i = 0; i < Math.ceil(keys.length / 2); i++) delete all[keys[i]]
+    }
+    all[key] = { at: Date.now(), v: v }
+    store.set('ym.lp.urlcache', all)
+  }
+
+  function lpUrlCacheClear() { store.del('ym.lp.urlcache') }
+
+  /* ------------------------------ 音频缓存 ------------------------------ */
+  /**
+   * 缓存音频**字节本体**，而不是解析出来的地址。
+   *
+   * ── 为什么字节这一层才有意义 ──────────────────────────────────
+   * 音乐源给的直链基本都带时效（几十分钟到几小时），还大量绑 IP / UA。
+   * 缓存「地址」= 缓存了一个很快会烂掉的东西，第二次点歌照样得重新解析
+   * （所以上面那份直链缓存只留 20 分钟，它只是短期加速）。
+   * 缓存字节才是真正省流量、第二次秒开的那一份。键用「平台:id:音质」这种
+   * 不随时间变的组合。
+   *
+   * ── 为什么必须落在 Java 侧 ────────────────────────────────────
+   * 原生桥 httpFetch 回的是**文本**（Java 按 UTF-8 读成 String），拿它下音频
+   * 会把二进制读成乱码。所以由 Java 用 HttpURLConnection 落盘到 App 私有目录，
+   * JS 只拿一个路径 —— 播放时 <audio src="file:///..."> 直接用本地文件。
+   * 顺带也绕开了「file:// 页面 fetch 跨域会被拦」这个死结。
+   *
+   * ── 为什么是「整首听完才存」────────────────────────────────────
+   * 边听边存听着省事，实际做不对：<audio> 播到哪存到哪，中途切歌会留下一堆
+   * 残缺的半截文件，下次命中反而放不出来（表现是「缓存了却播不了」）。
+   * 宁可不命中，也不留半成品 —— 与网页版 public/js/audiocache.js 同口径。
+   */
+  function audioCacheSupported() {
+    return !!(window.YunBridge && window.YunBridge.audioCacheGet)
+  }
+
+  function audioCacheKey(song) { return song.source + '_' + song.id + '_' + P.quality }
+
+  /** 查本机有没有这首的缓存；有就返回本地文件 URL，没有返回 null */
+  function audioCacheGet(song) {
+    if (!LP.cache.audio || !audioCacheSupported()) return null
+    try {
+      var p = window.YunBridge.audioCacheGet(audioCacheKey(song))
+      if (!p) return null
+      p = String(p)
+      /*
+       * 原生回的是文件系统绝对路径（/data/user/0/...）。直接当 src 用，是个
+       * **根相对 URL**，只是碰巧因为「页面本身就在 file:// 源下」才解析成
+       * file:///data/... —— 太依赖运行环境了。显式补上 scheme：解析结果确定，
+       * 也不怕以后页面被挪到别的源下（比如做成在线版）。
+       */
+      if (/^[a-z][a-z0-9+.-]*:\/\//i.test(p)) return p
+      return 'file://' + (p.charAt(0) === '/' ? '' : '/') + p
+    } catch (e) { return null }
+  }
+
+  /** 让原生去下载并落盘（异步，不阻塞播放） */
+  function audioCachePut(song, url) {
+    if (!LP.cache.audio || !audioCacheSupported() || !url) return
+    if (/^file:/i.test(url)) return   // 已经是本地文件，没什么可缓的
+    try {
+      window.YunBridge.audioCachePut(audioCacheKey(song), url, LP.cache.limitMb * 1024 * 1024)
+    } catch (e) { }
+  }
+
+  function audioCacheTrim() {
+    if (!audioCacheSupported()) return
+    try { window.YunBridge.audioCacheTrim(LP.cache.limitMb * 1024 * 1024) } catch (e) { }
+  }
+
+  function audioCacheClear() {
+    return new Promise(function (resolve) {
+      if (!audioCacheSupported()) return resolve(0)
+      var done = false
+      window.__lpCacheClearCb = function (bytes) {
+        if (done) return
+        done = true
+        window.__lpCacheClearCb = null
+        LP.audioBytes = 0
+        resolve(bytes)
+      }
+      try { window.YunBridge.audioCacheClear() } catch (e) { window.__lpCacheClearCb(0) }
+      setTimeout(function () { if (window.__lpCacheClearCb) window.__lpCacheClearCb(0) }, 6000)
+    })
+  }
+
+  /** 刷新「当前占用」——只改那一个节点，绝不整页重渲染 */
+  function audioCacheRefreshStat() {
+    if (!audioCacheSupported()) return
+    try { window.YunBridge.audioCacheStat() } catch (e) { }
+  }
+
+  window.onNativeAudioCacheStat = function (d) {
+    LP.audioBytes = Number((d && d.bytes) || 0)
+    var el = $('#lpCacheSize')
+    if (el) el.textContent = LP.audioBytes ? ('当前占用 ' + fmtBytes(LP.audioBytes) + '。') : '当前还没有缓存文件。'
+  }
+
+  window.onNativeAudioCacheCleared = function (d) {
+    LP.audioBytes = 0
+    var el = $('#lpCacheSize')
+    if (el) el.textContent = '当前还没有缓存文件。'
+    if (window.__lpCacheClearCb) window.__lpCacheClearCb(Number((d && d.bytes) || 0))
+  }
+
+  /** 「我的」页那一行菜单的副标题 —— 不依赖插件数据是否已加载 */
+  function lpDesc() {
+    if (!LP.runtime) return '本机不支持 · 走服务端'
+    if (!LP.on) return '已关闭 · 走服务端解析'
+    var map = store.get(LP_KEYS.enabled, null) || {}
+    var n = 0
+    for (var k in map) if (Object.prototype.hasOwnProperty.call(map, k) && map[k]) n++
+    return n ? ('已启用 ' + n + ' 个插件 · 本机取流') : '已启用 · 尚未勾选插件'
+  }
+
+  /**
+   * 解析播放地址 —— **本地插件优先，失败自动退回服务端**。
+   *
+   * 用户明确要的行为：开关打开时优先本地，但本地全都解析不出来时不能就此哑掉，
+   * 得退回服务端兜底（否则插件一失效，用户就彻底听不了歌了）。
+   * 返回形状与 `/api/url` 对齐，这样 candidateList() 一行都不用改。
+   */
+  function resolveUrl(song) {
+    if (!song || !song.id) return Promise.reject(new Error('缺少歌曲信息'))
+    var key = lpUrlKey(song)
+    var hit = lpUrlCacheGet(key)
+    if (hit) { LP.lastFrom = hit.local ? 'local' : 'server'; return Promise.resolve(hit) }
+
+    /*
+     * 「本地到底试过没有」看的是**有没有候选可试**，不是「有没有成功」。
+     * 早先写在「解出结果」那个分支里，于是本地全军覆没时这个标记还是 false，
+     * 「已改用服务端」那句提示永远不出现 —— 用户只会觉得插件白开了。
+     * 反过来，开关开着但一个插件都没勾，那不叫「本地失败」，不该提示。
+     */
+    var localTried = !!(LP.on && LP.runtime && lpCandidates(song.source).length)
+    var local = (LP.on && LP.runtime)
+      ? lpResolve(song).then(function (cands) {
+        if (cands && cands.length) {
+          LP.stat.local++
+          lpSaveStat()
+          var r = { urls: cands, url: cands[0].url, from: cands[0].from, local: true }
+          lpUrlCacheSet(key, r)
+          return r
+        }
+        return null
+      }, function () {
+        // 插件抛异常（而不是「没解出结果」）也要退服务端，不能把整首判死
+        return null
+      })
+      : Promise.resolve(null)
+
+    return local.then(function (r) {
+      if (r) { LP.lastFrom = 'local'; return r }
+      return api('/url?id=' + encodeURIComponent(song.id) + '&q=' + P.quality + '&fast=1')
+        .then(function (r2) {
+          r2 = r2 || {}
+          r2.local = false
+          LP.stat.server++
+          lpSaveStat()
+          lpUrlCacheSet(key, r2)
+          LP.lastFrom = 'server'
+          // 本地试过但全军覆没 —— 说一声，否则用户只会觉得「插件白开了」，
+          // 不知道这次其实是服务端救回来的（设置页的统计里也能看到）。
+          if (localTried) toast('本地插件没解出地址，已改用服务端', 3200)
+          return r2
+        })
+    })
+  }
+
+  /* ------------------------------ 插件跑分 ------------------------------ */
+  /**
+   * 实测每个插件**在本机网络上**的取流表现，产出评分，并据此排候选顺序。
+   *
+   * ── 为什么必须在设备上实测，不能沿用服务端那份评分表 ──────────────
+   * 服务端的 plugin-rank.js 是在**构建机**的出口上测的。插件好不好用高度依赖
+   * 出口网络：同一个插件在构建机可能 90% 成功，在用户手机上因为 DNS 污染、
+   * 运营商互联质量差而全军覆没。拿构建机的分数来排手机上的顺序是本末倒置
+   * （网页版 public/js/native.js 里也是这么写的）。
+   *
+   * ── 评分口径 ─────────────────────────────────────────────────
+   * 取流成功率 60% + 响应速度 40%（对齐服务端口径，砍掉了「直链可播性」与
+   * 「覆盖广度」两项 —— 前者要发 Range 请求探文件头，在壳里得走原生、成本高；
+   * 后者对「本机该信谁」没有信息量）。
+   * 速度按中位数耗时算：≤1.5s 满分，≥8s 归零，中间线性。
+   *
+   * ── 为什么用「搜一首歌」而不是内置探针 id ────────────────────────
+   * 各平台的 id 形态完全不同（网易数字、酷狗 hash、QQ mid），内置一份就要跟着
+   * 平台改而失效。直接搜一首各平台都有的歌，取每个平台的第一条当探针，
+   * 既不用维护，也保证是**本机现在真能搜到**的歌。
+   */
+  var LP_PROBE_KEYWORD = '稳稳的幸福'
+
+  function lpFetchProbes() {
+    return api('/search?q=' + encodeURIComponent(LP_PROBE_KEYWORD) + '&limit=40').then(function (d) {
+      var bySource = {}
+      var list = (d && d.list) || []
+      for (var i = 0; i < list.length; i++) {
+        var s = list[i]
+        if (!s || !s.source || !s.id) continue
+        if (!bySource[s.source]) bySource[s.source] = s
+      }
+      return bySource
+    })
+  }
+
+  /** 跑一轮分。onProgress(done, total) 用于显示进度。返回 Promise<scores> */
+  function lpScoreAll(onProgress) {
+    if (LP.scoring) return Promise.reject(new Error('正在跑分，请稍候'))
+    if (!LP.runtime) return Promise.reject(new Error('插件运行时不可用'))
+    if (!LP.list.length) return Promise.reject(new Error('插件清单是空的'))
+    LP.scoring = true
+    var t0 = Date.now()
+
+    return lpFetchProbes().then(function (probes) {
+      var sources = Object.keys(probes)
+      if (!sources.length) throw new Error('拿不到探针歌曲（先确认线路能搜到歌）')
+
+      /*
+       * ⚠ 必须先**把插件加载一遍**，才能枚举出任务表。
+       *
+       * 插件支持哪些平台，是它在 inited 事件里声明的（落在 p.sources 上）；
+       * 加载之前 p.sources 是空的 —— 直接拿它去枚举会得到一张**空任务表**，
+       * 跑分永远以「没有可测的组合」告终，而每个插件看起来都「没问题」。
+       * 加载本身也正是跑分要测的东西：加载不起来的插件就是不可用。
+       * 并发压到 4（见 lpMapLimit）：每个插件几十到几百 KB 源码，全开会把低端机内存顶爆。
+       */
+      return lpMapLimit(LP.list, 4, function (p) {
+        return lpEnsure(p.id, 10000).then(function () { }, function () { })
+      }).then(function () {
+        // 任务 = 插件 × 它声明支持的探针平台
+        var tasks = []
+        for (var i = 0; i < LP.list.length; i++) {
+          var p = LP.list[i]
+          for (var j = 0; j < sources.length; j++) {
+            var src = sources[j]
+            var info = p.sources && p.sources[src]
+            if (!info) continue
+            var acts = info.actions
+            if (Array.isArray(acts) && acts.indexOf('musicUrl') < 0) continue
+            tasks.push({ p: p, source: src, song: probes[src] })
+          }
+        }
+        if (!tasks.length) throw new Error('没有可测的组合（插件都没声明支持这些平台）')
+
+        var acc = {}
+        for (var k = 0; k < LP.list.length; k++) acc[LP.list[k].id] = { ok: 0, total: 0, times: [] }
+        var total = tasks.length
+        var finished = 0
+
+        return lpMapLimit(tasks, 4, function (t) {
+          var started = Date.now()
+          var rec = acc[t.p.id]
+          rec.total++
+          return Promise.resolve()
+            .then(function () { return lpInvoke(t.p.id, t.source, 'musicUrl', { type: P.quality, musicInfo: t.song }, 20000) })
+            .then(function (url) {
+              if (url && typeof url === 'string' && /^https?:\/\//.test(url)) {
+                rec.ok++
+                rec.times.push(Date.now() - started)
+              }
+            })
+            .catch(function () { /* 失败也是一份数据 */ })
+            .then(function () {
+              finished++
+              if (onProgress) { try { onProgress(finished, total) } catch (e) { } }
+            })
+        }).then(function () { return lpFinalizeScores(acc, t0) })
+      })
+    }).then(function (s) {
+      LP.scoring = false
+      return s
+    }, function (e) {
+      LP.scoring = false
+      throw e
+    })
+  }
+
+  function lpFinalizeScores(acc, t0) {
+    var byId = {}
+    var ids = Object.keys(acc)
+    for (var i = 0; i < ids.length; i++) {
+      var r = acc[ids[i]]
+      var rate = r.total ? (r.ok / r.total) : 0
+      var ms = 0
+      if (r.times.length) {
+        var sorted = r.times.slice().sort(function (a, b) { return a - b })
+        ms = sorted[Math.floor(sorted.length / 2)]   // 中位数：比均值抗「一个超时把整体拉垮」
+      }
+      var speed = 0
+      if (r.ok > 0) {
+        if (ms <= 1500) speed = 1
+        else if (ms >= 8000) speed = 0
+        else speed = (8000 - ms) / 6500
+      }
+      byId[ids[i]] = {
+        score: Math.round((rate * 0.6 + speed * 0.4) * 100),
+        ok: r.ok, total: r.total, ms: ms, rate: Math.round(rate * 100)
+      }
+    }
+    var s = { at: Date.now(), cost: Date.now() - t0, byId: byId }
+    LP.scores = s
+    store.set(LP_KEYS.scores, s)
+    lpBuildList()
+    return s
+  }
+
+  /**
+   * 跑完分后**自动勾选**每个平台上评分最高的 1~2 个插件。
+   *
+   * 为什么需要：22 个插件默认全关（全开会把取流拖慢），但让用户自己去 22 行里
+   * 挑出「哪两个能用」也不现实。跑分正是为了回答这个问题，那就顺手替他把勾打上。
+   * 只勾前两名 —— 再多就是同一平台的重复源，收益递减而失败面翻倍。
+   */
+  function lpAutoEnableFromScores() {
+    if (!LP.scores || !LP.scores.byId) return []
+    var sources = ['wy', 'kg', 'tx', 'kw', 'mg']
+    var turned = []
+    for (var i = 0; i < sources.length; i++) {
+      var src = sources[i]
+      var cands = []
+      for (var j = 0; j < LP.list.length; j++) {
+        var p = LP.list[j]
+        if (!p.sources || !p.sources[src]) continue
+        var sc = LP.scores.byId[p.id]
+        if (!sc || !sc.ok) continue
+        cands.push({ p: p, s: sc.score })
+      }
+      cands.sort(function (a, b) { return b.s - a.s })
+      var take = Math.min(2, cands.length)
+      for (var k = 0; k < take; k++) {
+        if (!cands[k].p.enabled) {
+          lpSetEnabled(cands[k].p.id, true)
+          turned.push(cands[k].p.name)
+        }
+      }
+    }
+    return turned
+  }
+
   /* ------------------------------ 服务器配置 ------------------------------ */
   /**
    * 前端兜底配置 —— **只放地址，不放账号密码**。
@@ -1316,6 +2497,9 @@ em{font-style:normal}
     // 以前只用 r.url 一条，一条不通就整首判失败跳下一首 —— 表现就是「跳歌」。
     cands: [],
     candIndex: -1,
+    // 这一串候选是**本地插件**给的还是服务端给的（见 resolveUrl）。
+    // 只用于界面标注与排查，不参与任何播放决策。
+    candsLocal: false,
     // 这一首是否已经退到过服务端代理流（每首只退一次，避免来回横跳）
     triedProxy: false,
     // ---- 试听片段（见 warnIfSnippet / useNextFullCandidate）----
@@ -1527,6 +2711,7 @@ em{font-style:normal}
     // 新的一首：候选列表、代理兜底标记、看门狗宽限次数全部重置
     P.cands = []
     P.candIndex = -1
+    P.candsLocal = false
     P.triedProxy = false
     P.watchWaits = 0
     P.watchHits = 0        // 每一首都有自己的两次抢救额度
@@ -1540,12 +2725,30 @@ em{font-style:normal}
     // errStreak 只在「真实进度」或「用户主动选歌」时清零，见 timeupdate / playSong。
     P.progressMark = 0
 
-    api('/url?id=' + encodeURIComponent(song.id) + '&q=' + P.quality + '&fast=1')
+    /*
+     * 音频缓存命中：直接放本地文件，整条解析链路（本地插件 + 服务端）全部跳过。
+     * 这才是「缓存」真正的价值 —— 第二次听同一首完全不联网。
+     * 放在 resolveUrl 之前，因为它比任何解析路径都快。
+     */
+    var cached = audioCacheGet(song)
+    if (cached) {
+      P.cands = [{ url: cached, from: 'cache', size: 0, trial: false, rank: 0 }]
+      P.candIndex = -1
+      P.candsLocal = false
+      useCandidate(0, autoplay)
+      loadLyric(song, myToken)
+      pushHistory(song)
+      return
+    }
+
+    // 本地插件优先、服务端兜底 —— 具体顺序与降级都在 resolveUrl 里（见其注释）
+    resolveUrl(song)
       .then(function (r) {
         if (myToken !== P.loadToken) return
         var list = candidateList(r, song)
         if (!list.length) throw new Error('无可用播放地址')
         P.cands = list
+        P.candsLocal = r.local === true
         useCandidate(0, autoplay)
       })
       .catch(function (e) {
@@ -2780,6 +3983,7 @@ em{font-style:normal}
     '/mine': pageMine,
     '/settings': pageSettings,
     '/about': pageAbout,
+    '/plugins': pagePlugins,
     '/downloads': pageDownloads
   }
 
@@ -3957,6 +5161,7 @@ em{font-style:normal}
       '<div class="groupTitle">系统</div>' +
       '<div class="settingsgroup">' +
         menuItem('cloud', '双线路管理', cfg.activeName || '切换服务器节点', '#/settings') +
+        menuItem('plugin', '插件与音源', lpDesc(), '#/plugins') +
         menuItem('info', '关于云音乐', CLIENT_VERSION + ' · 纯净双远端架构', '#/about') +
       '</div>'
 
@@ -3974,6 +5179,7 @@ em{font-style:normal}
       history: '<path d="M3 12a9 9 0 1 0 9-9 9.7 9.7 0 0 0-6.7 2.7L3 8"/><path d="M3 3v5h5"/><path d="M12 7.4v5l3.2 1.9"/>',
       download: '<path d="M12 4v11"/><path d="M7.6 10.6L12 15l4.4-4.4"/><path d="M5 19h14"/>',
       cloud: '<path d="M7 18h10a3.5 3.5 0 0 0 .4-7A5 5 0 0 0 7.6 9.6A4.2 4.2 0 0 0 7 18z"/>',
+      plugin: '<path d="M10 4v3.5"/><path d="M14 4v3.5"/><rect x="6" y="7.5" width="12" height="9.5" rx="2"/><path d="M12 17v3"/>',
       info: '<circle cx="12" cy="12" r="9"/><path d="M12 11v6M12 7.6v.8"/>'
     }
     return '<a class="menu-item" href="' + href + '">' +
@@ -4279,6 +5485,379 @@ em{font-style:normal}
   }
 
   /* ============================ 头部 / 返回 ============================ */
+  /* ============================ 插件与音源 ============================ */
+  /*
+   * 一页把「本地插件」这件事的开关、实测、清单、导入、缓存全收齐。
+   *
+   * 为什么统计和跑分要放在最上面：用户打开这一页，第一件想知道的事是
+   * 「本地插件到底在不在干活」。把「本地 N 次 / 服务端 M 次」摆在第一屏，
+   * 比让他去猜「我刚才是走的哪条路」有用得多。
+   */
+  function pagePlugins(r, myToken) {
+    view.innerHTML = pageHeadHtml('插件与音源') + '<div class="block" id="lpBody"></div>'
+    bindBack()
+    lpRenderBody()
+    audioCacheRefreshStat()
+    // 插件数据是懒加载的（约 760KB），进这一页才拉
+    loadPluginData(function (err) {
+      if (myToken !== routeToken) return
+      if (err) {
+        var b = $('#lpBody')
+        if (b) b.innerHTML = '<div class="note">插件数据加载失败：' + esc(err.message) + '<br>确认 assets/web/plugins.data.js 随包打进去了。</div>'
+        return
+      }
+      lpBuildList()
+      lpRenderBody()
+    })
+  }
+
+  function lpRenderBody() {
+    var b = $('#lpBody')
+    if (!b) return
+    b.innerHTML = lpSwitchCard() + lpStatCard() + lpScoreCard() +
+      lpListCard() + lpImportCard() + lpCacheCard() +
+      '<div class="note" style="padding:6px 2px 28px">' +
+      '插件运行在独立的 Worker 里 —— 个别第三方脚本出错只会影响它自己，不会让应用崩溃。' +
+      '</div>'
+    lpBindBody()
+  }
+
+  function lpSwitchCard() {
+    var ok = LP.runtime
+    var desc
+    if (!ok) {
+      desc = '<span style="color:var(--brand)">本机 WebView 版本过低（不支持 BigInt），本地插件不可用。' +
+        '服务端取流不受影响，功能照常。</span>'
+    } else if (LP.on) {
+      desc = '已启用：优先用<b>本机</b>插件解析地址，全都失败时自动退回服务端兜底。'
+    } else {
+      desc = '已关闭：一律走服务端解析。打开后插件在本机运行，取流不经过远端。'
+    }
+    return '<div class="card-block" style="margin-bottom:12px">' +
+      '<div class="card-block__head">' +
+      '<div class="card-block__name">本地插件取流</div>' +
+      '<label class="switch"><input type="checkbox" id="lpOn"' + (LP.on ? ' checked' : '') + (ok ? '' : ' disabled') + '><i></i></label>' +
+      '</div>' +
+      '<div class="card-block__desc">' + desc + '</div>' +
+      '</div>'
+  }
+
+  function lpStatCard() {
+    var total = LP.stat.local + LP.stat.server
+    var pct = total ? Math.round(LP.stat.local / total * 100) : 0
+    /*
+     * 插件「在哪儿求值」对用户是可见的差别，必须写出来：
+     *   Worker 里 → 个别插件脚本出错只影响它自己；
+     *   主线程里（老 WebView 没有 Blob Worker）→ 一个坏插件能把整个应用带走。
+     * 不写的话，用户只会觉得「开了插件怎么变卡/闪退」，猜不到是隔离降级了。
+     */
+    var mode = !LP.runtime ? '本机不支持（WebView 版本过低）'
+      : (LP.worker ? '独立 Worker · 插件出错不影响应用'
+        : (lpWorkerProbe ? '主线程降级 · 老 WebView 没有 Blob Worker' : '待检测（开始取流后自动探测）'))
+    return '<div class="card-block" style="margin-bottom:12px">' +
+      '<div class="card-block__head"><div class="card-block__name">取流统计</div>' +
+      '<span class="pill">安装以来</span></div>' +
+      '<div class="card-block__desc">本地插件 ' + LP.stat.local + ' 次 · 服务端 ' + LP.stat.server + ' 次' +
+      (total ? '（本地占 ' + pct + '%）' : '（还没取过流）') + '</div>' +
+      '<div class="card-block__desc" id="lpRuntimeMode">运行方式：' + mode + '</div>' +
+      '</div>'
+  }
+
+  function lpScoreCard() {
+    var s = LP.scores
+    var desc
+    if (LP.scoring) {
+      desc = '正在实测各插件在本机的取流表现…不阻塞听歌，可以先去别处。'
+    } else if (!s) {
+      desc = '还没跑过分。评分是<b>在本机上实测</b>出来的 —— 插件好不好用取决于你这条网络，别人测的分数参考价值有限。'
+    } else {
+      var when = new Date(s.at)
+      var n = 0
+      for (var k in s.byId) if (Object.prototype.hasOwnProperty.call(s.byId, k)) n++
+      desc = '上次跑分：' + (when.getMonth() + 1) + '月' + when.getDate() + '日 ' +
+        pad2(when.getHours()) + ':' + pad2(when.getMinutes()) +
+        '，用时 ' + Math.round((s.cost || 0) / 1000) + ' 秒，覆盖 ' + n + ' 个插件。'
+    }
+    return '<div class="card-block" style="margin-bottom:12px">' +
+      '<div class="card-block__head"><div class="card-block__name">插件评分</div>' +
+      (s ? '<span class="pill pill--brand">已有结果</span>' : '<span class="pill">未跑分</span>') + '</div>' +
+      '<div class="card-block__desc" id="lpScoreDesc">' + desc + '</div>' +
+      '<button class="btn btn--ghost btn--block" id="lpScoreBtn" style="margin-top:10px"' + (LP.scoring ? ' disabled' : '') + '>' +
+      (LP.scoring ? '正在跑分…' : (s ? '重新跑分' : '开始跑分')) + '</button>' +
+      '</div>'
+  }
+
+  function pad2(n) { return (n < 10 ? '0' : '') + n }
+
+  function lpListCard() {
+    var list = LP.list
+    if (!list.length) {
+      return '<div class="groupTitle" style="padding:14px 4px 8px">插件</div>' +
+        '<div class="note" style="padding:0 2px 12px">插件清单是空的 —— 数据文件可能没随包打进去。</div>'
+    }
+    var on = 0
+    var rows = ''
+    for (var i = 0; i < list.length; i++) {
+      if (list[i].enabled) on++
+      rows += lpRow(list[i])
+    }
+    return '<div class="groupTitle" style="padding:14px 4px 8px">插件（' + on + '/' + list.length + ' 已启用）</div>' +
+      '<div id="lpList">' + rows + '</div>'
+  }
+
+  function lpRow(p) {
+    var sc = p.score
+    var pill
+    if (sc) {
+      var cls = !sc.ok ? 'pill--bad' : (sc.score >= 60 ? 'pill--ok' : 'pill--warn')
+      pill = '<span class="pill ' + cls + '">' + (sc.ok ? (sc.score + ' 分') : '不可用') + '</span>'
+    } else {
+      pill = '<span class="pill">未测</span>'
+    }
+    var srcs = p.sources ? Object.keys(p.sources) : []
+    var meta = 'v' + esc(p.meta.version) + ' · ' + esc(p.meta.author)
+    if (srcs.length) meta += ' · ' + esc(srcs.join(','))
+    meta += ' · ' + Math.round((p.bytes || 0) / 1024) + 'KB'
+    if (p.origin === 'user') meta += ' · 已导入'
+    var it = LP.inst[p.id]
+    if (it && it.state === 'failed') meta += '<br><span style="color:var(--brand)">' + esc(it.error) + '</span>'
+    else if (it && it.state === 'ready') meta += ' · 已就绪'
+    else if (it && it.state === 'loading') meta += ' · 加载中…'
+    if (sc && sc.total) meta += '<br>实测 ' + sc.ok + '/' + sc.total + ' 次成功' + (sc.ms ? '，中位 ' + (sc.ms / 1000).toFixed(1) + 's' : '')
+
+    return '<div class="card-block" style="margin-bottom:8px">' +
+      '<div class="card-block__head">' +
+      '<div class="card-block__name">' + esc(p.name) + '</div>' + pill +
+      '<label class="switch"><input type="checkbox" data-lpen="' + esc(p.id) + '"' + (p.enabled ? ' checked' : '') + '><i></i></label>' +
+      '</div>' +
+      '<div class="card-block__desc">' + meta + '</div>' +
+      (p.origin === 'user'
+        ? '<button class="btn btn--sm btn--ghost" data-lpdel="' + esc(p.id) + '" style="margin-top:8px">删除</button>'
+        : '') +
+      '</div>'
+  }
+
+  function lpImportCard() {
+    return '<div class="groupTitle" style="padding:14px 4px 8px">导入插件</div>' +
+      '<div class="card-block" style="margin-bottom:12px">' +
+      '<div class="field"><div class="field__label">插件地址（http / https 直链）</div>' +
+      '<input class="input" id="lpUrl" placeholder="https://.../latest.js"></div>' +
+      '<button class="btn btn--ghost btn--block" id="lpImportUrl">从地址导入</button>' +
+      '<div class="field" style="margin-top:14px"><div class="field__label">或直接粘贴插件脚本</div>' +
+      '<textarea class="textarea" id="lpText" rows="4" placeholder="把 .js 文件内容粘到这里"></textarea></div>' +
+      '<button class="btn btn--ghost btn--block" id="lpImportText">从文本导入</button>' +
+      '<button class="btn btn--ghost btn--block" id="lpImportFile" style="margin-top:8px">从手机文件选择</button>' +
+      '<div class="note" style="margin-top:10px">导入的插件只保存在本机，不会上传到任何地方。</div>' +
+      '</div>'
+  }
+
+  function lpCacheCard() {
+    var size = LP.audioBytes || 0
+    return '<div class="groupTitle" style="padding:14px 4px 8px">缓存</div>' +
+      '<div class="card-block" style="margin-bottom:12px">' +
+      '<div class="card-block__head"><div class="card-block__name">直链缓存</div>' +
+      '<label class="switch"><input type="checkbox" id="lpCacheUrl"' + (LP.cache.url ? ' checked' : '') + '><i></i></label></div>' +
+      '<div class="card-block__desc">记住「解析出来的播放地址」，20 分钟内重复点同一首歌不用再解析。地址本身有时效，所以只留 20 分钟。</div>' +
+      '</div>' +
+      '<div class="card-block" style="margin-bottom:12px">' +
+      '<div class="card-block__head"><div class="card-block__name">音频缓存</div>' +
+      '<label class="switch"><input type="checkbox" id="lpCacheAudio"' + (LP.cache.audio ? ' checked' : '') + '><i></i></label></div>' +
+      '<div class="card-block__desc">整首听完后把音频存到本机，下次听同一首不必再联网取流。' +
+      '<br><span id="lpCacheSize">' + (size ? ('当前占用 ' + fmtBytes(size) + '。') : '当前还没有缓存文件。') + '</span></div>' +
+      '<div class="field" style="margin-top:12px"><div class="field__label">容量上限</div>' +
+      '<div class="chips" style="padding:0">' + [200, 500, 1000, 2000].map(function (m) {
+        return '<span class="chip' + (LP.cache.limitMb === m ? ' is-active' : '') + '" data-lplimit="' + m + '">' +
+          (m >= 1000 ? (m / 1000) + ' GB' : m + ' MB') + '</span>'
+      }).join('') + '</div></div>' +
+      '<button class="btn btn--ghost btn--block" id="lpCacheClear" style="margin-top:10px">清空音频缓存</button>' +
+      '</div>'
+  }
+
+  function lpBindBody() {
+    var onEl = $('#lpOn')
+    if (onEl) onEl.addEventListener('change', function () {
+      var want = this.checked
+      if (want && !lpSetOn(true)) { this.checked = false; return }
+      if (!want) lpSetOn(false)
+      lpRenderBody()
+    })
+
+    var sb = $('#lpScoreBtn')
+    if (sb) sb.addEventListener('click', lpRunScoreUI)
+
+    $$('[data-lpen]').forEach(function (c) {
+      c.addEventListener('change', function () {
+        lpSetEnabled(c.getAttribute('data-lpen'), c.checked)
+        if (c.checked && LP.on) lpEnsure(c.getAttribute('data-lpen'), 12000)
+        lpRenderBody()
+      })
+    })
+    $$('[data-lpdel]').forEach(function (c) {
+      c.addEventListener('click', function () {
+        lpRemove(c.getAttribute('data-lpdel'))
+        toast('已删除该插件')
+        lpRenderBody()
+      })
+    })
+    $$('[data-lplimit]').forEach(function (c) {
+      c.addEventListener('click', function () {
+        LP.cache.limitMb = Number(c.getAttribute('data-lplimit')) || 500
+        lpSaveCache()
+        lpRenderBody()
+        audioCacheTrim()
+      })
+    })
+
+    var cu = $('#lpCacheUrl')
+    if (cu) cu.addEventListener('change', function () {
+      LP.cache.url = this.checked
+      lpSaveCache()
+      if (!this.checked) lpUrlCacheClear()
+      toast(this.checked ? '已开启直链缓存' : '已关闭直链缓存，并清掉已有记录')
+    })
+    var ca = $('#lpCacheAudio')
+    if (ca) ca.addEventListener('change', function () {
+      LP.cache.audio = this.checked
+      lpSaveCache()
+      toast(this.checked ? '已开启音频缓存' : '已关闭音频缓存')
+    })
+    var cc = $('#lpCacheClear')
+    if (cc) cc.addEventListener('click', function () {
+      audioCacheClear().then(function (n) {
+        toast(n ? ('已清空 ' + fmtBytes(n) + ' 音频缓存') : '缓存本来就是空的')
+        lpRenderBody()
+      })
+    })
+
+    var iu = $('#lpImportUrl')
+    if (iu) iu.addEventListener('click', lpImportFromUrlUI)
+    var it2 = $('#lpImportText')
+    if (it2) it2.addEventListener('click', lpImportFromTextUI)
+    var ifl = $('#lpImportFile')
+    if (ifl) ifl.addEventListener('click', lpImportFromFileUI)
+  }
+
+  function lpSetOn(on) {
+    if (on && !LP.runtime) { toast('本机 WebView 版本过低，本地插件不可用'); return false }
+    LP.on = !!on
+    store.set(LP_KEYS.on, LP.on)
+    if (!LP.on) { lpReset(); toast('已关闭本地插件，全部走服务端'); return true }
+    loadPluginData(function (err) {
+      if (err) { toast('插件数据加载失败：' + err.message); return }
+      lpBuildList()
+      lpWarm()
+      if (!LP.scores) {
+        // 第一次启用：自动跑一轮分，再按实测结果替用户勾上能用的那几个。
+        // 不跑的话 22 个插件全是「未测」，用户根本不知道该开哪个。
+        toast('首次启用，正在后台实测各插件…', 3200)
+        lpScoreAll(function (done, total) {
+          var d = $('#lpScoreDesc')
+          if (d) d.innerHTML = '正在实测… ' + done + '/' + total
+        }).then(function () {
+          var turned = lpAutoEnableFromScores()
+          if (pageNowIs('/plugins')) lpRenderBody()
+          toast(turned.length ? ('跑分完成，已自动启用 ' + turned.length + ' 个插件') : '跑分完成，但没有可用的插件', 3600)
+          lpWarm()
+        }).catch(function (e) {
+          if (pageNowIs('/plugins')) lpRenderBody()
+          toast('自动跑分失败：' + e.message, 3600)
+        })
+      } else {
+        lpWarm()
+        if (pageNowIs('/plugins')) lpRenderBody()
+      }
+    })
+    return true
+  }
+
+  function pageNowIs(path) {
+    try { return parseHash().path === path } catch (e) { return false }
+  }
+
+  function lpRunScoreUI() {
+    if (!LP.runtime) return toast('插件运行时不可用')
+    if (LP.scoring) return
+    toast('开始跑分，会在后台实测各插件…', 2600)
+    lpRenderBody()
+    lpScoreAll(function (done, total) {
+      var d = $('#lpScoreDesc')
+      if (d) d.innerHTML = '正在实测… ' + done + '/' + total
+    }).then(function () {
+      var turned = lpAutoEnableFromScores()
+      lpRenderBody()
+      toast(turned.length ? ('跑分完成，已自动启用 ' + turned.length + ' 个插件') : '跑分完成', 3400)
+      lpWarm()
+    }).catch(function (e) {
+      lpRenderBody()
+      toast('跑分失败：' + e.message, 3600)
+    })
+  }
+
+  /* ------------------------------ 导入 ------------------------------ */
+
+  function lpAfterImport(res, srcLabel) {
+    toast(res.replaced ? '已更新同名插件' : ('已导入「' + res.meta.name + '」' + (srcLabel || '')))
+    if (LP.on) lpEnsure(res.id, 12000)
+    lpRenderBody()
+  }
+
+  function lpImportFromUrlUI() {
+    var el = $('#lpUrl')
+    var url = el ? String(el.value || '').trim() : ''
+    if (!/^https?:\/\//i.test(url)) return toast('请填一个 http/https 开头的地址')
+    toast('正在下载插件…')
+    // 走原生桥：file:// 源下直接 fetch 跨域会被拦，而且不少插件站要 UA
+    nativeHttp(url, 'GET', { 'User-Agent': 'Mozilla/5.0' }, null, 30000).then(function (res) {
+      if (res.status < 200 || res.status >= 300) throw new Error('HTTP ' + res.status)
+      var text = String(res.body || '')
+      if (text.length < 200) throw new Error('下载到的内容太短，可能不是插件脚本')
+      var r = lpImport(text, url)
+      lpAfterImport(r, '（来自地址）')
+    }).catch(function (e) {
+      toast('导入失败：' + e.message, 3400)
+    })
+  }
+
+  function lpImportFromTextUI() {
+    var el = $('#lpText')
+    var text = el ? String(el.value || '') : ''
+    try {
+      var r = lpImport(text, '')
+      if (el) el.value = ''
+      lpAfterImport(r, '（来自文本）')
+    } catch (e) {
+      toast('导入失败：' + e.message, 3400)
+    }
+  }
+
+  /**
+   * 从手机文件里选插件。
+   *
+   * 为什么不让 JS 自己读：file:// 页面拿不到用户选的文件的路径（<input type=file>
+   * 给的 File 对象读得到内容，但壳里这个入口不好用，且大脚本走 WebView 的
+   * JS 桥会超长）。所以交给原生：Java 侧用 ACTION_OPEN_DOCUMENT 选完直接读文本，
+   * 再回调 window.onNativePluginFile({name, content})。
+   */
+  function lpImportFromFileUI() {
+    if (!(window.YunBridge && window.YunBridge.pickPluginFile)) {
+      return toast('当前版本不支持从文件选择，可改用粘贴文本')
+    }
+    try { window.YunBridge.pickPluginFile() } catch (e) { toast('打开文件选择器失败：' + e.message) }
+  }
+
+  window.onNativePluginFile = function (data) {
+    if (!data) return
+    if (data.error) return toast('读取文件失败：' + data.error, 3400)
+    var content = String(data.content || '')
+    if (!content) return toast('文件是空的')
+    try {
+      var r = lpImport(content, '', data.name || '')
+      lpAfterImport(r, '（来自文件 ' + (data.name || '') + '）')
+    } catch (e) {
+      toast('导入失败：' + e.message, 3400)
+    }
+  }
+
   function pageHeadHtml(title, extra) {
     return '<div class="pagehead">' +
       '<button class="icon-btn" data-back aria-label="返回"><svg viewBox="0 0 24 24"><path d="M15 5l-7 7 7 7"/></svg></button>' +
@@ -4497,6 +6076,13 @@ em{font-style:normal}
     clearPlayWatch()
     warnIfSnippet()
     if (P.snippet && useNextFullCandidate()) return
+    /*
+     * 真的听完了 —— 这时候才把音频交给缓存（见 audioCachePut 顶部「为什么是
+     * 整首听完才存」）。中途切歌不存：半个文件留在缓存里，下次命中反而放不出来。
+     */
+    var doneSong = currentSong()
+    var doneCand = P.cands[P.candIndex]
+    if (doneSong && doneCand) audioCachePut(doneSong, doneCand.url)
     playNext()
   })
   audio.addEventListener('error', function () {
@@ -4598,6 +6184,10 @@ em{font-style:normal}
   /* ============================ 启动 ============================ */
   function boot() {
     readNativeConfig()
+    // 本地插件：先把开关状态读回来（纯本地读，不联网）。
+    // 插件数据（约 760KB）与预热**故意延后** —— 首屏不能被它拖住，
+    // 而且用户多半也不会一进来就听歌。
+    lpRestore()
     $('#qualityLabel').textContent = P.quality
     $('#modeIcon').innerHTML = MODE_PATH[P.mode]
     updateLyricCal()
@@ -4617,6 +6207,16 @@ em{font-style:normal}
     api('/favorites').then(function (d) {
       (d.list || []).forEach(function (s) { P.favorites[s.id] = true })
     }).catch(function () {})
+    // 上次开着本地插件 → 后台把插件数据拉起来并预热，等用户点歌时就不用等加载了
+    if (LP.on && LP.runtime) {
+      setTimeout(function () {
+        loadPluginData(function (err) {
+          if (err) return
+          lpBuildList()
+          lpWarm()
+        })
+      }, 1200)
+    }
   }
 
   if (document.readyState === 'loading') document.addEventListener('DOMContentLoaded', boot)

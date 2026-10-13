@@ -1,8 +1,8 @@
 <?xml version="1.0" encoding="utf-8"?>
 <manifest xmlns:android="http://schemas.android.com/apk/res/android"
     package="com.yunmusic.app"
-    android:versionCode="310"
-    android:versionName="V2.11">
+    android:versionCode="320"
+    android:versionName="V2.12">
 
     <!--
       ⚠ 这两个声明不能省。
