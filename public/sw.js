@@ -43,7 +43,7 @@
  *      provider 原生取流接口。bundle 由内置客户端直接加载，且 Web 端会通过 SWR 缓存；
  *      抬高 VERSION 以清除旧缓存，确保本地客户端和网页端尽快运行新策略。
  */
-const VERSION = 'v45'
+const VERSION = 'v46'
 const STATIC_CACHE = 'lxmusic-static-' + VERSION
 const SHELL_CACHE = 'lxmusic-shell-' + VERSION
 

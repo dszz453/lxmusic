@@ -5,7 +5,7 @@
  * 本项目有**两条版本线**，以前一直混着用一个数字：
  *
  *   · 服务端版本（src/version.js 的 APP_VERSION）—— CF Worker / Docker 那一侧，
- *     描述「接口与后端行为」到了第几版。当前 V2.9。
+ *     描述「接口与后端行为」到了第几版。当前 V2.10。
  *   · 客户端版本（本文件）—— 安卓客户端（原生宿主 + 跨端层）自身，
  *     描述「这个 App 装的是哪一版」。从 V1.0 起算。
  *
@@ -54,7 +54,7 @@ export const CLIENT_PACKAGE = 'com.zyplnn.lxclient'
 export const CLIENT_APP_NAME = 'LX-MUSIC'
 
 /** 该客户端按哪一版服务端设计（对接 src/version.js 的 APP_VERSION） */
-export const SERVICE_VERSION = 'V2.9'
+export const SERVICE_VERSION = 'V2.10'
 
 /**
  * 构建标识：Dockerfile / CI 传 commit sha，本地直接构建就是 'dev'。

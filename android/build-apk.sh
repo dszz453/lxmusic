@@ -37,6 +37,10 @@ W() { cygpath -w "$1"; }                          # MSYS 路径 → Windows 路�
 LIST_WIN() { find "$@" | while read -r f; do cygpath -w "$f"; done; }
 
 APP_NAME="music-edge"
+# 2.10：修「酷狗/QQ 的歌播不出来」—— http 直链不再按域名白名单丢弃。
+#      升级为「一律乐观升级 https，探不通再退回原 http（仅安卓壳）」：
+#      实测酷狗《黄昏》13 个候选里只有 3 条 http://*.bdycdn.cn/... 真能出声，
+#      而 bdycdn.cn 不在旧白名单里（kugou.com 只出现在路径中）→ 全被丢弃 → /url 404。
 # 2.9：所有播放取流只调用 musicUrl 插件，不再回退平台 provider 官方直连接口。
 #      播放候选覆盖本源、跨源、fast URL、已验证 URL、代理流与 Subsonic；无插件时明确报错。
 #      回归测试用替身 provider 取流方法做负向对照，确保 native URL 取流调用数为 0。

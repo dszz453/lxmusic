@@ -292,18 +292,20 @@
   let snippetWarned = false
 
   /**
-   * 客户端侧的 http→https 升级（与服务端 stream.js 的白名单保持一致）。
-   * 插件源给的地址常是 http，在 https 页面会被浏览器拦成混合内容。
+   * 客户端侧的 http→https 升级 —— **与服务端 stream.js 的 upgradeToHttps 同一口径**：
+   * 一律乐观升级，不设域名白名单。
+   *
+   * 为什么不再用白名单：插件源给的地址常常是 http，而白名单只认官方 CDN 域名，
+   * 于是酷狗 `http://*.bdycdn.cn/...`、QQ `http://175.27.166.236/...` 这类
+   * **第三方中转**被漏掉 —— 而它们往往正是该平台**唯一能出声**的那几条
+   * （实测酷狗《黄昏》13 个候选里只有 3 条 bdycdn 的 http 链真能出声）。
+   * 升级失败也无妨：下面的 isPlayable 在网页里只认 https，升级后探不通就自然
+   * 落到下一级；安卓壳里 LX_ALLOW_HTTP_AUDIO 为真，http 原链照样放行。
    */
-  const UPGRADE_HOSTS = [/\.music\.126\.net$/i, /\.kuwo\.cn$/i, /\.kugou\.com$/i,
-    /\.kglink\.cn$/i, /\.qqmusic\.qq\.com$/i, /\.music\.qq\.com$/i]
   function upgradeHttps(url) {
     const raw = String(url || '')
     if (!/^http:\/\//i.test(raw)) return raw
-    try {
-      const host = new URL(raw).hostname
-      return UPGRADE_HOSTS.some(re => re.test(host)) ? raw.replace(/^http:/i, 'https:') : raw
-    } catch { return raw }
+    return raw.replace(/^http:/i, 'https:')
   }
 
   /**

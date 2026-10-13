@@ -274,16 +274,6 @@ export async function resolvePlayableUrl(song, quality, pluginPool, { maxProbe =
  *      0.17MB，正常 320k 完整曲约 8MB）。直接取第一个候选容易一开就断。
  * ------------------------------------------------------------------ */
 
-/** 同时支持 http / https 的源站白名单。只升级这些，避免把不支持 https 的源改坏 */
-const HTTPS_UPGRADE_HOSTS = [
-  /\.music\.126\.net$/i,   // 网易云 CDN（m701/m702/m802…）
-  /\.kuwo\.cn$/i,          // 酷我
-  /\.kugou\.com$/i,        // 酷狗
-  /\.kglink\.cn$/i,        // 酷狗直链
-  /\.qqmusic\.qq\.com$/i,  // QQ 音乐
-  /\.music\.qq\.com$/i,
-]
-
 /** 插件候选 URL 的已知 CDN 域名分类：只用于评估插件返回的地址，不会调用平台取流 API。 */
 const OFFICIAL_HOSTS = [/\.music\.126\.net$/i, /\.kuwo\.cn$/i, /\.kugou\.com$/i,
   /\.kglink\.cn$/i, /\.qqmusic\.qq\.com$/i, /\.music\.qq\.com$/i]
@@ -295,13 +285,25 @@ const OFFICIAL_HOSTS = [/\.music\.126\.net$/i, /\.kuwo\.cn$/i, /\.kugou\.com$/i,
  */
 const WEAK_HOSTS = [/^music\.163\.com$/i]
 
+/**
+ * 把插件给的 http 直链**乐观升级**成 https。
+ *
+ * ⚠ 这里曾经只升一份域名白名单（网易 / 酷我 / 酷狗 / QQ 的**官方** CDN 域名）。
+ *   后果是**白名单外的域名被整批丢弃**，而且丢的往往正是该平台**唯一能出声**的那几条：
+ *   实测酷狗《黄昏》的 13 个候选里，只有 3 条 `http://*.bdycdn.cn/...`（第三方 CDN，
+ *   路径里才含 kugou.com、域名本身不是 kugou.com）真能出声，其余不是超时就是
+ *   源站回 `{"code":201,"msg":"error"}`。三条全不在白名单里 → 被丢弃 → `/url`
+ *   直接 404 → 只能退到服务端代理（音源标识显示「服务端」）。用户看到的就是
+ *   「网易的歌能放，酷狗的歌放不出来」。同一批里 QQ 那条 `http://175.27.166.236/...`
+ *   也是纯 http 的 IP 中转，同样被丢。
+ *
+ * 现在**一律升级**，能不能真用交给后面的 Range 探测判定 —— 探不通时会**退回原 http 链**
+ * （见下方 flow 里候选 URL 形态的处理），所以「升级」不再是一个会丢候选的破坏性动作。
+ */
 export function upgradeToHttps(url) {
   const raw = String(url || '')
   if (!/^http:\/\//i.test(raw)) return raw
-  try {
-    const host = new URL(raw).hostname
-    return HTTPS_UPGRADE_HOSTS.some((re) => re.test(host)) ? raw.replace(/^http:/i, 'https:') : raw
-  } catch { return raw }
+  return raw.replace(/^http:/i, 'https:')
 }
 
 function hostMatches(url, list) {
@@ -498,23 +500,36 @@ export async function resolveMusicUrlFast(song, quality, pluginPool, options = {
     let r = null
     try { r = await withDeadline(t(), deadline) } catch { return }
     if (!r || !r.url) return
-    // http 在 https 页面会被浏览器当混合内容拦掉，先升级协议再判定。
-    // 例外：安卓壳允许 http 音频（见 http.js 的 allowHttpAudio），
-    // 这时若还把「http 直链」丢掉，就等于白白扔掉一批本来能直连的源 ——
-    // 实测就是这一条把 fast 路径打成 404 的（候选全是 http，全被丢弃）。
-    const url = upgradeToHttps(r.url)
-    if (!/^https:\/\//i.test(url) && !(allowHttpAudio() && /^http:\/\//i.test(url))) {
-      tried.push(`${r.from}(仅 http，无法直连)`)
+
+    /**
+     * 这条候选**可以尝试的 URL 形态**，按优先级排列。
+     *
+     * 插件源给的直链大量是 http，而 http 在 https 页面里会被浏览器当混合内容拦掉，
+     * 所以先试升级后的 https。但**不能只认 https**：有些中转源（如 QQ 的
+     * `http://175.27.166.236/...`）是纯 http 的 IP，升 https 必失败 ——
+     * 这时若本机允许 http 音频（安卓壳，见 http.js 的 allowHttpAudio）就退回原链，
+     * 绝不因为「升级失败」白丢一条本来能播的候选。
+     *
+     * ⚠ 升级本身是**乐观**的（upgradeToHttps 现在一律升）：能不能真用由下面的
+     * Range 探测判定。曾经只升一份域名白名单，导致酷狗 `*.bdycdn.cn` 那批
+     * **唯一能出声**的 http 候选被整批丢弃、`/url` 打成 404（详见 upgradeToHttps 注释）。
+     */
+    const urls = []
+    const up = upgradeToHttps(r.url)
+    if (up !== r.url) urls.push(up)                                      // ① 升级后的 https
+    if (/^https:\/\//i.test(r.url) || allowHttpAudio()) urls.push(r.url) // ② 原链（仅 http 宿主需要）
+    const fresh = urls.filter(u => !seen.has(u))
+    if (!fresh.length) {
+      if (!urls.length) tried.push(`${r.from}(仅 http，无法直连)`)
       return
     }
-    if (seen.has(url)) return
-    seen.add(url)
+    for (const u of fresh) seen.add(u)
 
     const rec = {
-      url,
+      url: fresh[0],
       from: r.from,
-      official: hostMatches(url, OFFICIAL_HOSTS),
-      weak: hostMatches(url, WEAK_HOSTS),
+      official: false,
+      weak: false,
       trial: r.trial === true,            // 源自己标的「这是试听片段」（见 wy.js 的 freeTrialInfo）
       size: 0,
       /**
@@ -536,8 +551,17 @@ export async function resolveMusicUrlFast(song, quality, pluginPool, options = {
       rank,
     }
     cands.push(rec)                       // 先入列：哪怕探测没赶上预算也要能返回
-    const p = await withDeadline(probeAudioBytes(url), probeDeadline)
-    Object.assign(rec, p)
+    // 逐个形态探：先 https，探不通再退原 http（仅当它在 urls 里）。
+    // 取**第一个探通**的形态；全都不通就保留最后一次的探测结果（ok=false）。
+    let p = null
+    for (const u of fresh) {
+      p = await withDeadline(probeAudioBytes(u), probeDeadline)
+      if (p.ok) { rec.url = u; break }
+    }
+    Object.assign(rec, p || { ok: false, size: 0, status: 0 })
+    // official / weak 用**最终选中的那个形态**判定（升级前后域名相同，但保持口径一致）
+    rec.official = hostMatches(rec.url, OFFICIAL_HOSTS)
+    rec.weak = hostMatches(rec.url, WEAK_HOSTS)
     /**
      * 探测拿到体积之后**补齐** trial 标记。
      *
