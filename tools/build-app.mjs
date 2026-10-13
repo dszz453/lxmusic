@@ -205,9 +205,13 @@ function emitPluginData() {
     console.warn(`[build-app] 跳过插件数据：${path.relative(ROOT, PLUGIN_JS)} 不存在（先跑 node build.mjs）`)
     return null
   }
-  let skip = []
+  // 崩溃插件的排除规则必须可复现，不能只依赖被 .gitignore 忽略的本机 probe 配置。
+  let skip = ['pdone-sixyin']
   if (fs.existsSync(BLACKLIST)) {
-    try { skip = JSON.parse(fs.readFileSync(BLACKLIST, 'utf8')).skip || [] } catch { /* 读坏就不过滤 */ }
+    try {
+      const configured = JSON.parse(fs.readFileSync(BLACKLIST, 'utf8')).skip || []
+      skip = Array.from(new Set(skip.concat(configured)))
+    } catch { /* 读坏就保留内置排除项 */ }
   }
   const src = fs.readFileSync(PLUGIN_JS, 'utf8')
   // generated/plugins.js 的结构是固定的：每项一个对象字面量，字段顺序 id/name/url/script

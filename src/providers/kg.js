@@ -3,7 +3,7 @@
  * 搜索：songsearch.kugou.com/song_search_v2（实测 CF 出口 200，无需签名）
  * 歌单：mobiles.kugou.com/api/v5/special/song（实测可用）
  * 歌词/封面：kugou 公开接口
- * 取流：原生兜底接口（优先走落雪插件）
+ * 取流：provider 原生接口仅作为 legacy API 保留；播放链路只通过 musicUrl 插件取流。
  */
 import { request, UA_PC } from '../lib/http.js'
 import { decodeName, formatSingerName, splitSingers, safeInt } from '../lib/util.js'

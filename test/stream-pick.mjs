@@ -9,8 +9,9 @@
  *   用户看到的现象就是「同一首歌换个音质，长度就变了」。
  *
  *   修法是在探通第一条之后再等一个 450ms 的收敛窗口，把同期探通的候选收齐，
- *   按「官方直链 → 体积大 → 非弱源」挑。本脚本用一个假的 outbound fetch
- *   把「先探通的是片段、后探通的是完整版」这个时序精确造出来，验挑选结果。
+ *   按「已知弱域名 → 试听标记 → 插件返回地址的域名特征 → 体积/插件评分」挑。
+ *   域名分类只评估插件返回的 URL，不会调用 provider 官方取流接口。本脚本用假的
+ *   outbound fetch 把「先探通的是片段、后探通的是完整版」这个时序精确造出来。
  *
  * 用法：node test/stream-pick.mjs
  */
@@ -298,9 +299,17 @@ check('wy.js 用 freeTrialInfo 标记试听片段',
   '出现 ' + ((wySrc.match(/if \(item\.freeTrialInfo\) return \{ url: item\.url, trial: true, from: 'native' \}/g) || []).length) + ' 处（v1 与老接口各一）')
 check('wy.js 的 outer/url 最终兜底也标 trial（实测 302→/404，VIP 歌只给片段）',
   /return \{ url: `https:\/\/music\.163\.com\/song\/media\/outer\/url\?id=\$\{id\}\.mp3`, trial: true, from: 'native' \}/.test(wySrc))
-check('providers/index.js 支持 getMusicUrl 返回对象并透传 trial', /trial: r\.trial === true/.test(idxSrc))
-check('providers/index.js 仍兼容字符串返回（别的 provider 没改，别弄坏它们）',
-  /if \(typeof r === 'string'\) return \{ url: r, from: 'native' \}/.test(idxSrc))
+const idxCode = deComment(idxSrc)
+const candidateBuilder = (idxCode.match(/export function musicUrlCandidateList\([\s\S]*?\n\}/) || [''])[0]
+check('providers/index.js 播放候选构造只枚举 musicUrl 插件',
+  /musicUrlPlugins\(song\.source, 'musicUrl'\)/.test(candidateBuilder)
+  && /invokePlugin\(plugin, song\.source, 'musicUrl'/.test(candidateBuilder))
+check('播放候选构造不调用 provider 原生取流方法',
+  !!candidateBuilder && !/getMusicUrlCandidates?\s*\(/.test(candidateBuilder)
+  && !/PROVIDERS\[/.test(candidateBuilder))
+check('候选构造中无插件时为空，不从 provider 生成原生取流候选',
+  /return out\s*\n\}/.test(candidateBuilder)
+  && !/getMusicUrlCandidates?\s*\(/.test(candidateBuilder))
 
 console.log('\n===== stream-pick：' + pass + ' 通过 / ' + fail + ' 失败 =====')
 if (failures.length) console.log('失败项：\n  - ' + failures.join('\n  - '))

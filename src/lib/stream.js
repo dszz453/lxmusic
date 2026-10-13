@@ -1,14 +1,13 @@
 /**
  * 统一的「逐个候选取流」逻辑
  *
- * 为什么需要它：聚合类音源里总有个别源失效（接口挂了 / 被风控 / 返回的是
- * 一个 HTML 错误页）。如果只认第一个返回地址的源，就会出现「A 源挂了 → 整首歌
- * 播不了」，即使后面还有 4 个源可用。
+ * 播放地址只来自 musicUrl 插件：平台 provider 可继续提供搜索、榜单等元数据，
+ * 但此处绝不调用平台官方 getMusicUrl / getMusicUrlCandidates 直连接口。
  *
- * 于是这里改成三级兜底：
- *   1) 本平台的所有插件 + 原生接口，逐个真拉一次，拿到音频字节才认；
- *   2) 全部失败时，跨平台搜同名歌曲（用户的诉求是「听到这首歌」，不是「必须来自酷狗」）；
- *   3) 仍失败才报错，并把每个候选的失败原因一并返回，便于排查。
+ * 取流策略：
+ *   1) 本平台已启用的插件逐个真拉，拿到音频字节才认；
+ *   2) 全部失败时，可跨平台搜索同名歌曲，但备用歌曲仍只调用其 musicUrl 插件；
+ *   3) 仍失败就明确报错，不回退官方 provider 直连。
  */
 import { musicUrlCandidateList, searchOnline, ALL_SOURCES, SOURCE_META } from '../providers/index.js'
 import { audioMime, guessAudioFormat, decodeName } from './util.js'
@@ -181,10 +180,8 @@ export async function openAudioStream(song, quality, pluginPool, opts = {}) {
     }
   }
 
-  result = await tryCandidates(
-    musicUrlCandidateList(song, quality, pluginPool).slice(0, maxCandidates),
-    song, errors, seen, opts
-  )
+  const pluginThunks = musicUrlCandidateList(song, quality, pluginPool).slice(0, maxCandidates)
+  result = await tryCandidates(pluginThunks, song, errors, seen, opts)
   if (result) return result
 
   return await crossSourceFallback(song, quality, pluginPool, opts, errors, seen)
@@ -192,12 +189,19 @@ export async function openAudioStream(song, quality, pluginPool, opts = {}) {
 
 /** 本平台全挂 → 跨平台搜同名歌曲（用户的诉求是「听到这首歌」，不是「必须来自酷狗」） */
 async function crossSourceFallback(song, quality, pluginPool, opts, errors, seen) {
-  if (opts.allowCrossSource === false) return null
+  if (opts.allowCrossSource === false) {
+    return {
+      ok: false,
+      errors,
+      error: errors.length
+        ? `所有取流插件均无法播放（试了 ${errors.length} 个）：${errors.slice(0, 3).join('；')}`
+        : '当前歌曲来源没有启用取流插件',
+    }
+  }
   const alts = await crossSourceSongs(song, opts.crossSourceLimit || 2)
   for (const alt of alts) {
-    const r = await tryCandidates(
-      musicUrlCandidateList(alt, quality, pluginPool).slice(0, 4), alt, errors, seen, opts
-    )
+    const pluginThunks = musicUrlCandidateList(alt, quality, pluginPool).slice(0, 4)
+    const r = await tryCandidates(pluginThunks, alt, errors, seen, opts)
     if (r) {
       const srcName = (SOURCE_META[alt.source] && SOURCE_META[alt.source].name) || alt.source
       r.from = `跨源(${srcName}) ${r.from}`
@@ -209,8 +213,8 @@ async function crossSourceFallback(song, quality, pluginPool, opts, errors, seen
     ok: false,
     errors,
     error: errors.length
-      ? `所有音源均无法播放（试了 ${errors.length} 个）：${errors.slice(0, 3).join('；')}`
-      : '该歌曲暂无可用音源，请更换关键字或音源插件',
+      ? `所有取流插件均无法播放（试了 ${errors.length} 个）：${errors.slice(0, 3).join('；')}`
+      : '当前歌曲及备用结果均没有可用的取流插件地址，请检查已启用的插件',
   }
 }
 
@@ -237,6 +241,9 @@ export async function probeAudioUrl(url) {
 export async function resolvePlayableUrl(song, quality, pluginPool, { maxProbe = 4 } = {}) {
   const thunks = musicUrlCandidateList(song, quality, pluginPool).slice(0, maxProbe)
   const tried = []
+  if (!thunks.length) {
+    return { url: null, from: null, tried, error: '当前歌曲来源没有启用取流插件' }
+  }
   for (const thunk of thunks) {
     let cand = null
     try { cand = await thunk() } catch { continue }
@@ -244,14 +251,14 @@ export async function resolvePlayableUrl(song, quality, pluginPool, { maxProbe =
     tried.push(cand.from)
     if (await probeAudioUrl(cand.url)) return { url: cand.url, from: cand.from, tried }
   }
-  // 全都探测失败时，仍把第一个能解析出的地址给出去（客户端也许能放）
+  // 全都探测失败时，仍把第一个插件返回的地址给出去（客户端也许能放）
   for (const thunk of thunks) {
     try {
       const cand = await thunk()
       if (cand && cand.url) return { url: cand.url, from: cand.from, tried, unverified: true }
     } catch { /* ignore */ }
   }
-  return { url: null, from: null, tried }
+  return { url: null, from: null, tried, error: '所有取流插件均未返回可用地址' }
 }
 
 /* ------------------------------------------------------------------ *
@@ -277,7 +284,7 @@ const HTTPS_UPGRADE_HOSTS = [
   /\.music\.qq\.com$/i,
 ]
 
-/** 官方 CDN：同一份字节少一跳，且探测得到 content-range（第三方中转往往不返回，体积算不出来） */
+/** 插件候选 URL 的已知 CDN 域名分类：只用于评估插件返回的地址，不会调用平台取流 API。 */
 const OFFICIAL_HOSTS = [/\.music\.126\.net$/i, /\.kuwo\.cn$/i, /\.kugou\.com$/i,
   /\.kglink\.cn$/i, /\.qqmusic\.qq\.com$/i, /\.music\.qq\.com$/i]
 
@@ -335,26 +342,28 @@ async function probeAudioBytes(url) {
  *
  * 返回：
  *   { urls: [{url, from, size}], url, from, tried, unverified }
- *   urls 已按「体积降序（完整版优先）、原生优先」排好，客户端按序降级即可。
- *   全部探测失败时不返回空，而是兜底给出第一个 https 候选（unverified），
- *   让客户端自己试 —— 宁可多一次尝试，也不要直接判定「无音源」。
+ *   urls 由插件取流候选组成，并按「体积、来源健康度与插件评分序」交给客户端降级。
+ *   全部探测失败时不返回空，而是兜底给出第一个插件返回的 https 候选（unverified），
+ *   让客户端自己试 —— 不会转而调用 provider 的官方直连接口。
  */
 export async function resolveMusicUrlFast(song, quality, pluginPool, options = {}) {
   // 宿主默认预算（网页紧、壳内宽），调用方传入的 options 优先 —— 见 http.js 的 resolveBudget
   const {
     maxTries = 12, deadline = 1600, probeDeadline = 1200, totalBudget = 1800,
   } = { ...resolveBudget(), ...options }
-  // 原生优先：官方 CDN 直链比第三方插件中转稳（实测插件源 music-dl.sayqz.com 常年 530）。
-  //
-  // maxTries 的取值有讲究：原生接口会占掉固定几个槽位（酷狗一次摊成 3 个直链槽），
-  // 槽位空的时候也照样占名额。实测截断到 6 会把后面的插件候选挤掉，
-  // 导致「明明有 5 个 wy 插件，只试了 3 个」。
-  //
-  // 放到 12 是为了配合「插件实测评分排序表」：池子里现在有十几个可用插件，
-  // 只取 8 个的话排在第 9 位之后的等于白装。这里是**并行**解析 + totalBudget 兜底，
-  // 多给几个槽位只增加并发数，不增加等待时间（到点就带着已解析的候选返回）。
-  const thunks = musicUrlCandidateList(song, quality, pluginPool, { prefer: 'native' }).slice(0, maxTries)
+  // 候选只来自 musicUrl 插件；按插件池的评分序并行解析，不调用 provider 官方取流接口。
+  // 放到 12 是为了不让前面的空槽位挤掉评分靠后的插件；并行解析 + totalBudget
+  // 只增加并发数，不增加等待时间（到点就带着已解析出的插件候选返回）。
+  const thunks = musicUrlCandidateList(song, quality, pluginPool).slice(0, maxTries)
   const tried = []
+  if (!thunks.length) {
+    return {
+      urls: [], url: null, from: null,
+      tried: ['当前歌曲来源没有启用 musicUrl 取流插件'],
+      error: '当前歌曲来源没有启用取流插件',
+      unverified: true,
+    }
+  }
   const cands = []           // 解析出来的候选，按到达顺序；可能还没探完
   const seen = new Set()
 
@@ -402,9 +411,9 @@ export async function resolveMusicUrlFast(song, quality, pluginPool, options = {
    * ⚠ 2026-10-10 补了一个洞：上面这套「等 450ms 收齐再挑」有个前提 ——
    * **先探通的那条得是个正常候选**。可它是一个**试听片段**时照样会开表，
    * 450ms 一到就收工；插件那条几 MB 的完整版只晚一步到，就永远没机会看一眼。
-   * 老板报的「播放中进度条只有 30 秒、音源显示 native · 直连」正是这个：
-   * 网易官方那条（eapi 的 freeTrialInfo={start:0,end:30}，470KB）先探通，
-   * 官方的 26.9MB 完整版由插件给出、晚到一步，被窗口关在门外。
+   * 曾有平台接口返回 30 秒试听片段、而插件返回完整版本晚到一步的情况。
+   * 现行播放链已禁用 provider 原生取流；这里的判据仅处理插件候选，包括
+   * 网易插件透传的 freeTrialInfo 标记，以及探测到的音频体积。
    * 所以现在首条若是**可判定为片段**的候选，窗口直接放到总预算（见 armSettle）。
    */
   const SETTLE_MS = 450
@@ -464,8 +473,8 @@ export async function resolveMusicUrlFast(song, quality, pluginPool, options = {
    * 同一份文件里两个sort 顺序不一致 ⇒ 走哪条路径结果不同 ⇒ 极难复现的偶发。
    *
    * 档位与 compareCandidates 逐条对齐：
-   *   ① weak 最后   ② trial（试听片段）最后   ③ official 优先
-   *   ④ 体积大优先   ⑤ native 优先
+   *   ① weak 域名最后   ② trial（试听片段）最后   ③ 已知 CDN 域名特征优先
+   *   ④ 体积大优先   ⑤ 插件评分序优先
    * 两边改一处就要改另一处；test/stream-pick.mjs 有一条一致性断言盯着它们。
    *
    * ⚠ trial 这一档为什么要**排在体积之前**：30 秒的**无损**片段可能有 5MB，
@@ -481,7 +490,7 @@ export async function resolveMusicUrlFast(song, quality, pluginPool, options = {
       const as = a.size || 0
       const bs = b.size || 0
       if (as !== bs) return bs - as               // 体积大 = 完整版
-      return (b.native ? 1 : 0) - (a.native ? 1 : 0)
+      return (Number.isFinite(a.rank) ? a.rank : Infinity) - (Number.isFinite(b.rank) ? b.rank : Infinity)
     })[0]
   }
 
@@ -504,7 +513,6 @@ export async function resolveMusicUrlFast(song, quality, pluginPool, options = {
     const rec = {
       url,
       from: r.from,
-      native: r.from === 'native',
       official: hostMatches(url, OFFICIAL_HOSTS),
       weak: hostMatches(url, WEAK_HOSTS),
       trial: r.trial === true,            // 源自己标的「这是试听片段」（见 wy.js 的 freeTrialInfo）
@@ -513,8 +521,7 @@ export async function resolveMusicUrlFast(song, quality, pluginPool, options = {
        * 这条候选在服务端**偏好序**里的位次（0 = 服务端最想用的那条）。
        *
        * 就是 thunks 的下标，而 thunks 的顺序正是 `musicUrlCandidateList()` 给的：
-       * 默认「插件按实测评分降序、原生兜底」，`prefer:'native'` 时前面先放 3 个
-       * 原生槽位（见 providers/index.js，以及 plugins.js 的 setRank(PLUGIN_RANK)）。
+       * 只包含插件，并按插件池实测评分降序（见 providers/index.js 与 plugins.js 的 setRank）。
        * 也就是说 **rank 里已经含着「哪个插件评分高」这个信息**。
        *
        * 为什么必须显式带给客户端：下面返回的 `ordered` 是
@@ -607,7 +614,8 @@ export async function resolveMusicUrlFast(song, quality, pluginPool, options = {
       urls: [],
       url: null,
       from: null,
-      tried: [...tried, `${thunks.length} 个候选在 ${deadline}ms 内均未解析出地址（多数是源站慢或不可达）`],
+      tried: [...tried, `${thunks.length} 个插件候选在 ${deadline}ms 内均未返回播放地址`],
+      error: '取流插件未返回可用播放地址',
       unverified: true,
     }
   }
@@ -631,9 +639,9 @@ export async function resolveMusicUrlFast(song, quality, pluginPool, options = {
  * 候选排序（依次比较，先满足者胜出）：
  *   ① 已知死接口排最后 —— 网易 outer/url 实测 302 到 /404，放前面纯属白等；
  *   ② **已知试听片段排最后** —— 30 秒的无损片段可能有 5MB，按体积排会把它选出来；
- *   ③ 官方 CDN 优先 —— 同字节少一跳，且能返回 content-range 算得出体积；
+ *   ③ 已知 CDN 域名特征优先 —— 仅比较插件返回地址的域名，并非 provider 官方直连；
  *   ④ 体积大优先 —— 完整版，酷我 n1 试听片段只有 0.17MB；
- *   ⑤ 原生优先。
+ *   ⑤ 插件评分序优先（rank 小者先）。
  *
  * ⚠ 必须与上面的 pickBest 同档位同顺序，改一处就要改另一处。
  */
@@ -642,5 +650,5 @@ function compareCandidates(a, b) {
   if (!!a.trial !== !!b.trial) return a.trial ? 1 : -1
   if (!!a.official !== !!b.official) return a.official ? -1 : 1
   if ((b.size || 0) !== (a.size || 0)) return (b.size || 0) - (a.size || 0)
-  return (b.native ? 1 : 0) - (a.native ? 1 : 0)
+  return (Number.isFinite(a.rank) ? a.rank : Infinity) - (Number.isFinite(b.rank) ? b.rank : Infinity)
 }

@@ -1,6 +1,6 @@
 /**
  * 多平台聚合层：统一搜索 / 取流 / 歌词 / 封面 / 歌单导入
- * 取流优先级：落雪插件 > 平台原生接口
+ * 播放取流只通过落雪 musicUrl 插件；provider 原生接口仅保留给非播放元数据/兼容功能。
  */
 import kg from './kg.js'
 import wy from './wy.js'
@@ -232,73 +232,30 @@ function interleave(groups) {
 }
 
 /**
- * 播放地址「候选流」：插件按声明顺序排列，原生接口兜底。
- * 返回一串惰性 thunk —— 调用方可以逐个尝试，直到拿到真正能播的地址。
- * 这是「保覆盖」的关键：单个插件源失效不应导致整首歌播不了。
+ * 播放地址「候选流」：只调用已启用并声明 musicUrl 的插件。
+ * 平台 provider 仍负责搜索、榜单等元数据，但播放取流不再调用 provider 的官方直连接口。
+ * 返回一串惰性 thunk —— 调用方可以逐个尝试插件，直到拿到真正能播的地址。
  *
  * @returns {Array<() => Promise<{url:string, from:string}|null>>}
  */
-export function musicUrlCandidateList(song, quality = '320k', pluginPool = null, opts = {}) {
+export function musicUrlCandidateList(song, quality = '320k', pluginPool = null) {
   if (!song || !song.source) return []
 
-  const pluginThunks = () => {
-    const out = []
-    if (pluginPool && typeof pluginPool.musicUrlPlugins === 'function') {
-      for (const plugin of pluginPool.musicUrlPlugins(song.source, 'musicUrl')) {
-        out.push(async () => {
-          const r = await pluginPool.invokePlugin(plugin, song.source, 'musicUrl', { type: quality, musicInfo: song })
-          return r.ok ? { url: r.value, from: `plugin:${r.plugin}` } : null
-        })
-      }
-    } else if (pluginPool && pluginPool.supports(song.source, 'musicUrl')) {
+  const out = []
+  if (pluginPool && typeof pluginPool.musicUrlPlugins === 'function') {
+    for (const plugin of pluginPool.musicUrlPlugins(song.source, 'musicUrl')) {
       out.push(async () => {
-        const res = await pluginPool.invoke(song.source, 'musicUrl', { type: quality, musicInfo: song })
-        return res.value ? { url: res.value, from: `plugin:${res.plugin}` } : null
+        const r = await pluginPool.invokePlugin(plugin, song.source, 'musicUrl', { type: quality, musicInfo: song })
+        return r.ok ? { url: r.value, from: `plugin:${r.plugin}` } : null
       })
     }
-    return out
+  } else if (pluginPool && typeof pluginPool.supports === 'function' && pluginPool.supports(song.source, 'musicUrl')) {
+    out.push(async () => {
+      const res = await pluginPool.invoke(song.source, 'musicUrl', { type: quality, musicInfo: song })
+      return res.value ? { url: res.value, from: `plugin:${res.plugin}` } : null
+    })
   }
-
-  const nativeThunks = () => {
-    const out = []
-    const provider = PROVIDERS[song.source]
-    if (provider && typeof provider.getMusicUrlCandidates === 'function') {
-      // 原生接口本身可能返回多条直链（如酷狗），一次调用摊成多个候选槽位
-      let cache = null
-      const load = async () => {
-        if (cache === null) {
-          cache = await provider.getMusicUrlCandidates(song, quality).catch(() => [])
-        }
-        return cache
-      }
-      for (let i = 0; i < 3; i++) {
-        out.push(async () => {
-          const list = await load()
-          return list[i] ? { url: list[i], from: 'native' } : null
-        })
-      }
-    } else if (provider && typeof provider.getMusicUrl === 'function') {
-      out.push(async () => {
-        try {
-          const r = await provider.getMusicUrl(song, quality)
-          if (!r) return null
-          // 兼容两种返回：字符串（只有地址）或 { url, from?, trial? }。
-          // trial 是「这条只是试听片段」的**源侧声明**（网易 eapi 的 freeTrialInfo）——
-          // 声明时长未知时，它是唯一能判定片段的依据，必须原样带上去给 stream.js。
-          if (typeof r === 'string') return { url: r, from: 'native' }
-          return { url: r.url, from: r.from || 'native', trial: r.trial === true }
-        } catch { return null }
-      })
-    }
-    return out
-  }
-
-  // 默认插件优先（服务端代理播放沿用的既有顺序）；
-  // prefer='native' 时原生优先 —— 官方 CDN 直链比第三方插件中转稳，
-  // 浏览器直连播放走这条路（实测第三方插件源 music-dl.sayqz.com 常年 530）。
-  return opts.prefer === 'native'
-    ? nativeThunks().concat(pluginThunks())
-    : pluginThunks().concat(nativeThunks())
+  return out
 }
 
 /**
@@ -308,11 +265,12 @@ export function musicUrlCandidateList(song, quality = '320k', pluginPool = null,
 export async function resolveMusicUrl(song, quality = '320k', pluginPool = null) {
   if (!song || !song.source) return { url: null, from: 'none', errors: ['无效歌曲'] }
   const thunks = musicUrlCandidateList(song, quality, pluginPool)
+  if (!thunks.length) return { url: null, from: 'none', errors: ['当前歌曲来源没有启用取流插件'] }
   for (const thunk of thunks) {
     const cand = await thunk()
     if (cand && cand.url) return { url: cand.url, from: cand.from, errors: [] }
   }
-  return { url: null, from: 'none', errors: ['所有音源均未返回可用地址'] }
+  return { url: null, from: 'none', errors: ['所有取流插件均未返回可用地址'] }
 }
 
 /**

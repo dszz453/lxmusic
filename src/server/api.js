@@ -1117,7 +1117,7 @@ export async function handleApi(request, env, url) {
       const r = fast
         ? await resolveMusicUrlFast(song, quality, env.PLUGIN_POOL)
         : await resolvePlayableUrl(song, quality, env.PLUGIN_POOL)
-      if (!r.url) return json({ ok: false, error: '无可用播放地址', errors: r.tried }, 404)
+      if (!r.url) return json({ ok: false, error: r.error || '无可用播放地址', errors: r.tried }, 404)
       return json({ ok: true, url: r.url, urls: r.urls || null, from: r.from, verified: !r.unverified, tried: r.tried })
     }
 

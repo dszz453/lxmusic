@@ -38,8 +38,12 @@
  *        （星号加斜杠），把 v43 的说明变成了裸代码 —— 整个 sw.js 语法错误、
  *        Service Worker 根本注册不上（自 2.6 起，2026-10-10 才发现）。
  *        护栏：test/home-cache.test.mjs 里用 node --check 校验本文件可被解析。
+ *
+ * v45：`js/backend.bundle.js` 的所有播放取流改为仅调用 `musicUrl` 插件，不再回退到
+ *      provider 原生取流接口。bundle 由内置客户端直接加载，且 Web 端会通过 SWR 缓存；
+ *      抬高 VERSION 以清除旧缓存，确保本地客户端和网页端尽快运行新策略。
  */
-const VERSION = 'v44'
+const VERSION = 'v45'
 const STATIC_CACHE = 'lxmusic-static-' + VERSION
 const SHELL_CACHE = 'lxmusic-shell-' + VERSION
 

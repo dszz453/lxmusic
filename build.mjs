@@ -185,7 +185,7 @@ async function main() {
   }
 
   if (!results.length) {
-    console.warn('[build] 未获取到任何插件，将生成空插件列表（服务端取流会走原生兜底）')
+    console.warn('[build] 未获取到任何插件，将生成空插件列表（播放取流将明确失败，不会调用 provider 原生接口）')
   }
 
   const totalBytes = results.reduce((a, r) => a + r.size, 0)
