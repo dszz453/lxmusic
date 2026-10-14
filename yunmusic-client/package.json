@@ -1,6 +1,6 @@
 {
   "name": "yunmusic-client",
-  "version": "2.17.0",
+  "version": "2.18.0",
   "private": true,
   "description": "云音乐安卓客户端。APK 由 build.sh 出（不经过 npm），这里的 package.json 只服务于 test/smoke.js 的前端自测。",
   "scripts": {
