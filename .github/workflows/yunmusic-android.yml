@@ -1,34 +1,43 @@
 name: yunmusic-android
 
-# 云音乐安卓客户端（yunmusic-client/）的出包链路。
+# 云音乐客户端（client/，包名 com.yunmusic.app）的出包链路。
 #
-# ⚠ 为什么放在**仓库根**的 .github/workflows/ 而不是 yunmusic-client/.github/：
-#    GitHub Actions 只扫描仓库根那一层，子目录里的 workflow 文件会被完全忽略
-#    （不报错，就是不跑 —— 排查起来很费时间）。所以这里必须放根目录，
-#    再用 working-directory / paths 把作用域收回到 yunmusic-client。
+# ── V2.20 起这个客户端「参照 web 端重新开发」────────────────────
+# 前端不再手写，改成**整包复用 public/**：assets/www 是构建时从 public/ 拷进去的，
+# 只多一个客户端专属的 js/client-layer.js（跨端层，源码在 client/rn/src/）。
+# 所以**改 public/ 就等于改客户端界面** —— paths 里必须同时盯着 public/，
+# 否则「只改了前端、没碰客户端目录」的提交不会触发这里，CI 静默不跑。
 #
-# 为什么要跑自测再打包：yunmusic-client/assets/web/index.html 是约 20 万字符的
-# 单文件前端，改一处布局很容易把别处带崩（比如删掉 `.player__src` 那条 CSS 规则后，
-# 依赖它的断言要同步改）。smoke.js 有 400+ 条断言，几秒就跑完，比装到手机上肉眼验收快。
+# ⚠ 为什么放在**仓库根**的 .github/workflows/ 而不是 client/.github/：
+#   GitHub Actions 只扫描仓库根那一层，子目录里的 workflow 文件会被完全忽略
+#   （不报错，就是不跑 —— 排查起来很费时间）。
+#
+# 为什么测试与出包分成两个 job：测试是秒级的，出包要拉 SDK 跑 aapt2/d8。
+# 测试先挂掉就不必再浪费几分钟去打包。
 #
 # 为什么要真出 APK 而不是只跑测试：aapt2 / d8 / apksigner 这条链路上的问题
-# （资源 id 冲突、dex 方法数、签名方案）测试照不到，只有真打包才暴露。
+# （资源 id 冲突、dex 方法数、签名方案、assets 缺文件）测试照不到，只有真打包才暴露。
 
 on:
   push:
     branches: [main]
     # 只在客户端相关文件变化时触发 —— 服务端改插件清单不该顺带跑一遍安卓构建
     paths:
-      - 'yunmusic-client/**'
+      - 'client/**'
+      - 'public/**'
+      - 'tools/build-client-rn.mjs'
+      - 'tools/build-app.mjs'
+      - 'test/client-wiring.test.mjs'
+      - 'test/client-layer.mjs'
+      - 'test/brand.test.mjs'
+      - 'test/app-wiring.test.mjs'
+      - 'test/boot-speed.test.mjs'
       - '.github/workflows/yunmusic-android.yml'
   workflow_dispatch:
 
 jobs:
   test:
     runs-on: ubuntu-latest
-    defaults:
-      run:
-        working-directory: yunmusic-client
     steps:
       - uses: actions/checkout@v4
 
@@ -36,21 +45,23 @@ jobs:
         with:
           node-version: '22'
 
-      # ⚠ yunmusic-client/ 必须有自己的 package.json。
-      #    否则 npm 会**向上**找到仓库根那份（lxmusic-cf），连带去装 wrangler 的
-      #    @cloudflare/workerd-windows-64 —— 那是 Windows 专用包，在 Linux 上直接
-      #    EBADPLATFORM 挂掉，报错信息完全指不到真正的原因（实测踩过）。
-      - name: 装测试依赖
-        run: npm install --no-audit --no-fund
-
-      - name: 前端自测（smoke.js）
-        run: node test/smoke.js
+      # 这五套是客户端相关、且**不需要安卓运行时**的（零第三方依赖，不用 npm install）：
+      #   client-wiring  静态接线审计：源码里有没有写对
+      #   client-layer   跨端层行为：跑起来是不是那个行为（自带极小 DOM 替身）
+      #   两者互补，别只跑一个（见 docs/client-android.md）
+      #   brand          品牌判定（客户端的包名/名字/版本落点也钉在这里）
+      #   app-wiring     版本落点与媒体会话接线
+      #   boot-speed     首屏启动速度护栏
+      - name: 客户端测试
+        run: |
+          node test/client-wiring.test.mjs
+          node test/client-layer.mjs
+          node test/brand.test.mjs
+          node test/app-wiring.test.mjs
+          node test/boot-speed.test.mjs
 
   build:
     runs-on: ubuntu-latest
-    defaults:
-      run:
-        working-directory: yunmusic-client
     steps:
       - uses: actions/checkout@v4
 
@@ -73,14 +84,16 @@ jobs:
           "$SM" "build-tools;34.0.0" "platforms;android-34"
 
       - name: 构建 APK
-        # build.sh 默认去同级 repo_extracted/ 找便携工具链（那是本地开发布局，
+        # build-client.sh 默认去仓库的 android-build/ 找便携工具链（本地开发布局，
         # CI 上没有），所以这里把四个路径显式指到 setup-java / 预装 SDK 的位置。
+        # 版本号由脚本自己从 client/version.mjs 读；读不到它会直接中止，
+        # 不会像以前那样悄悄退回一个装不上的 versionCode。
         run: |
           export JDK_DIR="$JAVA_HOME"
           export BUILD_TOOLS="$ANDROID_HOME/build-tools/34.0.0"
           export PLATFORM="$ANDROID_HOME/platforms/android-34"
-          export OUTPUT_DIR="$PWD/outputs"
-          bash build.sh
+          export OUT_DIR="$PWD/client/build"
+          bash client/build-client.sh
 
       - name: 汇总产物信息
         run: |
@@ -88,9 +101,11 @@ jobs:
           echo "产物：$apk"
           echo "大小：$(du -h "$apk" | cut -f1)"
           echo "sha256：$(sha256sum "$apk" | cut -d' ' -f1)"
+          "$ANDROID_HOME/build-tools/34.0.0/aapt2" dump badging "$apk" \
+            | grep -E "^package|^application-label|^launchable-activity" | head -5
 
       - uses: actions/upload-artifact@v4
         with:
           name: yunmusic-apk
-          path: yunmusic-client/outputs/*.apk
+          path: outputs/*.apk
           if-no-files-found: error

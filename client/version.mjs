@@ -18,19 +18,28 @@
  *
  * ── 2026-10-11：老板要求**全项目统一在 V2.7** ──────────────────
  * 于是三个数字（服务端 APP_VERSION、本文件的 CLIENT_VERSION、
- * yunmusic-client 的 CLIENT_VERSION）现在**恰好都是 V2.7**。
+ * 当时那套手写客户端的 CLIENT_VERSION）现在**恰好都是 V2.7**。
  * 但**它们仍然是三个独立常量，不是一个**：
  * 哪天只有一边需要发版，改一边即可，另一边不必跟着动 ——
  * 这正是把「当前值相同」与「结构上绑定」分开的意义。
  * 不要因为「看起来一样」就把它们合并成一个共享常量（那会退回到上面那个荒唐局面）。
+ *
+ * ── 2026-10-14：客户端改为「参照 web 端重新开发」──────────────────
+ * 前端不再手写，改成**整包复用 public/**（详见 docs/client-android.md）。
+ * 版本线不重置，接着往下走：V2.7 → … → V2.19（手写前端最后一版）
+ * → **V2.20（本版，前端换成 public/ 整包）**。
+ * ⚠ 版本号**必须接着涨、不能回退**：versionCode 是安卓判断「能不能覆盖安装」
+ * 的唯一依据，退号或同号原地覆盖会让用户装不上（390 → 400 才能覆盖）。
  *
  * 但客户端必须**知道自己该跟哪一版服务端说话** —— 这就是 SERVICE_VERSION。
  * 握手时（GET /api/version）拿服务端自报的 version 与它比对，不一致只提示、不阻断：
  * 版本差一格通常仍然可用，硬拦会把用户锁在门外。
  *
  * ── 发版规矩（老板 2026-10-06 定，2026-10-08 收紧）──────────────
- * 每发一版：CLIENT_VERSION 升 0.1、CLIENT_VERSION_CODE +1，两件事一次做完。
- * 与服务端侧同规矩（见 src/version.js 顶部）—— 只改一个的后果一样：
+ * 每发一版：CLIENT_VERSION 升 0.1、CLIENT_VERSION_CODE **+10**，两件事一次做完。
+ * （+10 而不是 +1 是为了给「同一个小版本的紧急热修」留号位；实际步长见版本线：
+ *   310 → 320 → … → 390 → 400。服务端侧同规矩，见 src/version.js 顶部。）
+ * 只改一个的后果一样：
  * 只改 code 装得上但没人看得出换了，只改名字装不上（Android 靠 code 判断覆盖）。
  *
  * 2026-10-08 收紧：**客户端每出一个新包都要 +0.1，不许同号原地覆盖 dist/**。
@@ -41,17 +50,17 @@
  * 注意分工：改客户端**不动** SERVICE_VERSION（那是「本 App 按哪版服务端设计」
  * 的声明）—— 只有服务端抬了 APP_VERSION，这里才跟着抬。 */
 
-/** 客户端产品版本。当前 V2.7（2026-10-11 起全项目统一），以后每个版本增加 0.1 */
-export const CLIENT_VERSION = 'V2.7'
+/** 客户端产品版本。当前 V2.20（前端换成 public/ 整包那一版），以后每个版本增加 0.1 */
+export const CLIENT_VERSION = 'V2.20'
 
 /** 安卓 versionCode：整数、单调递增、跨次发布不可重复 */
-export const CLIENT_VERSION_CODE = 270
+export const CLIENT_VERSION_CODE = 400
 
-/** 客户端包名（与既有 music-edge 壳 com.zyplnn.musicedge 并存，互不覆盖） */
-export const CLIENT_PACKAGE = 'com.zyplnn.lxclient'
+/** 客户端包名。沿用 V2.19 及更早那套手写客户端的包名 —— 老用户原地覆盖安装即可升级 */
+export const CLIENT_PACKAGE = 'com.yunmusic.app'
 
 /** 客户端对内自称（装在桌面上的名字）。品牌由所连服务端决定，这里是 App 自身的名字 */
-export const CLIENT_APP_NAME = 'LX-MUSIC'
+export const CLIENT_APP_NAME = '云音乐'
 
 /** 该客户端按哪一版服务端设计（对接 src/version.js 的 APP_VERSION） */
 export const SERVICE_VERSION = 'V2.12'

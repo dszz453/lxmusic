@@ -1,18 +1,31 @@
-# 安卓客户端（LX-MUSIC · 通用客户端）
+# 安卓客户端（云音乐 · 通用客户端）
 
 同一个仓库里有**两个安卓工程**，做的是两件不同的事，别混：
 
 | | `android/` | **`client/`（本文档）** |
 |---|---|---|
-| 包名 | `com.zyplnn.musicedge` | `com.zyplnn.lxclient` |
+| 包名 | `com.zyplnn.musicedge` | `com.yunmusic.app` |
 | 定位 | CF 那条线上的**离线自包含壳** | **通用客户端**：连 CF / Docker / 自建 / 内置都行 |
+| 前端 | `public/` 整包（离线自包含） | **同一份 `public/` 整包** + 跨端层 `client/rn/` |
 | 后端 | 永远在设备内（`backend.bundle.js` + 手机 SQLite） | 跟着「服务器档案」走：远程就放服务器上，内置就在设备内 |
-| 名字 | 固定 `music-edge` | 由所连服务端自报（`music-edge` 或 `LX-MUSIC`） |
-| 版本线 | 与服务端同号（V1.3） | **客户端自己的版本线（V1.0 起算）** |
-| 产物 | `dist/music-edge-<版本>.apk` | `dist/lx-music-client-<版本>.apk` |
+| 名字 | 固定 `music-edge` | App 自称 **云音乐**；界面品牌由所连服务端自报（`music-edge` / `LX-MUSIC`） |
+| 版本线 | 与服务端同号 | **客户端自己的版本线（V2.20）** |
+| 产物 | `dist/music-edge-<版本>.apk` | `outputs/云音乐-V<版本>.apk`（另拷一份到 `dist/`） |
 
 两者包名不同 → **可以同时装在一台设备上互不覆盖**，方便对照。
-签名共用 `android/keystore/yunmusic.keystore`（包名不同不冲突，部署者只备份一份密钥）。
+签名**各自一把**，互不通用：
+`android/keystore/yunmusic.keystore`（music-edge 壳）与
+`client/keystore/yunmusic-app.keystore`（云音乐，别名 `debug` / 口令 `android`，
+**沿用 V2.19 及更早那套手写客户端的签名** → 老用户**原地覆盖安装**即可升级，不必卸载重装）。
+
+> ⚠ 2026-10-14：原本还有**第三个**安卓工程 `yunmusic-client/`（包名同样是 `com.yunmusic.app`，
+> 但前端是**手写单文件** `assets/web/index.html`，4727 行）。老板要求「客户端参照 web 端重新开发」
+> → 它已被 `client/` 取代并**整体删除**：包名与签名沿用，前端换成 `public/` 整包。
+> 从此**只有一份前端**，不再出现「改一处漏一处」的分叉。
+> 一并删掉的还有 `tools/build-client-lxcore.mjs` —— 它只为那个手写前端生成
+> `lxcore.js` / `plugins.data.js` 到 `yunmusic-client/assets/web/`，
+> 手写前端一没，它就零引用了（`plugins.data.js` 现在由 `tools/build-app.mjs`
+> 统一产出到 `public/js/`，网页端与客户端共用）。
 
 ---
 
@@ -43,7 +56,7 @@
 │  ③ 跨端业务层（JS，`client/rn/`）                          │
 │     00-guard / 10-bridge / 20-brand / 30-nav / 40-pages / 50-shell │
 │     承载：底栏与路由同步、品牌与双版本、原生页入口接管          │
-│     业务页面本体是 `public/`（首页/搜索/歌单/播放器，三宿主共用）  │
+│     业务页面本体是 `public/`（首页/搜索/歌单/播放器，两个安卓宿主共用）  │
 ├──────────────────────────────────────────────────────────┤
 │  ④ 底层能力层（Java + JNI 预留）                           │
 │     core/AudioEngine    本地音频发现 / 解码接口 / 引擎信息      │
@@ -55,10 +68,10 @@
 | 网易云的做法 | 本工程的做法 | 原因 |
 |---|---|---|
 | 外壳/页面都可能是 Kotlin（新代码优先 Kotlin） | **全部 Java** | 构建链路是 `aapt2 → javac → d8`（没有 Gradle），也就没有 `kotlinc` 与 `kotlin-stdlib`。为一个几千行的宿主引入 80MB 编译器 + 运行时，换来的只是语法糖；而 Java 侧的分层结构**一模一样**，以后要上 Kotlin 是加编译步骤，不是重写架构 |
-| 业务页面用 React Native（JS/TS + Hermes） | **业务页面仍是 JS/TS，但渲染载体是系统 WebView** | 真上 RN 需要 Gradle + npm 依赖 + Hermes + native module 编译，与本工程「免 Gradle、离线可构建」的链路直接冲突。更关键的是：这个项目的业务页面**已经用 JS 写完了**，而且是**三宿主共用同一份** —— 换 RN 等于把它们重写一遍并复制成第二份源码，正是这个项目一直在避免的事（「改一处漏一处」） |
+| 业务页面用 React Native（JS/TS + Hermes） | **业务页面仍是 JS/TS，但渲染载体是系统 WebView** | 真上 RN 需要 Gradle + npm 依赖 + Hermes + native module 编译，与本工程「免 Gradle、离线可构建」的链路直接冲突。更关键的是：这个项目的业务页面**已经用 JS 写完了**，而且是**两个安卓宿主共用同一份** —— 换 RN 等于把它们重写一遍并复制成第二份源码，正是这个项目一直在避免的事（「改一处漏一处」） |
 | 音频解码/音效/重采样是 C/C++（JNI） | **JNI 接口预留 + 平台 API 兜底** | 没有 NDK（同上，无 LLVM/NDK 工具链）。所以：能做的用平台 API 做到位（`MediaStore` 找本地音频、`MediaMetadataRetriever` 取时长/比特率/采样率），native 那部分**如实标注不可用**（`AudioEngine.nativeAvailable()`），绝不写「假装成功」的桩 |
 | 纯原生页面：设置、本地播放底层、权限、推送 | **照搬** | 这四类都握在系统手里（权限、Activity 跳转、媒体库、进程退出），放跨端层只会做不了或者做不稳。见下面「原生与跨端怎么分工」 |
-| React Native 页面：动态、社区、直播、歌单详情 | **照搬**：首页/搜索/歌单/播放器放跨端层 | 这些是**频繁迭代的业务 UI**，改一次要三端同时生效；放进跨端层才能做到「改一处三端同效」 |
+| React Native 页面：动态、社区、直播、歌单详情 | **照搬**：首页/搜索/歌单/播放器放跨端层 | 这些是**频繁迭代的业务 UI**，改一次要两个安卓宿主同时生效；放进跨端层才能做到「一处改两端同效」 |
 
 > 一句话：**分层照搬，渲染载体按可构建性换**。换掉的是 RN 这一层的运行时，不是它的架构位置。
 
@@ -113,12 +126,17 @@
 
 | | 谁 | 现在 | 改哪儿 |
 |---|---|---|---|
-| 客户端版本 | 这个 APK | **V1.0**（`versionCode 100`） | `client/version.mjs` |
-| 服务端版本 | CF Worker / Docker | **V1.3** | `src/version.js` |
+| 客户端版本 | 这个 APK | **V2.20**（`versionCode 400`） | `client/version.mjs` |
+| 服务端版本 | CF Worker / Docker | **V2.12**（`versionCode 131`） | `src/version.js` |
 
-**两者不必同号，也不该强求同号**：服务端升到 V1.4 时，只要接口兼容，App 不用重装；
+**两者不必同号，也不该强求同号**：服务端升到 V2.13 时，只要接口兼容，App 不用重装；
 客户端修个原生层的 bug 时，服务端一行都不用动。强行同号的后果是
 「服务端发个版，全量用户就得重装 App」。
+
+⚠ 客户端版本号**只增不减、不许同号原地覆盖**：`versionCode` 是安卓判断
+「这个包能不能覆盖安装」的唯一依据，退号或同号会让用户**装不上**
+（V2.19 是 390，V2.20 必须是 400；改客户端时 `CLIENT_VERSION` 与
+`CLIENT_VERSION_CODE` 一起 +0.1 / +10）。
 
 但客户端必须知道**自己该跟哪一版服务端说话** —— 那就是
 `client/version.mjs` 的 `SERVICE_VERSION`（= 服务端 `APP_VERSION`，由
@@ -126,7 +144,7 @@
 握手回来版本不一致时**只提示、不阻断**：差一格通常仍然可用，硬拦会把用户锁在门外。
 
 顺带修掉一个会立刻出现的假告警：共用前端原本拿**客户端版本**去比**服务端版本**，
-在通用客户端上必然不等（1.0 vs V1.3）→ 一条永远亮着的「⚠ 与服务端版本不一致」。
+在通用客户端上必然不等（2.20 vs V2.12）→ 一条永远亮着的「⚠ 与服务端版本不一致」。
 现在比的是 `window.LX_CLIENT_SERVICE`（客户端期望的服务端版本），
 拿不到时退回老行为（老壳不受影响）。
 
@@ -139,11 +157,12 @@
 bash client/build-client.sh
 bash client/build-client.sh --skip-backend   # 只改前端/跨端层时更快
 
-# 产物
-client/build/lx-music-client-1.0.apk         # 主产物
-dist/lx-music-client-1.0.apk                 # 副本，方便取件
+# 产物（版本号从 client/version.mjs 读，文件名随之变）
+client/build/云音乐-V2.20.apk                # 主产物
+outputs/云音乐-V2.20.apk                     # 副本（历史惯例，方便取件）
+dist/云音乐-V2.20.apk                        # 副本（与 android/ 壳同一惯例）
 
-# 静态接线审计（111 项，秒级，不需要安卓运行时）
+# 静态接线审计（112 项，秒级，不需要安卓运行时）
 node test/client-wiring.test.mjs
 
 # 跨端层行为（34 项，秒级，不需要浏览器/安卓 —— 自带一个极小 DOM 替身）
@@ -156,9 +175,15 @@ node test/client-layer.mjs
 ```bash
 node test/brand.test.mjs              # 38 项：品牌判定（客户端的同步判据在这里被钉住）
 node test/app-wiring.test.mjs         # 47 项：版本落点 / 媒体会话接线
-node test/client-wiring.test.mjs      # 111 项：客户端四条链路（静态接线审计）
+node test/client-wiring.test.mjs      # 112 项：客户端四条链路（静态接线审计）
 node test/client-layer.mjs            # 34 项：跨端层行为（守卫 / 路由归属 / 入口接管 / 桥崩容错）
+node test/boot-speed.test.mjs         # 52 项：启动路径（首屏不等网络 / 档案读取顺序）
 ```
+
+> ⚠ 构建脚本第 1.5 步是 `cp -r "$ROOT/public/." "$ASSETS/www/"` ——
+> **APK 里的前端就是仓库里的 `public/`，逐字节同一份**，不是副本、不是「同步过来的」。
+> 改前端 = 改 `public/`，两端同时生效；构建时还会把 `public/` 里已删的文件
+> 从 `assets/www/` 清掉（`client-layer.js` 与 `client-build.txt` 两个客户端专属文件除外）。
 
 > `client-wiring` 与 `client-layer` 是**互补**的，别只跑一个：
 > 前者审「源码里有没有写对」（静态、不执行），后者审「跑起来是不是那个行为」。

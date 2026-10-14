@@ -56,12 +56,12 @@ const A_MANIFEST = read('android/AndroidManifest.xml')
 const BUILD = read('client/build-client.sh')
 const BUILD_SHELL = read('android/build-apk.sh')
 const RN_BUILD = read('tools/build-client-rn.mjs')
-const CLIENT_ACT = read('client/src/com/zyplnn/lxclient/ClientActivity.java')
-const BRIDGE = read('client/src/com/zyplnn/lxclient/BridgeHub.java')
-const BRAND_JAVA = read('client/src/com/zyplnn/lxclient/ClientBrand.java')
-const UI_JAVA = read('client/src/com/zyplnn/lxclient/Ui.java')
-const STORE_JAVA = read('client/src/com/zyplnn/lxclient/ServerStore.java')
-const AUDIO_JAVA = read('client/src/com/zyplnn/lxclient/core/AudioEngine.java')
+const CLIENT_ACT = read('client/src/com/yunmusic/app/ClientActivity.java')
+const BRIDGE = read('client/src/com/yunmusic/app/BridgeHub.java')
+const BRAND_JAVA = read('client/src/com/yunmusic/app/ClientBrand.java')
+const UI_JAVA = read('client/src/com/yunmusic/app/Ui.java')
+const STORE_JAVA = read('client/src/com/yunmusic/app/ServerStore.java')
+const AUDIO_JAVA = read('client/src/com/yunmusic/app/core/AudioEngine.java')
 const COLORS = read('client/res/values/colors.xml')
 const STRINGS = read('client/res/values/strings.xml')
 const INDEX = read('public/index.html')
@@ -132,14 +132,17 @@ console.log('\n== 2. 与 music-edge 壳并存，互不覆盖 ==')
     pkg(C_MANIFEST) !== pkg(A_MANIFEST), `${pkg(C_MANIFEST)} vs ${pkg(A_MANIFEST)}`)
   ok('客户端包名与 client/version.mjs 声明的一致', pkg(C_MANIFEST) === V.CLIENT_PACKAGE)
 
-  // 密钥：两个包共用同一把（包名不同不会冲突），且绝不能放 build/ ——
-  // build/ 每轮被清，密钥一丢就只能让用户卸载重装。
-  const ksClient = (BUILD.match(/^KS="\$ROOT\/(.+)"$/m) || [])[1]
+  // 密钥：云音乐客户端用**自己那把**（client/keystore/yunmusic-app.keystore），
+  // 与隔壁 music-edge 壳那把不是同一把 —— 包名不同、历史签名也不同。
+  // ⚠ 这把密钥从 V2.19（手写前端那版）起就在用，换掉它 = 老用户装不上，
+  //    只能卸载重装（数据全丢）。所以下面第二条盯的就是「别顺手换成老壳那把」。
+  // 且绝不能放 build/ —— build/ 每轮被清，密钥一丢就只能让用户卸载重装。
+  const ksClient = (BUILD.match(/^KS="\$HERE\/(.+)"$/m) || [])[1]
   const ksShell = (BUILD_SHELL.match(/^KS="\$HERE\/(.+)"$/m) || [])[1]
-  ok('客户端签名密钥指向 android/keystore/（不在 build/ 里）',
-    ksClient && ksClient.startsWith('android/keystore/'), String(ksClient))
-  ok('两个客户端共用同一把密钥（部署者只需要备份一份）',
-    ksClient && ksShell && ksClient.replace(/^android\//, '') === ksShell,
+  ok('客户端签名密钥在 client/keystore/ 下（不在 build/ 里）',
+    ksClient && ksClient.startsWith('keystore/'), String(ksClient))
+  ok('客户端密钥是云音乐专用那把（沿用 V2.19 的签名，不是老壳那把）',
+    ksClient === 'keystore/yunmusic-app.keystore' && ksShell === 'keystore/yunmusic.keystore',
     `${ksClient} vs ${ksShell}`)
 }
 
@@ -158,8 +161,8 @@ console.log('\n== 3. 构建脚本：版本从哪来、白名单够不够 ==')
     /client-build\.txt/.test(BUILD.slice(BUILD.indexOf('for f in index.html'))))
   ok('同步残留的清理排除了客户端专属文件（否则每轮都被删一次）',
     /CLIENT_ONLY=/.test(BUILD) && /continue 2/.test(BUILD))
-  ok('产物名是 lx-music-client-<版本>（与老壳的 music-edge-* 区分开）',
-    /APP_NAME="lx-music-client"/.test(BUILD))
+  ok('产物名是 云音乐-V<版本>（沿用老客户端的产品名，与老壳的 music-edge-* 区分开）',
+    /APP_NAME="云音乐"/.test(BUILD) && /APP_NAME-V\$VERSION_NAME\.apk/.test(BUILD))
   ok('清单声明了四个原生页面 + 主界面 + 播放服务',
     ['.ClientActivity', '.ServerActivity', '.SettingsActivity', '.LocalMusicActivity',
       '.AboutActivity', '.PlaybackService'].every((c) => C_MANIFEST.includes(`android:name="${c}"`)))
@@ -290,9 +293,9 @@ console.log('\n== 6. 注入契约：宿主给的变量，前端真的在读 ═�
  * 所以两头都要钉：设置页**保留**着它，别处**不再**出现。
  * 唯一的例外是「版本对不上」的警告 —— 那是一条可执行的建议，且本身不含版本值。 */
 {
-  const ABOUT = read('client/src/com/zyplnn/lxclient/AboutActivity.java')
-  const SERVERPAGE = read('client/src/com/zyplnn/lxclient/ServerActivity.java')
-  const SETTINGS = read('client/src/com/zyplnn/lxclient/SettingsActivity.java')
+  const ABOUT = read('client/src/com/yunmusic/app/AboutActivity.java')
+  const SERVERPAGE = read('client/src/com/yunmusic/app/ServerActivity.java')
+  const SETTINGS = read('client/src/com/yunmusic/app/SettingsActivity.java')
 
   ok('顶栏状态条不再拼服务端版本（只留品牌 / 连接态 / 地址）',
     !/append\(" · 服务端 "\)/.test(CLIENT_ACT), '还在拼 ` · 服务端 `')
@@ -351,25 +354,34 @@ console.log('\n== 8. 底层能力层、权限与主题 ════════�
     C_MANIFEST.includes('android.permission.READ_MEDIA_AUDIO')
     && C_MANIFEST.includes('android.permission.READ_EXTERNAL_STORAGE'))
 
-  // 2026-10-11：档案槽位从「三档（内置 / CF / Docker）」重构成「两档线路」
-  // （地址 1 = Docker 主线路、地址 2 = CF 备用线路）。内置离线档案已废弃，
-  // 加载时还会主动丢弃历史残留（见下面第 3 条）。断言跟着钉当前设计。
-  ok('ServerStore 是两档线路槽位（地址 1 = Docker / 地址 2 = CF），不再有内置档',
+  // 2026-10-11：档案槽位曾重构成「两档线路」（地址 1 = Docker 主线路、
+  //   地址 2 = CF 备用线路），内置离线档案一度被删掉。
+  // 2026-10-14：客户端参照 web 端重新开发时，老板明确要求**保留「内置离线」**
+  //   （不连服务器也能用）→ 内置离线恢复成**第三个固定槽位**，垫在两条线路之后。
+  //   三档都是固定槽位：用户不能改名、不能删，品牌判定靠它。
+  // 断言跟着钉当前设计。
+  ok('ServerStore 是三档固定槽位（内置离线 / Docker 主线路 / CF 备用线路）',
     /ID_CF\s*=\s*"cf"/.test(STORE_JAVA)
     && /ID_DOCKER\s*=\s*"docker"/.test(STORE_JAVA)
+    && /ID_BUILTIN\s*=\s*"builtin"/.test(STORE_JAVA)
     && /ID_LINE1\s*=\s*ID_DOCKER/.test(STORE_JAVA)
     && /ID_LINE2\s*=\s*ID_CF/.test(STORE_JAVA)
-    && !/ID_BUILTIN/.test(STORE_JAVA))
-  ok('品牌判定优先用握手自报的 host；槽位不许删（ensureDefaults 会补回来）',
+    && /KIND_BUILTIN\s*=\s*"builtin"/.test(STORE_JAVA))
+  ok('内置离线槽位：可用、有自己的品牌名、且不允许被删',
+    /if\s*\(KIND_BUILTIN\.equals\(kind\)\)\s*return\s*true/.test(STORE_JAVA)
+    && /if\s*\(KIND_BUILTIN\.equals\(kind\)\)\s*return\s*ClientBrand\.builtinName\(\)/.test(STORE_JAVA)
+    && /if\s*\(ID_BUILTIN\.equals\(id\)\)\s*return\s*false/.test(STORE_JAVA))
+  ok('品牌判定优先用握手自报的 host；三条固定槽位都由 ensureDefaults 补回来',
     /if\s*\(!host\.isEmpty\(\)\)\s*return\s*ClientBrand\.nameOf\(host\)/.test(STORE_JAVA)
     && /if\s*\(find\(ID_LINE1\)\s*==\s*null\)/.test(STORE_JAVA)
-    && /if\s*\(find\(ID_LINE2\)\s*==\s*null\)/.test(STORE_JAVA))
+    && /if\s*\(find\(ID_LINE2\)\s*==\s*null\)/.test(STORE_JAVA)
+    && /if\s*\(find\(ID_BUILTIN\)\s*==\s*null\)/.test(STORE_JAVA))
   ok('Handshake 不会只看状态码就判定成功（必须看正文像不像本项目的接口）',
-    /trimmed\.startsWith\("<"\)/.test(read('client/src/com/zyplnn/lxclient/Handshake.java'))
-    && /没有 version 字段/.test(read('client/src/com/zyplnn/lxclient/Handshake.java')))
+    /trimmed\.startsWith\("<"\)/.test(read('client/src/com/yunmusic/app/Handshake.java'))
+    && /没有 version 字段/.test(read('client/src/com/yunmusic/app/Handshake.java')))
   ok('Handshake 的地址归一化与网页端同一套口径（内网 http / 域名 https）',
-    /localish/.test(read('client/src/com/zyplnn/lxclient/Handshake.java'))
-    && /hostPart\.indexOf\('\.'\) < 0/.test(read('client/src/com/zyplnn/lxclient/Handshake.java')))
+    /localish/.test(read('client/src/com/yunmusic/app/Handshake.java'))
+    && /hostPart\.indexOf\('\.'\) < 0/.test(read('client/src/com/yunmusic/app/Handshake.java')))
 
   // 免 Gradle 链路：不能出现 androidx / support 依赖
   const javaFiles = []
@@ -454,7 +466,7 @@ console.log('\n== 10. 出站 HTTP 桥（「桥请求超时: /api/playlists」那
    * 下面这些断言钉的是「写法」，因为这几个坑一旦被改回去，现象会原样复现，
    * 而且复现出来的文案仍然是误导性的。
    */
-  const HB_CLI = read('client/src/com/zyplnn/lxclient/HttpBridge.java')
+  const HB_CLI = read('client/src/com/yunmusic/app/HttpBridge.java')
   const HB_SHELL = read('android/src/com/zyplnn/musicedge/HttpBridge.java')
 
   /**
@@ -527,7 +539,10 @@ console.log('\n== 10. 出站 HTTP 桥（「桥请求超时: /api/playlists」那
     .replace(/\/\*[\s\S]*?\*\//g, '')
     .replace(/\/\/[^\n]*/g, '')
     .replace(/\b(?:Main|Client)Activity\b/g, 'XActivity')
-    .replace(/\b(?:musicedge|lxclient)\b/g, 'X')
+    // 两份的**唯一**实质差异就是包名那一行（com.yunmusic.app vs com.zyplnn.musicedge）。
+    // 早先是把 musicedge / lxclient 这两个词各自换成 X 来抹平；改成云音乐客户端后
+    // 包名里多了 app 这一节，逐词替换抹不平了 —— 直接整行归一，以后再改包名也不用动这里。
+    .replace(/^package [\w.]+;$/gm, 'package X;')
     .split('\n').map((l) => l.trim()).filter(Boolean).join('\n')
   ok('两份 HttpBridge 除注释外逐行一致（改一份就必须改另一份）',
     stripForCmp(HB_CLI) === stripForCmp(HB_SHELL))

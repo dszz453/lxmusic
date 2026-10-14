@@ -1,12 +1,15 @@
 # 云音乐 · 全平台音乐播放器
 
-> **当前版本：V2.12**（服务端）· 客户端 V2.19
+> **当前版本：V2.12**（服务端）· 客户端 V2.20
 >
 > 一个自托管的音乐播放系统，支持 **Cloudflare Workers 线上部署**、**Docker 自建服务器**、**安卓 APK 客户端** 三种形态。
 > 同一份源码服务三个宿主，运行时自动适配，不做编译期分叉。
 >
 > 服务端与客户端是**两条独立的版本线**：服务端改一次，三端同时生效，不必重新装 App；
-> 客户端只在出包时才动。两条线各自维护，当前不同号（客户端 V2.19 / 服务端 V2.12）。
+> 客户端只在出包时才动。两条线各自维护，当前不同号（客户端 V2.20 / 服务端 V2.12）。
+>
+> **客户端的前端就是网页端本身**：`client/assets/www` 是构建时从 `public/` 整包拷进去的，
+> 只多一个客户端专属的 `js/client-layer.js`（跨端层）。改 `public/` 就等于改客户端界面。
 
 ---
 
@@ -58,6 +61,15 @@ docker compose up -d
 - 包名：`com.yunmusic.app`
 - 最低 Android 5.0（API 21），目标 API 34
 - 已签名（v1 + v2 + v3），可原地覆盖升级
+- 构建：`bash client/build-client.sh` → `outputs/云音乐-V2.20.apk`
+
+首启让你选连哪条线，三条可选：
+
+| 连接方式 | 说明 |
+|---|---|
+| **地址 1（主线路）** | 自建 Docker / 局域网服务器 |
+| **地址 2（备用线路）** | Cloudflare Workers |
+| **内置离线** | 后端完全跑在设备内，不连任何服务器（数据只在这台手机上） |
 
 下载：[Releases](https://github.com/dszz453/lxmusic/releases) 或直接用 CI 产物。
 
@@ -102,7 +114,7 @@ docker compose up -d
 │                        用户层                                │
 │  ┌──────────────┐  ┌──────────────┐  ┌──────────────────┐  │
 │  │  网页端 PWA   │  │  云音乐 APK   │  │  Subsonic 客户端  │  │
-│  │  (public/)   │  │ (yunmusic-client/)│  │    (/rest/*)     │  │
+│  │  (public/)   │  │   (client/)   │  │    (/rest/*)     │  │
 │  └──────┬───────┘  └──────┬───────┘  └────────┬─────────┘  │
 └─────────┼─────────────────┼───────────────────┼────────────┘
           │                 │                   │
@@ -124,7 +136,11 @@ docker compose up -d
 ### 关键设计
 
 - **单一事实来源**：`src/version.js` 一处改版本，三端同步生效。
-- **同构前端**：`public/` 的 PWA 前端与 APK 内的单文件前端同源，CSS / JS 逻辑一致。
+- **同构前端**：`public/` 的 PWA 前端与 APK 内的前端**是同一份文件** ——
+  APK 打包时把 `public/` 整包拷进 `assets/www`，由 WebView 从包内直出
+  （`shouldInterceptRequest`），Java 侧只做「网络 / 数据库 / 媒体会话」三座桥
+  （见 `public/js/native.js`）。网页端与客户端**共享同一套页面与交互**，
+  不存在「两边各写一份、改一处漏一处」。
 - **零构建依赖**：APK 打包不依赖 Gradle / Maven，纯 aapt2 + javac + d8 + zipalign + apksigner。
 - **ES5 兼容**：支持 Android 5.0 的老 WebView，全部手写 polyfill，无现代语法。
 
@@ -170,18 +186,21 @@ docker compose up -d
 # 服务端端到端（真 HTTP，31 项）
 LX_BASE=http://127.0.0.1:8787 node test/server-node.mjs
 
-# 客户端静态审计（111 项）
+# 客户端静态接线审计（112 项，秒级，不需要安卓运行时）
 node test/client-wiring.test.mjs
 
-# 客户端跨端层（34 项）
+# 客户端跨端层行为（34 项，自带极小 DOM 替身）
 node test/client-layer.mjs
+
+# 客户端其它护栏：品牌判定 / 版本落点 / 首屏启动速度
+node test/brand.test.mjs && node test/app-wiring.test.mjs && node test/boot-speed.test.mjs
 
 # 浏览器验收（93 项，需本地服务）
 LX_BASE=http://127.0.0.1:8787 LX_PASS='密码' node test/ui.mjs
-
-# APK 自测（430 项，需 jsdom）
-cd yunmusic-client && node test/smoke.js
 ```
+
+> `client-wiring` 与 `client-layer` 是**互补**的，别只跑一个：前者审「源码里有没有写对」
+> （静态、不执行），后者审「跑起来是不是那个行为」。CI 里两套都跑。
 
 ---
 
@@ -190,7 +209,9 @@ cd yunmusic-client && node test/smoke.js
 发版规矩：
 - 服务端 `APP_VERSION` 每版 **升 0.1**，同时 `APP_VERSION_CODE` **+1**
 - 客户端每版 **升 0.1**，`versionCode` **+10**
-- 当前：**服务端 V2.12 (131) / 客户端 V2.19 (390)**
+- 当前：**服务端 V2.12 (131) / 客户端 V2.20 (400)**
+- 客户端版本改 `client/version.mjs`，然后 `bash client/build-client.sh` 出包
+  （包内 `client-build.txt` 记录构建时的 HEAD，所以**先提交再构建**）
 
 部署后查 `/api/version` 的 `build` 字段即可确认「跑的是不是刚推的那一版」。
 

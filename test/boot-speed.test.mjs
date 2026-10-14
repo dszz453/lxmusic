@@ -68,8 +68,8 @@ function sliceBetween(src, startMarker, endMarker) {
 
 console.log('\n== 1. 客户端网络层：连接能复用（否则每个 /api 都重做一次握手）==')
 
-const HB_RAW = read('client/src/com/zyplnn/lxclient/HttpBridge.java')
-const HS_RAW = read('client/src/com/zyplnn/lxclient/Handshake.java')
+const HB_RAW = read('client/src/com/yunmusic/app/HttpBridge.java')
+const HS_RAW = read('client/src/com/yunmusic/app/Handshake.java')
 const HB = stripComments(HB_RAW)
 const HS = stripComments(HS_RAW)
 
@@ -173,7 +173,7 @@ ok('App.ready 在身份确定之后才置位',
 
 console.log('\n== 4. 客户端远程档案：不加载本机后端那两个大文件（合计 1.9 MB）==')
 
-const CA = stripComments(read('client/src/com/zyplnn/lxclient/ClientActivity.java'))
+const CA = stripComments(read('client/src/com/yunmusic/app/ClientActivity.java'))
 const shell = sliceBetween(CA, 'private String injectClientShell(', 'private WebResourceResponse serveAsset(')
 
 ok('injectClientShell 切出来了（否则下面几条是空断言）', shell.length > 500)

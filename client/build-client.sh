@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
 # ============================================================
-#  LX-MUSIC 通用客户端 · APK 构建脚本（不依赖 Gradle / Maven）
+#  云音乐客户端 · APK 构建脚本（不依赖 Gradle / Maven）
 #
 #  与隔壁 android/build-apk.sh（music-edge 壳）同一个套路：
 #    aapt2 → javac → d8 → zipalign → apksigner 五步走完，全程离线。
@@ -8,8 +8,13 @@
 #    1) 版本号取自 client/version.mjs（**客户端自己的版本线**，不是服务端的）；
 #    2) 先跑 tools/build-client-rn.mjs 把跨端业务层打成 client-layer.js，
 #       再连同 public/ 一起塞进 assets/www；
-#    3) 包名 com.zyplnn.lxclient（与 com.zyplnn.musicedge 并存，互不覆盖）；
-#    4) 产物落在 dist/lx-music-client-<版本>.apk。
+#    3) 包名 com.yunmusic.app（与 com.zyplnn.musicedge 并存，互不覆盖）；
+#    4) 产物落在 outputs/云音乐-V<版本>.apk（并拷一份到 dist/）。
+#
+#  ⚠ 包名与签名**沿用** V2.19 及更早那套手写客户端（曾放在 yunmusic-client/）：
+#    老用户原地覆盖安装即可升级，不必卸载重装。
+#    密钥在 client/keystore/yunmusic-app.keystore（别名 debug / 口令 android）——
+#    换掉它 = 老用户装不上，只能卸载重装（数据全丢）。
 #
 #  依赖（各下一份就够，之后全程离线，与壳共用同一份）：
 #    · JDK 17            android-build/jdk/
@@ -23,13 +28,16 @@ set -euo pipefail
 
 HERE="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"      # …/client
 ROOT="$(cd "$HERE/.." && pwd)"                            # 仓库根
-AB="$(cd "$ROOT/android-build" && pwd)"                   # JDK 与 Android SDK
-JDK="$(ls -d "$AB"/jdk/jdk-* 2>/dev/null | head -1 || true)"
+# 便携工具链默认在仓库的 android-build/（本地开发布局）。CI 上没有这个目录，
+# 所以四个路径都允许用环境变量覆盖 —— 与隔壁 android/build-apk.sh 同一套口径，
+# 免得 CI 里再去凑一份目录结构出来。
+AB="${ANDROID_BUILD_DIR:-$ROOT/android-build}"
+JDK="${JDK_DIR:-$(ls -d "$AB"/jdk/jdk-* 2>/dev/null | head -1 || true)}"
 JDK="${JDK:-$AB/jdk}"
-SDK="$AB/sdk"
-BT="$SDK/build-tools/34.0.0"
-PLAT="$SDK/platforms/android-34/android.jar"
-OUT="$HERE/build"
+SDK="${SDK_DIR:-$AB/sdk}"
+BT="${BUILD_TOOLS:-$SDK/build-tools/34.0.0}"
+PLAT="${PLATFORM:-$SDK/platforms/android-34/android.jar}"
+OUT="${OUT_DIR:-$HERE/build}"
 
 SKIP_BACKEND=0
 for arg in "$@"; do
@@ -44,19 +52,27 @@ export JAVA_TOOL_OPTIONS="-Dfile.encoding=UTF-8 -Dsun.stdout.encoding=UTF-8 -Dsu
 W() { cygpath -m "$1"; }                                  # MSYS 路径 → Windows 正斜杠路径
 LIST_WIN() { find "$@" | while read -r f; do printf '"%s"\n' "$(cygpath -m "$f")"; done; }
 
-# ── 客户端产品名（装在桌面上的名字）。注意与**品牌**不是一回事：
-#    连 CF 时界面显示 music-edge、连 Docker 时显示 LX-MUSIC，那是运行期由服务端自报的。
-APP_NAME="lx-music-client"
+# ── 客户端产品名（装在桌面上的名字，也是产物文件名）。
+#    注意与**品牌**不是一回事：连 CF 时界面显示 music-edge、连 Docker 时显示
+#    LX-MUSIC，那是运行期由服务端自报的（见 public/js/brand.js 的 NAMES）。
+APP_NAME="云音乐"
 
 # ⚠ 版本号不在这里写死 —— 从 client/version.mjs 读（单一事实来源）。
 #    要发新版：改 client/version.mjs 的 CLIENT_VERSION 与 CLIENT_VERSION_CODE，重跑构建。
-VERSION_CODE="$(node -e "import('./client/version.mjs').then(m=>console.log(m.CLIENT_VERSION_CODE))" 2>/dev/null)"
-VERSION_NAME="$(node -e "import('./client/version.mjs').then(m=>console.log(m.CLIENT_VERSION.replace(/^v/i,'')))" 2>/dev/null)"
-SERVICE_VER="$(node -e "import('./client/version.mjs').then(m=>console.log(m.SERVICE_VERSION))" 2>/dev/null)"
+#    用 (cd "$ROOT" && node …) 而不是直接 node：import('./client/version.mjs') 是相对
+#    **当前工作目录**解析的，脚本被从别处调起时（CI、或 bash /abs/path/build-client.sh）
+#    就会读不到 —— 而下面的兜底会把版本号悄悄变成 100，出一个**装不上**的包
+#    （安卓只认 versionCode 单调递增）。所以这里先 cd 到仓库根，读不到就直接中止。
+VERSION_CODE="$(cd "$ROOT" && node -e "import('./client/version.mjs').then(m=>console.log(m.CLIENT_VERSION_CODE))" 2>/dev/null)"
+VERSION_NAME="$(cd "$ROOT" && node -e "import('./client/version.mjs').then(m=>console.log(m.CLIENT_VERSION.replace(/^v/i,'')))" 2>/dev/null)"
+SERVICE_VER="$(cd "$ROOT" && node -e "import('./client/version.mjs').then(m=>console.log(m.SERVICE_VERSION))" 2>/dev/null)"
 BUILD_ID="${LX_BUILD_ID:-$(git -C "$ROOT" rev-parse --short=12 HEAD 2>/dev/null || echo dev)}"
-VERSION_CODE="${VERSION_CODE:-100}"
-VERSION_NAME="${VERSION_NAME:-1.0}"
-SERVICE_VER="${SERVICE_VER:-V2.5}"
+# 读不到就中止。**不要**给兜底默认值：那会出一个 versionCode 很小的包，
+# 用户装上之后再也升不上去（覆盖安装要求 code 严格递增），而且构建日志里看不出异常。
+[ -n "$VERSION_CODE" ] && [ -n "$VERSION_NAME" ] && [ -n "$SERVICE_VER" ] || {
+  echo "❌ 读不到 client/version.mjs 的版本号（node 执行失败？）—— 中止，别出一个装不上的包"
+  exit 1
+}
 echo "   客户端版本：$VERSION_NAME (code $VERSION_CODE) ← client/version.mjs"
 echo "   服务端版本：客户端按 $SERVICE_VER 对接 ← src/version.js（由测试钉住一致性）"
 echo "   构建标识：$BUILD_ID"
@@ -169,41 +185,44 @@ echo "== 6. zipalign：4 字节对齐（v2 签名要求，必须先于签名） 
 "$BT/zipalign.exe" -f -p 4 "$OUT/app-unsigned.apk" "$OUT/app-aligned.apk"
 
 echo "== 7. 签名密钥 =="
-# 与 music-edge 壳**共用同一把密钥**（android/keystore/yunmusic.keystore）。
-# 两个包名不同，共用一把密钥不会有任何冲突；好处是用户/部署者只需要备份一份密钥。
-# 密钥必须放在 android/keystore/ 而不是 build/ —— build/ 每轮都被清，
-# 密钥一旦跟着被删，下次构建就会换一套签名，用户只能卸载重装（数据全丢）。
-KS="$ROOT/android/keystore/yunmusic.keystore"
+# ⚠ 这把密钥**不是**隔壁 android/ 壳那把（android/keystore/yunmusic.keystore）。
+#    云音乐客户端（com.yunmusic.app）从 V2.19 起就用 client/keystore/yunmusic-app.keystore
+#    签（别名 debug），安卓只认「同一个包名 + 同一把签名证书」才允许覆盖安装 ——
+#    换成隔壁那把，老用户会装不上，只能卸载重装（数据全丢）。
+#    密钥必须放在 client/keystore/ 而不是 build/ —— build/ 每轮都被清，
+#    密钥一旦跟着被删，下次构建就会换一套签名。
+KS="$HERE/keystore/yunmusic-app.keystore"
 mkdir -p "$(dirname "$KS")"
 if [ ! -f "$KS" ]; then
   keytool -genkeypair -v \
     -keystore "$KS" -storepass android -keypass android \
-    -alias yunmusic -keyalg RSA -keysize 2048 -validity 10950 \
-    -dname "CN=YunMusic, OU=Mobile, O=Zyplnn, L=Zhengzhou, ST=Henan, C=CN" \
+    -alias debug -keyalg RSA -keysize 2048 -validity 10000 \
+    -dname "CN=YunMusic, OU=App, O=YunMusic, L=SZ, ST=GD, C=CN" \
     -noprompt 2>&1 | tail -2
-  echo "   密钥: $KS（口令 android；升级包要沿用同一个，别丢）"
+  echo "   密钥: $KS（口令 android / 别名 debug；升级包要沿用同一个，别丢）"
 else
   echo "   复用已有密钥: $KS"
 fi
 
 echo "== 8. apksigner：签名 =="
 java -jar "$(W "$BT/lib/apksigner.jar")" sign \
-  --ks "$(W "$KS")" --ks-pass pass:android --key-pass pass:android --ks-key-alias yunmusic \
+  --ks "$(W "$KS")" --ks-pass pass:android --key-pass pass:android --ks-key-alias debug \
   --v1-signing-enabled true --v2-signing-enabled true --v3-signing-enabled true \
-  --out "$(W "$OUT/$APP_NAME-$VERSION_NAME.apk")" \
+  --out "$(W "$OUT/$APP_NAME-V$VERSION_NAME.apk")" \
   "$(W "$OUT/app-aligned.apk")"
 
 echo "== 9. 校验 =="
-java -jar "$(W "$BT/lib/apksigner.jar")" verify --print-certs "$(W "$OUT/$APP_NAME-$VERSION_NAME.apk")" | head -6
-"$BT/aapt2.exe" dump badging "$OUT/$APP_NAME-$VERSION_NAME.apk" 2>/dev/null \
+java -jar "$(W "$BT/lib/apksigner.jar")" verify --print-certs "$(W "$OUT/$APP_NAME-V$VERSION_NAME.apk")" | head -6
+"$BT/aapt2.exe" dump badging "$OUT/$APP_NAME-V$VERSION_NAME.apk" 2>/dev/null \
   | grep -E "^package|^application-label|^launchable-activity|^uses-permission" | head -12
-ls -la "$OUT/$APP_NAME-$VERSION_NAME.apk"
+ls -la "$OUT/$APP_NAME-V$VERSION_NAME.apk"
 
-# 随手拷一份到 dist/，方便直接取件（dist/ 已在 .gitignore 里）
-mkdir -p "$ROOT/dist"
-cp "$OUT/$APP_NAME-$VERSION_NAME.apk" "$ROOT/dist/$APP_NAME-$VERSION_NAME.apk"
+# 拷两份方便取件：dist/（与 android/ 壳同一惯例）与 outputs/（云音乐客户端的历史惯例）
+mkdir -p "$ROOT/dist" "$ROOT/outputs"
+cp "$OUT/$APP_NAME-V$VERSION_NAME.apk" "$ROOT/dist/$APP_NAME-V$VERSION_NAME.apk"
+cp "$OUT/$APP_NAME-V$VERSION_NAME.apk" "$ROOT/outputs/$APP_NAME-V$VERSION_NAME.apk"
 
 echo ""
-echo "✅ 产物: $OUT/$APP_NAME-$VERSION_NAME.apk"
-echo "   副本: dist/$APP_NAME-$VERSION_NAME.apk"
+echo "✅ 产物: $OUT/$APP_NAME-V$VERSION_NAME.apk"
+echo "   副本: outputs/$APP_NAME-V$VERSION_NAME.apk 与 dist/$APP_NAME-V$VERSION_NAME.apk"
 echo "   客户端 V$VERSION_NAME（code $VERSION_CODE）· 按服务端 $SERVICE_VER 设计 · 构建 $BUILD_ID"

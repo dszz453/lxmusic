@@ -1,15 +1,20 @@
 <?xml version="1.0" encoding="utf-8"?>
 <!--
-  LX-MUSIC 通用客户端（安卓）
+  云音乐客户端（安卓）
 
   ── 与隔壁 music-edge 壳（android/）是什么关系 ──────────────────
   同一份 public/ 前端资源、同一套桥接思路，但产品定位不同：
     · android/（包名 com.zyplnn.musicedge）—— CF 那条线上的**离线自包含壳**：
       后端整个跑在设备内，不连任何服务器。
-    · client/（包名 com.zyplnn.lxclient，本工程）—— **通用客户端**：
+    · client/（包名 com.yunmusic.app，本工程）—— **云音乐客户端**：
       首启让你选连哪条线（内置离线 / Cloudflare / Docker 自托管 / 任意自建地址），
       连通后服务端自报是什么，界面就显示什么品牌。
   两者包名不同 → 可以同时装在一台机器上互不覆盖，方便对照。
+
+  ⚠ 这个包名是**沿用**的：V2.19 及更早的「云音乐客户端」是另一套手写前端
+  （曾放在 yunmusic-client/），也是 com.yunmusic.app、也用同一把 debug.keystore 签的。
+  V2.20 起前端换成 public/ 整包，但包名与签名保持不变 —— 老用户**原地覆盖安装**
+  即可升级，不必卸载重装（卸载会丢数据）。
 
   ── 分层（对应网易云客户端的 原生 + RN 混合架构）────────────────
     · 原生宿主层（Java）：ClientActivity 顶栏 / 原生底部导航 / 原生页面
@@ -30,9 +35,9 @@
       用 maxSdkVersion 卡住范围，新系统上不白要旧权限。
 -->
 <manifest xmlns:android="http://schemas.android.com/apk/res/android"
-    package="com.zyplnn.lxclient"
-    android:versionCode="270"
-    android:versionName="2.7">
+    package="com.yunmusic.app"
+    android:versionCode="400"
+    android:versionName="2.20">
     <!--
       versionCode / versionName 是 aapt2 link 时用 version-code / version-name 参数覆盖的
       （见 build-client.sh，值来自 client/version.mjs —— 客户端自己的版本线）。
