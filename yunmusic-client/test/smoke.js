@@ -477,6 +477,17 @@ function mockFetch(reqId, url, method, headers, body) {
 }
 
 let win = null
+/**
+ * 读客户端**当前**的登录 token。
+ *
+ * ⚠ 客户端的 `store.set` 是 `JSON.stringify` 之后写进 localStorage 的
+ * （见页面里的 `var store = {...}`），所以这里必须 `JSON.parse` 回来 ——
+ * 直接拿 `localStorage.getItem('ym.token')` 会得到带引号的 `"tk"`，
+ * 拼进 URL 却是不带引号的 `tk`，比对必然失败。
+ */
+function clientToken(w) {
+  try { return JSON.parse(w.localStorage.getItem('ym.token') || '""') || '' } catch (e) { return '' }
+}
 const vc = new VirtualConsole()
 vc.on('jsdomError', e => {
   const m = String(e && e.message || '')
@@ -1355,6 +1366,20 @@ ok(/P\.errStreak > 3/.test(errHandler), '连续失败 4 次熔断，停止自动
   ok(/useProxyStream\(autoplay\)/.test(lcCode), 'loadCurrent 无条件起播服务端插件流（/api/stream）')
   ok(!/api\('\/url/.test(lcCode), 'loadCurrent 里不再先问 /url 拿直链（「先直连」那一跳已去掉）')
   ok(!/useCandidate\(0, autoplay\)/.test(lcCode), 'loadCurrent 里不再直接播第一条直链候选')
+
+  /*
+   * ⚠⚠ 服务端插件流的 URL **必须带 token**，漏了就是「一首歌都放不出来」。
+   *
+   * /api/stream 在登录闸门之后（src/server/api.js 拿到 user 才轮到它），
+   * currentUser() 只认 Authorization 头或 `?token=` 查询参数；而 `<audio src>`
+   * 是浏览器自己发的请求，**加不了自定义头** → 只能走查询参数。
+   * 实测踩过：漏掉这一项 → 401 → <audio> 派发 error → 跳下一首，
+   * 整张歌单一首都放不出来。
+   */
+  const psCode = stripComments(blockAfter('function useProxyStream('))
+  ok(psCode !== '', '取到了 useProxyStream 正文（防止断言退化成空串假绿灯）')
+  ok(/api\/stream\?id=/.test(psCode), '取到了拼 /api/stream 的那段（确认没抓错块）')
+  ok(/token/.test(psCode), 'useProxyStream 把 token 拼进了 /api/stream 的查询串')
 }
 
 // 熔断的**行为**验证：连发 6 次 error，自动跳歌必须自己停下来。
@@ -1424,6 +1449,11 @@ eq(urlCallsIdle, urlCalls, '自动跳歌已经停下，不再无限重试（erro
 
   // ① 第一跳 = 服务端插件流；此时**一次 /url 都没发**
   ok(/\/api\/stream/.test(a.src), '每次播放第一跳就是服务端插件流（不再先试直连）', a.src)
+  // 与客户端**当前**的 token 精确比对（不是随便匹配一个非空值）
+  const liveToken = clientToken(win)
+  ok(liveToken !== '', '（前置）客户端确实持有登录 token，否则下面那条断言会空跑')
+  ok(a.src.indexOf('token=' + encodeURIComponent(liveToken)) > 0,
+    '插件流的 URL 带上了**当前登录 token**（漏了就是 401 → 一首歌都放不出来）', a.src)
   eq(API_CALLS.filter(c => c.path === '/url').length, 0, '刚点歌时不请求 /url（「先直连」那一跳已去掉）')
   eq($('#playerResolvedBy').textContent, '音源：服务端代理', '音源标识显示「服务端代理」')
   eq($('#playerArtist').textContent, '测试歌手  ·  网易云音乐', '歌手那一行仍然是歌曲所属平台（两处口径不串味）')

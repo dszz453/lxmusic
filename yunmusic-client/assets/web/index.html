@@ -874,7 +874,7 @@ em{font-style:normal}
    * 以前它在抽屉菜单、关于页、顶栏文案里各写一遍，发版必然漏改几处
    * （实测发到 V2.3 时抽屉里还写着 V2.2），所以收口到这里。
    */
-  var CLIENT_VERSION = 'V2.18'
+  var CLIENT_VERSION = 'V2.19'
 
   /* ------------------------------ 兼容垫片 ------------------------------
      部分老设备的系统 WebView 停留在 Chrome 4x，缺少下面这些 ES6 方法。
@@ -1512,7 +1512,21 @@ em{font-style:normal}
     P.candIndex = -1
     P.localSrc = false
     P.watchWaits = 0
-    audio.src = apiBase() + '/api/stream?id=' + encodeURIComponent(song.id) + '&q=' + P.quality
+    /*
+     * ⚠⚠ 必须带上 token，否则**一首歌都放不出来**。
+     *
+     * `/api/stream` 在登录闸门**之后**（`src/server/api.js` 第 783 行拿到 user 才轮到它），
+     * 而 `currentUser()` 只认两种凭据：`Authorization: Bearer <token>` 头，
+     * 或 **`?token=<token>` 查询参数**。
+     * `<audio src>` 是浏览器自己发的请求，**加不了自定义头** → 只能走查询参数。
+     *
+     * 网页端就是这么拼的（`public/js/player.js` 的 `serverStreamUrl`）：
+     *   new URLSearchParams({ id: song.id, q: state.quality, token: TOKEN() })
+     * 安卓客户端早先漏了这一项 —— 症状是 401 → `<audio>` 派发 error → 跳下一首，
+     * 表现成「一首歌都放不出来」。
+     */
+    audio.src = apiBase() + '/api/stream?id=' + encodeURIComponent(song.id)
+      + '&q=' + P.quality + (token ? '&token=' + encodeURIComponent(token) : '')
     applySource('proxy')
     if (autoplay) {
       playAudio(function () { toast('这个音源也放不出来，换下一首') })
