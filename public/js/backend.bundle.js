@@ -1,5 +1,5 @@
 /* 由 tools/build-app.mjs 自动生成，请勿手动修改。
- * 源摘要: edbbe12d3f51e733
+ * 源摘要: 1d3174b72c04722a
  * 模块数: 25
  *
  * 这是给安卓壳用的后端展平版：把 src/ 的 ESM 后端打成单个 IIFE，
@@ -4763,13 +4763,25 @@ async function resolveMusicUrlFast(song, quality, pluginPool, options = {}) {
     // ⚠ `trial` 必须一起带上：客户端拿到 urls 后会**再按体积排一次**（第二道保险）。
     // 它要是不知道哪条是片段，就会把「30 秒的无损片段（5MB）」排在
     // 「128k 完整版（4MB）」前面 —— 体积大在这一档恰恰是错的信号。
-    const ordered = [best, ...probed.filter(x => x !== best)]
-      .map((x) => ({ url: x.url, from: x.from, size: x.size || 0, trial: x.trial === true, rank: x.rank }))
+    /*
+     * ⚠ 次要候选必须按 compareCandidates 排序，**不能按「探测完成先后」交出去**。
+     *
+     * `probed` 的入列顺序是网络快慢，与「完整度」毫无关系：一条 30 秒试听片段
+     * 先探通，就会被排到完整版前面。而 `/api/stream` 正是拿这份列表当 preferUrls
+     * **串行取流**（不经过客户端那次重排）—— 于是「谁先探通就先取谁」，
+     * 用户看到的就是「放 30 秒就没了」。web 端与安卓客户端都会走到这条路径
+     * （直连级失败后退代理流时）。
+     *
+     * pickBest 与 compareCandidates 是同档位同顺序的两套实现（见各自注释），
+     * 所以排序后的第一条就是 best；这里显式取一次，保证返回的 url 与 urls[0] 一致。
+     */
+    const ordered = probed.slice().sort(compareCandidates)
+    const top = ordered[0] || best
     return {
-      urls: ordered,
-      url: best.url,
-      from: best.from,
-      size: best.size || 0,
+      urls: ordered.map((x) => ({ url: x.url, from: x.from, size: x.size || 0, trial: x.trial === true, rank: x.rank })),
+      url: top.url,
+      from: top.from,
+      size: top.size || 0,
       tried,
       unverified: false,
     }
@@ -8649,7 +8661,7 @@ __modules["src/version.js"] = function (__exports, __require) {
  * 所以统一读这里，谁也别再各写各的。
  *
  * ── 两条版本线，别混 ──────────────────────────────────────────
- *   APP_VERSION      产品版本，人看的。改功能才动它。当前 V2.10
+ *   APP_VERSION      产品版本，人看的。改功能才动它。当前 V2.12
  *   APP_VERSION_CODE 整数构建号，Android 靠它判断「能不能覆盖安装」。
  *                    每次要发新版就 +1，**不能倒退、不能重复**，
  *                    否则手机上会报「应用未安装」（签名相同也装不上）。
@@ -8675,10 +8687,10 @@ __modules["src/version.js"] = function (__exports, __require) {
  */
 
 /** 产品版本（对外展示用）。每发一版升 0.1。 */
-const APP_VERSION = 'V2.10'
+const APP_VERSION = 'V2.12'
 
 /** Android versionCode：整数、单调递增、跨次发布不可重复。每发一版 +1。 */
-const APP_VERSION_CODE = 120
+const APP_VERSION_CODE = 131
 
 /** 人类可读的完整标识，日志/关于页用。 */
 const APP_ID = 'lxmusic'

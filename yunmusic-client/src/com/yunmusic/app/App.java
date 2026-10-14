@@ -79,7 +79,7 @@ public class App extends Application {
         pw.println("时间: " + new SimpleDateFormat("yyyy-MM-dd HH:mm:ss", Locale.US).format(new Date()));
         pw.println("线程: " + (thread == null ? "?" : thread.getName()));
         pw.println("包名: com.yunmusic.app");
-        pw.println("版本: V2.16 (360)");
+        pw.println("版本: V2.17 (370)");
         pw.println("Android: " + android.os.Build.VERSION.RELEASE
                 + " (API " + android.os.Build.VERSION.SDK_INT + ")");
         pw.println("机型: " + android.os.Build.MANUFACTURER + " " + android.os.Build.MODEL);

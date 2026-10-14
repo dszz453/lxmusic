@@ -37,6 +37,19 @@ W() { cygpath -w "$1"; }                          # MSYS 路径 → Windows 路�
 LIST_WIN() { find "$@" | while read -r f; do cygpath -w "$f"; done; }
 
 APP_NAME="music-edge"
+# 2.12：修「播 30 秒就没了」—— 交给客户端的候选列表**没按完整度排序**。
+#     ① 根因：resolveMusicUrlFast 在「有候选探通」那条路径上交出去的 ordered 是
+#        「best 打头 + 其余按**探测完成先后**」。完成顺序是网络快慢，与完整度无关：
+#        一条 30 秒试听片段先探通，就会被排到完整版前面。而 /api/stream 正是拿
+#        这份列表当 preferUrls **串行取流**（不经过客户端那次重排）——
+#        于是「谁先探通就先取谁」，用户听到的就是「进度条只走 30 秒」。
+#        CF 与 Docker 都有；web 端（直连级失败后走 server 级）与安卓客户端
+#        （退代理流兜底）都走得到这条路。
+#        修法：ordered 改成 probed.slice().sort(compareCandidates)，与 pickBest
+#        同档位同顺序（已知死接口最后 → 试听片段最后 → 官方 CDN 优先 →
+#        体积大优先 → 插件评分序兜底）。
+#     ② 回归：test/stream-pick.mjs 两条断言，其中一条专门钉住「不许退回
+#        [best, ...probed.filter] 那种按完成先后交出去的写法」。
 # 2.11：修「搜专辑搜到了、点进去打不开 / 集数对不上」—— 两个 provider 的**响应形状不匹配**。
 #     ① QQ（tx）：专辑接口 fcg_v8_album_info_cp 回的是扁平字段
 #        （songmid / songname / size128 / strMediaMid），而 filterSong 是按**搜索接口**

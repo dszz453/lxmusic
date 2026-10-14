@@ -923,7 +923,7 @@ em{font-style:normal}
    * 以前它在抽屉菜单、关于页、顶栏文案里各写一遍，发版必然漏改几处
    * （实测发到 V2.3 时抽屉里还写着 V2.2），所以收口到这里。
    */
-  var CLIENT_VERSION = 'V2.16'
+  var CLIENT_VERSION = 'V2.17'
 
   /* ------------------------------ 兼容垫片 ------------------------------
      部分老设备的系统 WebView 停留在 Chrome 4x，缺少下面这些 ES6 方法。
@@ -1242,6 +1242,14 @@ em{font-style:normal}
   var LP = {
     // 总开关。true = 本地插件优先（失败退回服务端）；false = 只用服务端。
     on: false,
+    /*
+     * 「每次播放直接用插件」——true = 不走「先拿服务端直链试一下」那一跳。
+     *
+     * 与 on 不是一回事：on 管「插件在不在本机跑」，这一项管「播放时的第一跳是谁」。
+     * 默认 true（老板 2026-10-14 明确要求）：新歌单的第一首常常卡在直连那一跳上
+     * （服务端给的地址在手机网络里播不出来），直接被跳过去；回头再放又好了。
+     */
+    skipDirect: true,
     // lxcore.js 有没有加载成功（老 WebView 上可能整个文件解析失败）
     runtime: !!window.LXCore,
     // Worker 能不能用。为 false 时走主线程降级（带 LP_SKIP 黑名单）
@@ -1267,6 +1275,7 @@ em{font-style:normal}
 
   var LP_KEYS = {
     on: 'ym.lp.on',
+    skipDirect: 'ym.lp.skipDirect',   // 每次播放直接用插件（不走直连那一跳）
     enabled: 'ym.lp.enabled',     // { id: bool }
     imported: 'ym.lp.imported',   // [{id,name,url,script}]
     scores: 'ym.lp.scores',
@@ -1276,6 +1285,8 @@ em{font-style:normal}
 
   function lpRestore() {
     LP.on = store.get(LP_KEYS.on, false) === true
+    // 默认 true —— 老装机（没这个键）升级上来也直接吃到新行为
+    LP.skipDirect = store.get(LP_KEYS.skipDirect, true) === true
     var c = store.get(LP_KEYS.cache, null)
     if (c && typeof c === 'object') {
       LP.cache = {
@@ -2943,6 +2954,12 @@ em{font-style:normal}
    *
    * 每首歌只试一次；服务端也没解出来时继续走代理流兜底（见 afterServerResolveFail）。
    * 返回 true 表示已接管（异步续播），调用方不要再往下走。
+   *
+   * ── 第二个触发点（2026-10-14）────────────────────────────────
+   * 「每次播放直接调插件」之后，**代理流成了第一跳**（见 loadCurrent 里那段说明），
+   * 于是它也接在 error 处理的末尾：代理流失败时回头要一份候选直连试试 ——
+   * 代理流要过 Worker（可能被限流、超时），同一批候选直连反倒可能是通的。
+   * 两种情况共用同一个 triedServerResolve 守卫，每首合计只试一次。
    */
   function retryViaServer() {
     if (P.triedServerResolve) return false
@@ -2953,7 +2970,7 @@ em{font-style:normal}
     // 关键：清掉本地那份坏地址。不清的话后续任何一次重新解析（包括看门狗触发的
     // loadCurrent）都会原地命中同一个坏地址 —— 来回打转、永远退不到服务端。
     lpUrlCacheDel(lpUrlKey(song))
-    toast('本地插件没解出可播地址，改用服务端解析…', 2600)
+    toast('这条音源放不出来，换服务端候选再试…', 2600)
     api('/url?id=' + encodeURIComponent(song.id) + '&q=' + P.quality + '&fast=1')
       .then(function (r) {
         if (myToken !== P.loadToken) return
@@ -3032,6 +3049,31 @@ em{font-style:normal}
       loadLyric(song, myToken)
       pushHistory(song)
       return
+    }
+
+    /*
+     * ── 每次播放直接调插件（老板 2026-10-14 明确要求）────────────────
+     *
+     * 原来这里是「先问服务端要一串直链 → 客户端直连播 → 失败了才退
+     * /api/stream 代理流」。老板看到的就是这个顺序：播放页底部的音源标识
+     * 先闪一下直连、再变成插件；而**新歌单的第一首常常卡死在直连这一跳**
+     * （拿到的地址在手机网络里播不出来）被直接跳过去，回头再放同一首又好了
+     * （那时服务端已经热了）。web 端没有这个问题，是因为它的取流链
+     * （public/js/player.js 的 STAGES）本身就把插件级排在直连之前。
+     *
+     * 现在分两条，都不再有「先直连」这一跳：
+     *   · 本地插件开着 → 走本地插件（插件在本机跑，同样是一次到位），
+     *     它失败时由 retryViaServer 换成服务端候选；
+     *   · 本地插件没开 → **直接走服务端插件**。服务端 /api/stream 自己
+     *     逐个候选取流、还带跨源兜底，成功率比「客户端拿一条地址自己试」高。
+     *     代理流若失败，error 处理里接了一条「回头要候选直链」的兜底。
+     */
+    if (LP.skipDirect && !(LP.on && LP.runtime)) {
+      if (useProxyStream(autoplay)) {
+        loadLyric(song, myToken)
+        pushHistory(song)
+        return
+      }
     }
 
     // 本地插件优先、服务端兜底 —— 具体顺序与降级都在 resolveUrl 里（见其注释）
@@ -3182,9 +3224,15 @@ em{font-style:normal}
   function useNextFullCandidate() {
     var song = currentSong()
     if (!song) return false
-    // ⚠ 代理流（candIndex = -1）时**不许**回跳到候选列表：直连候选都已经试败过
-    //    才退到代理的，回去只会再失败一遍，还平白多一次起播。
-    if (P.candIndex < 0) return false
+    /*
+     * 代理流（candIndex = -1）时手上没有候选列表。
+     *
+     * 原来是直接放弃 —— 那时代理流只是最后的兜底，片段了也就片段了。
+     * 但「每次播放直接调插件」之后代理流成了**第一跳**（见 loadCurrent 的说明），
+     * 再放弃就等于「只要代理给的是试听片段，用户就永远只能听 30 秒」。
+     * 所以改成回头问服务端要一份候选直链，挑一条**没标成片段**的接着放。
+     */
+    if (P.candIndex < 0) return swapSnippetFromServer(song)
     if (P.snippetSwapFor !== song.id) { P.snippetSwapFor = song.id; P.snippetSwaps = 0 }
     if ((P.snippetSwaps || 0) >= 1) return false
     var list = P.cands || []
@@ -3197,6 +3245,49 @@ em{font-style:normal}
       return true
     }
     return false
+  }
+
+  /**
+   * 代理流给的是试听片段 → 回头要一份候选直链，挑一条完整的接着放。
+   *
+   * 换源额度与 useNextFullCandidate 共用（`snippetSwaps`，按**歌曲**记账、
+   * 每首最多 1 次）—— 免得「候选全是片段」时把一首歌拖成一长串 30 秒。
+   * 服务端那边已经按「试听片段排最后」排过序（见 src/lib/stream.js 的
+   * compareCandidates），所以这里通常第一条就是完整版。
+   */
+  function swapSnippetFromServer(song) {
+    /*
+     * 只在「每次播放直接用插件」模式下换源。
+     *
+     * 直连优先模式下代理流是**兜底** —— 直连候选都已经试败过才退过来的，
+     * 回去再试一遍没有意义（原设计如此，见本节开头那段注释）。
+     * 而「直接用插件」模式下代理流是**第一跳**，候选压根没试过，才值得换。
+     */
+    if (!LP.skipDirect) return false
+    if (P.snippetSwapFor !== song.id) { P.snippetSwapFor = song.id; P.snippetSwaps = 0 }
+    if ((P.snippetSwaps || 0) >= 1) return false
+    P.snippetSwaps = (P.snippetSwaps || 0) + 1
+    var myToken = P.loadToken
+    api('/url?id=' + encodeURIComponent(song.id) + '&q=' + P.quality + '&fast=1')
+      .then(function (r) {
+        if (myToken !== P.loadToken) return
+        var list = candidateList(r || {}, song)
+        var i
+        for (i = 0; i < list.length; i++) { if (!list[i].trial) break }
+        if (i >= list.length) { toast('这个源只给了试听片段，可换个音质再试', 5000); return }
+        P.cands = list
+        P.candsLocal = false
+        P.candIndex = -1
+        P.triedProxy = false     // 从代理流切回直连候选：代理流还可以再兜一次
+        P.watchWaits = 0
+        P.resumePos = 0          // 片段已经放过一遍了，从头放
+        useCandidate(i, true)    // 内部会把 snippet / snippetWarned 重置
+        toast('这条音源只有片段，换一条试试完整版')
+      })
+      .catch(function () {
+        if (myToken === P.loadToken) toast('这个源只给了试听片段，可换个音质再试', 5000)
+      })
+    return true
   }
 
   function togglePlay() {
@@ -5833,12 +5924,33 @@ em{font-style:normal}
     } else {
       desc = '已关闭：一律走服务端解析。打开后插件在本机运行，取流不经过远端。'
     }
+    /*
+     * 第二行「播放时直接用插件」。
+     *
+     * 与上面那个总开关**不是一回事**，别合并：
+     *   总开关（lpOn）     —— 插件在**哪儿**跑：本机 / 服务端。
+     *   这一行（skipDirect）—— 播放时的**第一跳是谁**：插件 / 先试直连。
+     * 默认开启。老板的原话是「请客户端每次播放直接调用插件」——
+     * 新歌单的第一首常常卡在「先试直连」那一跳上被跳过去，关掉它就是回到
+     * 「先试直连、失败再退插件」（省流量、拖动更跟手，但第一首容易翻车）。
+     */
     return '<div class="card-block" style="margin-bottom:12px">' +
       '<div class="card-block__head">' +
       '<div class="card-block__name">本地插件取流</div>' +
       '<label class="switch"><input type="checkbox" id="lpOn"' + (LP.on ? ' checked' : '') + (ok ? '' : ' disabled') + '><i></i></label>' +
       '</div>' +
       '<div class="card-block__desc">' + desc + '</div>' +
+      '</div>' +
+      '<div class="card-block" style="margin-bottom:12px">' +
+      '<div class="card-block__head">' +
+      '<div class="card-block__name">播放时直接用插件</div>' +
+      '<label class="switch"><input type="checkbox" id="lpSkipDirect"' + (LP.skipDirect ? ' checked' : '') + '><i></i></label>' +
+      '</div>' +
+      '<div class="card-block__desc">' +
+      (LP.skipDirect
+        ? '已开启：每次播放直接交给插件解析，不再先试直连 —— 新歌单的第一首更稳。'
+        : '已关闭：先试服务端直链，失败了再退插件 —— 省流量、拖动进度更跟手。') +
+      '</div>' +
       '</div>'
   }
 
@@ -6218,6 +6330,15 @@ em{font-style:normal}
       var want = this.checked
       if (want && !lpSetOn(true)) { this.checked = false; return }
       if (!want) lpSetOn(false)
+      lpRenderBody()
+    })
+
+    // 「播放时直接用插件」——只管播放的第一跳，不影响插件在哪儿跑
+    var sdEl = $('#lpSkipDirect')
+    if (sdEl) sdEl.addEventListener('change', function () {
+      LP.skipDirect = !!this.checked
+      store.set(LP_KEYS.skipDirect, LP.skipDirect)
+      toast(LP.skipDirect ? '已开启：每次播放直接用插件' : '已关闭：先试直连，失败再退插件')
       lpRenderBody()
     })
 
@@ -6662,6 +6783,15 @@ em{font-style:normal}
     if (P.candsLocal && retryViaServer()) return
     // ③ 候选都试完了 → 退服务端代理流（同源，规避防盗链），每首只退一次
     if (!P.triedProxy && useProxyStream(true)) return
+    /*
+     * ④ 代理流也没成 → 回头问服务端要一份候选直链再试一次。
+     *
+     * 「每次播放直接调插件」这条路（见 loadCurrent）把代理流放在第一跳，
+     * 所以它失败时不能就此判死：代理流要过 Worker，可能被限流或超时，
+     * 而同一批候选直连反倒是通的。每首只试一次
+     * （retryViaServer 内部的 triedServerResolve 守卫）。
+     */
+    if (retryViaServer()) return
     // ③ 真的没辙了：连续失败兜底。整队列音源都失效时，不能无休止地「自动下一首」
     P.errStreak = (P.errStreak || 0) + 1
     if (P.errStreak > 3) { P.errStreak = 0; toast('多个音源均无法播放，请切换线路后重试'); return }

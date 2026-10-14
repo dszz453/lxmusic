@@ -617,13 +617,25 @@ export async function resolveMusicUrlFast(song, quality, pluginPool, options = {
     // ⚠ `trial` 必须一起带上：客户端拿到 urls 后会**再按体积排一次**（第二道保险）。
     // 它要是不知道哪条是片段，就会把「30 秒的无损片段（5MB）」排在
     // 「128k 完整版（4MB）」前面 —— 体积大在这一档恰恰是错的信号。
-    const ordered = [best, ...probed.filter(x => x !== best)]
-      .map((x) => ({ url: x.url, from: x.from, size: x.size || 0, trial: x.trial === true, rank: x.rank }))
+    /*
+     * ⚠ 次要候选必须按 compareCandidates 排序，**不能按「探测完成先后」交出去**。
+     *
+     * `probed` 的入列顺序是网络快慢，与「完整度」毫无关系：一条 30 秒试听片段
+     * 先探通，就会被排到完整版前面。而 `/api/stream` 正是拿这份列表当 preferUrls
+     * **串行取流**（不经过客户端那次重排）—— 于是「谁先探通就先取谁」，
+     * 用户看到的就是「放 30 秒就没了」。web 端与安卓客户端都会走到这条路径
+     * （直连级失败后退代理流时）。
+     *
+     * pickBest 与 compareCandidates 是同档位同顺序的两套实现（见各自注释），
+     * 所以排序后的第一条就是 best；这里显式取一次，保证返回的 url 与 urls[0] 一致。
+     */
+    const ordered = probed.slice().sort(compareCandidates)
+    const top = ordered[0] || best
     return {
-      urls: ordered,
-      url: best.url,
-      from: best.from,
-      size: best.size || 0,
+      urls: ordered.map((x) => ({ url: x.url, from: x.from, size: x.size || 0, trial: x.trial === true, rank: x.rank })),
+      url: top.url,
+      from: top.from,
+      size: top.size || 0,
       tried,
       unverified: false,
     }

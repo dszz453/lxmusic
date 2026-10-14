@@ -626,6 +626,14 @@ async function boot() {
     pretendToBeVisual: true,
     virtualConsole: vc,
     beforeParse(w) {
+      /*
+       * 「每次播放直接用插件」（ym.lp.skipDirect）自 V2.17 起**默认 true**。
+       *
+       * 本文件里那几节播放链测试（候选降级、片段换源、代理兜底）测的是
+       * **直连优先**那条链，所以先把开关关掉，让它们继续走原路径；
+       * 默认开启后的新行为由 25 节单独测。
+       */
+      try { w.localStorage.setItem('ym.lp.skipDirect', 'false') } catch (e) { }
       // 本地插件运行时（真机上由 lxcore.js 提供；jsdom 里没法从 file:// 源加载）
       w.LXCore = FAKE_LXCORE
       // 插件数据（真机上由 plugins.data.js 懒加载提供）
@@ -3263,7 +3271,7 @@ let WY_ENCODED_ID = ''
   eq(get('P.candsLocal'), false, '来源标记改成服务端')
   eq(get('P.candIndex'), -1, '候选指针重置')
   ok(get('LOG').some(x => x === 'use:0:true'), '用服务端第一条候选续播')
-  ok(get('LOG').some(x => /本地插件没解出可播地址/.test(x)), '告诉用户「已改用服务端」')
+  ok(get('LOG').some(x => /换服务端候选/.test(x)), '告诉用户「已改用服务端」')
   eq(get('NEXTED'), 0, '救回来了就不该跳下一首')
 
   // ② 每首只试一次：已经问过服务端就不再问（否则会和看门狗互相触发成死循环）
@@ -3385,6 +3393,114 @@ let WY_ENCODED_ID = ''
   set('SCORE.tab = "kg"')
   ok(/data-scoretab="kg"[^>]*is-active|is-active[^>]*data-scoretab="kg"/.test(get('lpScoreRank()')),
     '用户选过的平台在重渲染后仍然是选中态')
+}
+
+/* ============================================================ */
+section('23.20 每次播放直接用插件（V2.17）')
+/* ============================================================ */
+
+/*
+ * 老板 2026-10-14 的原话：「请客户端每次播放直接调用插件」。
+ *
+ * 原行为是「先拿服务端直链试播、失败了才退插件」，新歌单的第一首常常卡在
+ * 直连那一跳上被整首跳过去。现在默认第一跳就是插件（服务端 /api/stream）。
+ *
+ * ⚠ 本文件的 beforeParse 把这个开关显式关成了 false —— 上面那几节播放链
+ *   测试测的是**直连优先**那条链，不能被这次改动带走。所以这一节先验证
+ *   「默认值」，再通过设置页把开关打开验证新行为，最后还原。
+ */
+
+/* ---- 默认值与接线（源码级） ---- */
+{
+  ok(/skipDirect:\s*true/.test(CODE), 'LP 里 skipDirect 默认 true（老装机升级上来也吃到新行为）')
+  // ⚠ 含字符串字面量的断言必须查 SCRIPT：CODE 是 blankOut 过的，字符串已被置空
+  ok(/skipDirect:\s*'ym\.lp\.skipDirect'/.test(SCRIPT), '有 ym.lp.skipDirect 这个键')
+  ok(/LP\.skipDirect\s*=\s*store\.get\(LP_KEYS\.skipDirect,\s*true\)/.test(CODE),
+    '读档时缺省为 true（老装机没有这个键）')
+  const lc = blockAfter('function loadCurrent(')
+  ok(/LP\.skipDirect\s*&&\s*!\(LP\.on\s*&&\s*LP\.runtime\)/.test(lc),
+    'loadCurrent 按开关决定第一跳：直接用插件 / 先试直连')
+}
+
+/* ---- 设置页开关 ---- */
+{
+  await go('#/plugins')
+  await sleep(250)
+  /*
+   * 先把「本地插件总开关」关掉 —— 本节要测的是老板的场景：
+   * **没开本地插件**时，播放直接走服务端插件（不再先试直连）。
+   * 本地插件开着时同样是「直接调插件」（插件在本机跑），那条路由上面覆盖。
+   */
+  const onEl = $('#lpOn')
+  if (onEl && onEl.checked) {
+    onEl.checked = false
+    onEl.dispatchEvent(new win.Event('change'))
+    await sleep(250)
+  }
+  const sd = $('#lpSkipDirect')
+  ok(!!sd, '设置页有「播放时直接用插件」开关')
+  eq(sd.checked, false, '（本测试环境里被显式关掉，好让上面的直连优先链保持可测）')
+  sd.checked = true
+  sd.dispatchEvent(new win.Event('change'))
+  await sleep(150)
+  eq(JSON.parse(win.localStorage.getItem('ym.lp.skipDirect')), true,
+    '打开后持久化 ym.lp.skipDirect=true')
+}
+
+/* ---- 打开后：点歌第一跳就是插件，连 /url 都不问 ---- */
+{
+  API_CALLS.length = 0
+  RESPONSES['/url'] = {
+    ok: true, from: 'wy', verified: true,
+    url: 'https://cdn.example.com/1.mp3',
+    urls: [{ url: 'https://cdn.example.com/1.mp3', from: '甲', size: 0, trial: false }]
+  }
+  await go('#/mine')
+  await go('#/chart?source=wy&id=c1')
+  await sleep(80)
+  $('#view .song').dispatchEvent(new win.MouseEvent('click', { bubbles: true }))
+  await sleep(300)
+  const a = $('#audio')
+  ok(/\/api\/stream/.test(a.src), '每次播放直接走插件（服务端代理流）', a.src)
+  eq(API_CALLS.filter(c => c.path === '/url').length, 0, '第一跳就是插件 —— 连 /url 都没问')
+  eq($('#playerResolvedBy').textContent, '音源：服务端代理',
+    '音源标识直接写「服务端代理」，不再先闪一下直连')
+}
+
+/* ---- 代理流给的是片段 → 回头要一份候选，换完整版 ---- */
+{
+  /*
+   * 这是「直接用插件」模式下才有的新路径：代理流是第一跳，手上没有候选列表，
+   * 片段时得回头问一次 /url。直连优先模式下不这么做（代理是兜底，候选已试败过）。
+   */
+  const a = $('#audio')
+  TOASTS.length = 0
+  API_CALLS.length = 0
+  Object.defineProperty(a, 'duration', { configurable: true, value: 30 })
+  /*
+   * ⚠ 必须先来一次 loadedmetadata：`P.snippet` 是 warnIfSnippet 在
+   *   loadedmetadata 里判出来的（looksSnippet 拿 audio.duration 比 song.interval）。
+   *   直接 dispatch('ended') 的话它还是 false，走的是「正常播完 → 下一首」，
+   *   根本进不到换源那条路 —— 断言会假绿。
+   */
+  a.dispatchEvent(new win.Event('loadedmetadata'))
+  await sleep(80)
+  TOASTS.length = 0
+  API_CALLS.length = 0
+  a.dispatchEvent(new win.Event('ended'))
+  await sleep(250)
+  eq(API_CALLS.filter(c => c.path === '/url').length, 1, '代理流片段 → 回头问一次 /url 要候选')
+  ok(/1\.mp3/.test(a.src), '换到那条候选（完整版）上接着放', a.src)
+  ok(TOASTS.some(t => /完整版/.test(t)), '告诉用户「这条音源只有片段，换一条试试完整版」')
+}
+
+/* ---- 还原：开关关回去，别影响后面的全局异常检查 ---- */
+{
+  await go('#/plugins')
+  await sleep(250)
+  const sd = $('#lpSkipDirect')
+  if (sd) { sd.checked = false; sd.dispatchEvent(new win.Event('change')); await sleep(120) }
+  eq(JSON.parse(win.localStorage.getItem('ym.lp.skipDirect')), false, '（还原）开关已关回 false')
 }
 
 /* ============================================================ */

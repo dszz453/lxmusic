@@ -208,7 +208,18 @@ check('挑选里有「体积大优先」这一档', /if \(as !== bs\) return bs 
 check('探通后不再立刻收工（armSettle 被调用）', /armSettle\(/.test(src))
 check('窗口到点后确实用了 pickBest', /pickBest\(probed\)/.test(src))
 check('放弃先探通的那条时会留下说明（可排查）', /疑似试听片段/.test(src))
-check('探通后返回的是多条候选（不只一条）', /const ordered = \[best, \.\.\.probed\.filter/.test(src))
+/*
+ * ⚠ 2026-10-14 改了这行的写法：原来交出去的是「best 打头 + 其余按**探测完成先后**」，
+ *   而完成顺序是网络快慢 —— 一条 30 秒试听片段先探通就会被排到完整版前面。
+ *   `/api/stream` 拿这份列表当 preferUrls **串行取流**（不经过客户端那次重排），
+ *   于是「谁先探通就先取谁」→ 用户听到的就是「放 30 秒就没了」。
+ *   现在按 compareCandidates 排序（trial 排最后、体积大优先、rank 兜底）。
+ *   断言的**意图不变**：返回的是全部探通候选，不只 best 一条。
+ */
+check('探通后返回的是**全部**探通候选（不只 best 一条），并按 compareCandidates 排序',
+  /const ordered = probed\.slice\(\)\.sort\(compareCandidates\)/.test(src))
+check('⚠ 候选列表不再按「探测完成先后」交出去（那是「放 30 秒就没了」的根因之一）',
+  !/\[best, \.\.\.probed\.filter/.test(src))
 check('⚠ 探通的那条若是**试听片段**，窗口放到总预算（而不是 450ms 就收工）',
   /armSettle\(trial \? Math\.max\(SETTLE_MS, totalBudget - \(Date\.now\(\) - t0\)\) : SETTLE_MS, trial\)/.test(src))
 check('已等到完整版时把窗口收回 450ms（别白耗满预算）',
@@ -219,8 +230,12 @@ check('⚠ 交给客户端的每条候选都带上 trial（客户端会按体积
 /*
  * rank：服务端偏好序位次。老板的原话是「插件也自动选择评分高的插件」。
  * 服务端确实有一份实测评分排序表（src/generated/plugin-rank.js），也确实用它
- * 决定先解析哪个插件；但返回给客户端的 urls 是「best 打头 + 其余按探测完成先后」，
- * 完成顺序是网络快慢、不是评分 —— 评分到这一步就被冲掉了。必须显式带过去。
+ * 决定先解析哪个插件。
+ *
+ * ⚠ 2026-10-14 起返回给客户端的 urls **也按 compareCandidates 排过**了
+ *   （rank 在 size 并列时起作用），但客户端仍会**再排一次** —— 它的判据来自
+ *   手机侧的真实网络，是服务端探不出来的。所以 rank 必须显式带过去，
+ *   否则客户端那一轮排序会把评分序丢掉。
  */
 check('⚠ 交给客户端的每条候选都带上 rank（插件实测评分序，缺了它评分就到不了客户端）',
   (src.match(/rank: x\.rank/g) || []).length === 2,
