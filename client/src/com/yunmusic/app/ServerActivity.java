@@ -6,529 +6,341 @@ import android.graphics.Color;
 import android.os.Bundle;
 import android.text.InputType;
 import android.util.Log;
+import android.view.Gravity;
 import android.view.View;
 import android.view.ViewGroup;
 import android.widget.EditText;
 import android.widget.LinearLayout;
 import android.widget.TextView;
 
-import java.util.List;
-
 /**
- * 服务器连接 —— 纯原生页面，客户端最要紧的一块地面。
+ * 服务器连接 —— 纯原生页面，双线路一站式直配。
  *
- * ══════════════ 为什么这块必须是原生的 ══════════════
- * 服务器地址填错时，跨端层（WebView 里那份前端）**自己都起不来** ——
- * 它拿不到数据、渲染不出界面、连「设置」都进不去。这时候如果服务器配置页
- * 也长在跨端层里，用户就彻底没有退路了（只能重装 App）。
- * 所以它是一块完全独立的原生地面：不依赖网络、不依赖 WebView、不依赖任何 JS。
- * （老壳里也有同样的考虑：登录页底部那个「服务器设置」入口，见 app.js 的 serverEntryHtml。）
- *
- * ══════════════ 三种形态，一个页面 ══════════════
- *   内置离线      后端完全跑在设备内，一个字节都不出设备。换机 / 重装会清空数据。
- *   Cloudflare    连线上那份 Worker（D1 数据库 + 静态资源），零运维、秒开。
- *   Docker 自托管 连自己那台（局域网 IP、域名、反代都可以），数据在自己手里。
- *   + 自建服务器   任意地址，可以存多条（家里一台、公司一台、外面一台）。
- *
- * 这三条线的**品牌名与版本各不相同**（Docker → LX-MUSIC，CF → music-edge），
- * 页面上的「连上后是什么」一栏就是握手问出来的结果 —— 不让用户去猜自己连的是谁。
+ * ══════════════ 极致交互设计 ══════════════
+ * 1. 拒绝捉迷藏：地址输入框直接露在卡片上，进页面点进去就能打字，不需要点什么「编辑」。
+ * 2. 切换一键直达：每条线路卡片自带「切换并连接」，点击时自动把当前输入框最新的地址落盘，
+ *    绝不拿「握手成功」当保存门槛，改了就能存、存了就能切！
+ * 3. 连通性即测即显：每条线路单独配「测试连接」，延迟、节点名称当场显示。
+ * 4. 内置离线独立卡片：随时一键退回全单机离线模式。
  */
 public class ServerActivity extends Activity {
 
     private static final String TAG = "LXC/Server";
 
-    /** 首启向导模式（显示欢迎语，连上后直接回主界面） */
     public static final String EXTRA_FIRST_RUN = "first_run";
-    /** 回给 ClientActivity：档案变了，需要整页重载 */
     public static final String EXTRA_CHANGED = "changed";
 
     private boolean firstRun = false;
     private boolean changed = false;
-
-    /** 当前在编辑哪条档案（id）。null = 没展开任何编辑器 */
-    private String editingId = null;
-
-    private LinearLayout listHost;
-    private LinearLayout editorHost;
-    /** 正在测试连接 / 正在连接 —— 期间把按钮禁掉，免得连点发出多个请求 */
     private boolean busy = false;
+
+    // 两个线路的输入控件引用
+    private EditText base1In;
+    private EditText user1In;
+    private TextView hint1;
+
+    private EditText base2In;
+    private EditText user2In;
+    private TextView hint2;
 
     @Override
     protected void onCreate(Bundle savedInstanceState) {
         super.onCreate(savedInstanceState);
         firstRun = getIntent() != null && getIntent().getBooleanExtra(EXTRA_FIRST_RUN, false);
-        render();
+        buildUi();
     }
 
-    /* ══════════════════ 页面骨架 ══════════════════ */
+    private void buildUi() {
+        ServerStore st = ServerStore.get(this);
+        ServerStore.Profile p1 = st.getLine1();
+        ServerStore.Profile p2 = st.getLine2();
+        ServerStore.Profile pb = st.find(ServerStore.ID_BUILTIN);
+        String activeId = st.activeId();
 
-    private void render() {
-        LinearLayout col = Ui.page(this, 24);
-        col.addView(Ui.titleBar(this, firstRun ? "选择连接方式" : "服务器连接",
+        LinearLayout col = Ui.page(this, 30);
+
+        // 顶栏
+        col.addView(Ui.titleBar(this, firstRun ? "配置连接方式" : "服务器与线路配置",
                 firstRun ? null : "完成", firstRun ? null : new View.OnClickListener() {
                     @Override
                     public void onClick(View v) {
+                        saveAllInputs(false);
                         finishWith(false);
                     }
                 }));
 
         if (firstRun) {
-            TextView hi = Ui.text(this, "这个客户端可以连不同的后端，先选一个：", 15,
+            TextView hi = Ui.text(this, "欢迎使用云音乐！请直接填写服务器地址即可开始听歌：", 14,
                     Ui.color(this, R.color.text), false);
-            hi.setPadding(Ui.dp(this, 18), Ui.dp(this, 16), Ui.dp(this, 18), 0);
+            hi.setPadding(Ui.dp(this, 18), Ui.dp(this, 14), Ui.dp(this, 18), Ui.dp(this, 4));
             col.addView(hi);
-            col.addView(Ui.note(this, "选错也没关系，之后随时可以在顶栏「切换」或设置里改。"));
         }
 
-        listHost = new LinearLayout(this);
-        listHost.setOrientation(LinearLayout.VERTICAL);
-        col.addView(listHost);
+        // ==================== 1. 主线路卡片 (地址 1) ====================
+        col.addView(Ui.section(this, "主线路 (地址 1)"));
+        LinearLayout card1 = Ui.card(this);
+        card1.setPadding(0, Ui.dp(this, 10), 0, Ui.dp(this, 14));
 
-        // 双地址配置卡片（一次性配置地址 1 与地址 2）
-        col.addView(buildDualAddressCard());
+        boolean isAct1 = ServerStore.ID_LINE1.equals(activeId);
+        card1.addView(buildCardHeader("地址 1 · 主线路", "通常为自建 Docker、内网群晖/NAS 或主自建服务", isAct1));
 
-        editorHost = new LinearLayout(this);
-        editorHost.setOrientation(LinearLayout.VERTICAL);
-        col.addView(editorHost);
+        base1In = Ui.input(this, "例如: http://192.168.1.100:8080 或域名",
+                p1 != null ? p1.base : "", InputType.TYPE_CLASS_TEXT | InputType.TYPE_TEXT_VARIATION_URI);
+        card1.addView(wrapField("服务器地址", base1In));
 
-        col.addView(Ui.note(this,
-                "地址可以不写协议：IP 与 localhost 按 http 处理（内网基本没证书），域名按 https。"
-                        + "带路径也可以，末尾的 /api 会自动去掉。"));
-        col.addView(Ui.note(this,
-                "握手 = 向该服务器请求 /api/version，拿它自报的品牌名与版本。"
-                        + "只用状态码判断是不够的 —— 反向代理挂掉时经常回一个 200 的错误页，"
-                        + "所以这里会看正文像不像本项目的接口。"));
+        user1In = Ui.input(this, "登录用户名（可选，填了登录页自动预填）",
+                p1 != null ? p1.user : "", InputType.TYPE_CLASS_TEXT);
+        card1.addView(wrapField("用户名 (可选)", user1In));
 
-        rebuildList();
-        rebuildEditor();
-    }
+        hint1 = Ui.text(this, (p1 != null && p1.checkedAt > 0) ? statusLine(p1) : "",
+                12f, Ui.color(this, R.color.text_3), false);
+        hint1.setPadding(Ui.dp(this, 16), Ui.dp(this, 4), Ui.dp(this, 16), Ui.dp(this, 2));
+        card1.addView(hint1);
 
-    private void rebuildList() {
-        if (listHost == null) return;
-        listHost.removeAllViews();
-        listHost.addView(Ui.section(this, "服务器档案"));
+        card1.addView(buildLineActions(ServerStore.ID_LINE1, isAct1, base1In, user1In, hint1));
+        col.addView(card1);
 
-        ServerStore st = ServerStore.get(this);
-        List<ServerStore.Profile> ps = st.profiles();
-        String activeId = st.activeId();
+        // ==================== 2. 备用线路卡片 (地址 2) ====================
+        col.addView(Ui.section(this, "备用线路 (地址 2)"));
+        LinearLayout card2 = Ui.card(this);
+        card2.setPadding(0, Ui.dp(this, 10), 0, Ui.dp(this, 14));
 
-        LinearLayout card = Ui.card(this);
-        boolean first = true;
-        for (int i = 0; i < ps.size(); i++) {
-            final ServerStore.Profile p = ps.get(i);
-            if (!first) card.addView(Ui.divider(this, true));
-            first = false;
-            card.addView(profileRow(p, p.id.equals(activeId)));
-        }
-        listHost.addView(card);
+        boolean isAct2 = ServerStore.ID_LINE2.equals(activeId);
+        card2.addView(buildCardHeader("地址 2 · 备用线路", "通常为 Cloudflare Workers 线上节点或备用域名", isAct2));
 
-        // 自建服务器：局域网里的另一台、反代出来的域名等
-        LinearLayout addCard = Ui.card(this);
-        addCard.addView(Ui.row(this, null, "＋ 添加自建服务器",
-                "任意地址，可存多条（家里 / 公司 / 外面各一台）", null, false,
-                new View.OnClickListener() {
-                    @Override
-                    public void onClick(View v) {
-                        ServerStore st2 = ServerStore.get(ServerActivity.this);
-                        ServerStore.Profile p = st2.addCustom("自建服务器", "", "");
-                        editingId = p.id;
-                        rebuildList();
-                        rebuildEditor();
-                    }
-                }));
-        listHost.addView(addCard);
-    }
+        base2In = Ui.input(this, "例如: https://你的-worker.workers.dev",
+                p2 != null ? p2.base : "", InputType.TYPE_CLASS_TEXT | InputType.TYPE_TEXT_VARIATION_URI);
+        card2.addView(wrapField("服务器地址", base2In));
 
-    /** 一条档案：名称 + 副标题（类型 / 地址 / 品牌）+ 右侧状态 + 选中标记 */
-    private View profileRow(final ServerStore.Profile p, boolean active) {
-        String right;
-        if (ServerStore.KIND_BUILTIN.equals(p.kind)) right = "本机";
-        else if (!p.usable()) right = "未配置";
-        else if (p.checkedAt > 0) right = "已连接";
-        else right = "未握手";
+        user2In = Ui.input(this, "登录用户名（可选）",
+                p2 != null ? p2.user : "", InputType.TYPE_CLASS_TEXT);
+        card2.addView(wrapField("用户名 (可选)", user2In));
 
-        String subtitle;
-        if (ServerStore.KIND_BUILTIN.equals(p.kind)) {
-            subtitle = kindLabel(p.kind) + " · 数据都在这台手机上，不连服务器";
-        } else if (p.base.isEmpty()) {
-            subtitle = kindLabel(p.kind) + " · 还没填地址";
+        hint2 = Ui.text(this, (p2 != null && p2.checkedAt > 0) ? statusLine(p2) : "",
+                12f, Ui.color(this, R.color.text_3), false);
+        hint2.setPadding(Ui.dp(this, 16), Ui.dp(this, 4), Ui.dp(this, 16), Ui.dp(this, 2));
+        card2.addView(hint2);
+
+        card2.addView(buildLineActions(ServerStore.ID_LINE2, isAct2, base2In, user2In, hint2));
+        col.addView(card2);
+
+        // ==================== 3. 内置离线卡片 ====================
+        col.addView(Ui.section(this, "无网络 / 全离线模式"));
+        boolean isActB = ServerStore.ID_BUILTIN.equals(activeId);
+        LinearLayout cardB = Ui.card(this);
+        cardB.setPadding(Ui.dp(this, 16), Ui.dp(this, 12), Ui.dp(this, 16), Ui.dp(this, 14));
+
+        LinearLayout topB = new LinearLayout(this);
+        topB.setOrientation(LinearLayout.HORIZONTAL);
+        topB.setGravity(Gravity.CENTER_VERTICAL);
+
+        LinearLayout leftB = new LinearLayout(this);
+        leftB.setOrientation(LinearLayout.VERTICAL);
+        leftB.addView(Ui.text(this, "内置离线模式", 15, Ui.color(this, R.color.text), true));
+        TextView subB = Ui.text(this, "后端完全在手机内运行，无需服务器。换机或重装会清空数据。",
+                12.5f, Ui.color(this, R.color.text_3), false);
+        Ui.margin(this, subB, 0, 2, 0, 0);
+        leftB.addView(subB);
+        topB.addView(leftB, new LinearLayout.LayoutParams(0, ViewGroup.LayoutParams.WRAP_CONTENT, 1f));
+
+        if (isActB) {
+            topB.addView(Ui.pill(this, "使用中", Color.WHITE, Ui.color(this, R.color.brand)));
         } else {
-            subtitle = kindLabel(p.kind) + " · " + p.base
-                    + (p.checkedAt > 0 ? " · " + p.brandName() : "");
+            TextView switchB = Ui.button(this, "切换离线", false, new View.OnClickListener() {
+                @Override
+                public void onClick(View v) {
+                    saveAllInputs(false);
+                    ServerStore s = ServerStore.get(ServerActivity.this);
+                    ServerStore.Profile p = s.find(ServerStore.ID_BUILTIN);
+                    if (p != null) switchTo(p);
+                }
+            });
+            switchB.setPadding(Ui.dp(this, 12), Ui.dp(this, 6), Ui.dp(this, 12), Ui.dp(this, 6));
+            topB.addView(switchB);
         }
+        cardB.addView(topB);
+        col.addView(cardB);
 
-        final String label = p.name;
-        LinearLayout row = Ui.row(this, null, label, subtitle, right, true,
-                new View.OnClickListener() {
-                    @Override
-                    public void onClick(View v) {
-                        editingId = p.id.equals(editingId) ? null : p.id;
-                        rebuildList();
-                        rebuildEditor();
-                    }
-                });
-        if (active) {
-            View mark = new View(this);
-            mark.setBackgroundColor(Ui.color(this, R.color.brand));
-            LinearLayout wrap = new LinearLayout(this);
-            wrap.setOrientation(LinearLayout.HORIZONTAL);
-            wrap.addView(mark, new LinearLayout.LayoutParams(Ui.dp(this, 3),
-                    ViewGroup.LayoutParams.MATCH_PARENT));
-            wrap.addView(row, new LinearLayout.LayoutParams(0,
-                    ViewGroup.LayoutParams.WRAP_CONTENT, 1f));
-            return wrap;
+        // ==================== 4. 底部一键保存 ====================
+        col.addView(Ui.section(this, ""));
+        TextView saveBtn = Ui.button(this, "保存配置并连接", true, new View.OnClickListener() {
+            @Override
+            public void onClick(View v) {
+                saveAllInputs(true);
+            }
+        });
+        LinearLayout.LayoutParams btnLp = new LinearLayout.LayoutParams(
+                ViewGroup.LayoutParams.MATCH_PARENT, Ui.dp(this, 46));
+        btnLp.setMargins(Ui.dp(this, 14), 0, Ui.dp(this, 14), Ui.dp(this, 20));
+        col.addView(saveBtn, btnLp);
+
+        col.addView(Ui.note(this, "提示：地址无需写 http/https，IP 与内网按 http，域名按 https 自动匹配。末尾的 /api 会自动纠正。"));
+    }
+
+    /** 卡片标题栏：左侧标题与说明，右侧状态药丸 */
+    private View buildCardHeader(String title, String subtitle, boolean isActive) {
+        LinearLayout row = new LinearLayout(this);
+        row.setOrientation(LinearLayout.HORIZONTAL);
+        row.setGravity(Gravity.CENTER_VERTICAL);
+        row.setPadding(Ui.dp(this, 16), Ui.dp(this, 4), Ui.dp(this, 16), Ui.dp(this, 6));
+
+        LinearLayout left = new LinearLayout(this);
+        left.setOrientation(LinearLayout.VERTICAL);
+        left.addView(Ui.text(this, title, 14.5f, Ui.color(this, R.color.text), true));
+        TextView sub = Ui.text(this, subtitle, 12f, Ui.color(this, R.color.text_3), false);
+        Ui.margin(this, sub, 0, 2, 0, 0);
+        left.addView(sub);
+        row.addView(left, new LinearLayout.LayoutParams(0, ViewGroup.LayoutParams.WRAP_CONTENT, 1f));
+
+        if (isActive) {
+            row.addView(Ui.pill(this, "当前生效", Color.WHITE, Ui.color(this, R.color.brand)));
+        } else {
+            row.addView(Ui.pill(this, "备用中", Ui.color(this, R.color.text_3), Ui.color(this, R.color.surface_2)));
         }
         return row;
     }
 
-    private static String kindLabel(String kind) {
-        if (ServerStore.KIND_BUILTIN.equals(kind)) return "内置离线";
-        if (ServerStore.KIND_CF.equals(kind)) return "Cloudflare";
-        if (ServerStore.KIND_DOCKER.equals(kind)) return "Docker 自托管";
-        return "自建";
+    /** 线路操作按钮行：[ 启用此线路 ] + [ 测试连接 ] */
+    private View buildLineActions(final String lineId, final boolean isActive,
+                                  final EditText baseEt, final EditText userEt, final TextView hintTv) {
+        LinearLayout row = new LinearLayout(this);
+        row.setOrientation(LinearLayout.HORIZONTAL);
+        row.setPadding(Ui.dp(this, 16), Ui.dp(this, 12), Ui.dp(this, 16), 0);
+
+        // 按钮 1：启用/使用中
+        String switchLabel = isActive ? "✔ 当前正在使用" : "切换并使用此线路";
+        TextView switchBtn = Ui.button(this, switchLabel, !isActive, new View.OnClickListener() {
+            @Override
+            public void onClick(View v) {
+                if (isActive) {
+                    Ui.toast(ServerActivity.this, "当前生效的就是此线路");
+                    return;
+                }
+                saveLineInput(lineId, baseEt, userEt);
+                ServerStore st = ServerStore.get(ServerActivity.this);
+                ServerStore.Profile p = st.find(lineId);
+                if (p == null || !p.usable()) {
+                    hintTv.setTextColor(Ui.color(ServerActivity.this, R.color.brand));
+                    hintTv.setText("请先填写服务器地址再启用");
+                    Ui.toast(ServerActivity.this, "请先填写服务器地址再启用");
+                    return;
+                }
+                switchTo(p);
+            }
+        });
+        if (isActive) {
+            switchBtn.setEnabled(false);
+            switchBtn.setAlpha(0.7f);
+        }
+
+        // 按钮 2：测试连接
+        TextView probeBtn = Ui.button(this, "测试连接", false, new View.OnClickListener() {
+            @Override
+            public void onClick(View v) {
+                saveLineInput(lineId, baseEt, userEt);
+                ServerStore st = ServerStore.get(ServerActivity.this);
+                ServerStore.Profile p = st.find(lineId);
+                if (p != null) doProbe(p, baseEt, userEt, hintTv);
+            }
+        });
+
+        LinearLayout.LayoutParams lp1 = new LinearLayout.LayoutParams(0, Ui.dp(this, 40), 1.2f);
+        LinearLayout.LayoutParams lp2 = new LinearLayout.LayoutParams(0, Ui.dp(this, 40), 1f);
+        lp2.setMargins(Ui.dp(this, 8), 0, 0, 0);
+
+        row.addView(switchBtn, lp1);
+        row.addView(probeBtn, lp2);
+        return row;
     }
 
-    /* ══════════════════ 编辑器 ══════════════════ */
-
-    private void rebuildEditor() {
-        if (editorHost == null) return;
-        editorHost.removeAllViews();
-        if (editingId == null) return;
-
-        final ServerStore st = ServerStore.get(this);
-        final ServerStore.Profile p = st.find(editingId);
-        if (p == null) {
-            editingId = null;
-            return;
-        }
-
-        /**
-         * 内置离线没有地址可填 —— 它回答的不是「连哪台机器」，而是「后端就跑在这台手机上」。
-         * 所以这里**不摆地址输入框**：摆一个改了不生效的框比没有更糟。
-         * 只给一句说明 + 一个「就用它」，语义与别的档案完全一致（选中 + 标记已走完引导）。
-         */
-        if (ServerStore.KIND_BUILTIN.equals(p.kind)) {
-            editorHost.addView(Ui.section(this, "编辑：" + p.name));
-            LinearLayout bcard = Ui.card(this);
-            bcard.addView(Ui.note(this,
-                    "后端完全跑在设备内：搜索、取流、歌单都在本机完成，一个字节都不出设备。\n"
-                            + "代价是数据只在这台手机上，换机或重装会清空；插件也在手机上跑，"
-                            + "首次点歌会慢一点。"));
-            bcard.addView(buttonRow(new String[] { "就用它", "取消" }, new Runnable[] {
-                    new Runnable() {
-                        @Override
-                        public void run() {
-                            ServerStore s2 = ServerStore.get(ServerActivity.this);
-                            s2.setActive(p.id);
-                            s2.setOnboarded(true);
-                            finishWith(true);
-                        }
-                    },
-                    new Runnable() {
-                        @Override
-                        public void run() {
-                            editingId = null;
-                            rebuildList();
-                            rebuildEditor();
-                        }
-                    },
-            }));
-            editorHost.addView(bcard);
-            return;
-        }
-
-        editorHost.addView(Ui.section(this, "编辑：" + p.name));
-        LinearLayout card = Ui.card(this);
-        card.setPadding(0, Ui.dp(this, 6), 0, Ui.dp(this, 12));
-
-        // 名称（仅自定义档案可改）
-        final EditText nameIn = Ui.input(this, "名称（列表里显示）", p.name,
-                InputType.TYPE_CLASS_TEXT);
-        if (!ServerStore.KIND_CUSTOM.equals(p.kind)) nameIn.setEnabled(false);
-        card.addView(wrapField("名称", nameIn));
-
-        final EditText baseIn = Ui.input(this,
-                ServerStore.KIND_CF.equals(p.kind) ? "https://你的-worker.workers.dev"
-                        : "https://music.example.com 或 192.168.1.9:8080",
-                p.base, InputType.TYPE_CLASS_TEXT | InputType.TYPE_TEXT_VARIATION_URI);
-        card.addView(wrapField("服务器地址", baseIn));
-
-        final EditText userIn = Ui.input(this, "登录用户名（可选，填了登录页自动带上）",
-                p.user, InputType.TYPE_CLASS_TEXT);
-        card.addView(wrapField("用户名", userIn));
-
-        final TextView hint = Ui.text(this, "", 12.5f, Ui.color(this, R.color.text_3), false);
-        hint.setPadding(Ui.dp(this, 16), Ui.dp(this, 4), Ui.dp(this, 16), Ui.dp(this, 2));
-        hint.setLineSpacing(Ui.dp(this, 3), 1f);
-        card.addView(hint);
-        if (p.checkedAt > 0) {
-            hint.setText(statusLine(p));
-        }
-
-        card.addView(buttonRow(
-                new String[]{"测试连接", "保存并连接", "删除本档案"},
-                new Runnable[]{
-                        new Runnable() {
-                            @Override
-                            public void run() {
-                                doProbe(p, baseIn, userIn, hint, null);
-                            }
-                        },
-                        new Runnable() {
-                            @Override
-                            public void run() {
-                                doProbe(p, baseIn, userIn, hint, new Runnable() {
-                                    @Override
-                                    public void run() {
-                                        // 握手过了（或用户就是要存）→ 设为当前并回主界面
-                                        ServerStore s2 = ServerStore.get(ServerActivity.this);
-                                        ServerStore.Profile cur = s2.find(p.id);
-                                        if (cur != null) {
-                                            cur.base = Handshake.normalize(baseIn.getText().toString());
-                                            cur.user = userIn.getText().toString().trim();
-                                            if (ServerStore.KIND_CUSTOM.equals(cur.kind)) {
-                                                String nm = nameIn.getText().toString().trim();
-                                                if (!nm.isEmpty()) cur.name = nm;
-                                            }
-                                            s2.upsert(cur);
-                                        }
-                                        s2.setActive(p.id);
-                                        s2.setOnboarded(true);
-                                        finishWith(true);
-                                    }
-                                });
-                            }
-                        },
-                        new Runnable() {
-                            @Override
-                            public void run() {
-                                final ServerStore s2 = ServerStore.get(ServerActivity.this);
-                                Ui.confirm(ServerActivity.this, "删除档案",
-                                        "确定删除「" + p.name + "」吗？只是从列表里去掉这条记录，"
-                                                + "服务器上的数据不受影响。",
-                                        "删除", new Runnable() {
-                                            @Override
-                                            public void run() {
-                                                s2.remove(p.id);
-                                                editingId = null;
-                                                rebuildList();
-                                                rebuildEditor();
-                                            }
-                                        }, null);
-                            }
-                        },
-                }));
-
-        editorHost.addView(card);
-
-        if (!p.base.isEmpty() && p.checkedAt > 0) {
-            editorHost.addView(Ui.note(this, statusLine(p)));
+    /** 保存单个输入框的内容到 Profile */
+    private void saveLineInput(String lineId, EditText baseEt, EditText userEt) {
+        if (baseEt == null || userEt == null) return;
+        String b = Handshake.normalize(baseEt.getText().toString());
+        String u = userEt.getText().toString().trim();
+        ServerStore st = ServerStore.get(this);
+        ServerStore.Profile p = st.find(lineId);
+        if (p != null) {
+            p.base = b;
+            p.user = u;
+            st.upsert(p);
         }
     }
 
-    /** 一行说明 + 输入框，统一左右留白 */
+    /** 保存全部输入框，若 andReconnect 为 true 则直接刷新当前连接 */
+    private void saveAllInputs(boolean andReconnect) {
+        saveLineInput(ServerStore.ID_LINE1, base1In, user1In);
+        saveLineInput(ServerStore.ID_LINE2, base2In, user2In);
+        ServerStore st = ServerStore.get(this);
+        ServerStore.Profile cur = st.active();
+        changed = true;
+        if (andReconnect) {
+            if (cur != null && !cur.usable()) {
+                Ui.toast(this, "当前选中的线路还没填地址，请填写");
+                return;
+            }
+            Ui.toast(this, "配置已保存，正在重新连接…");
+            finishWith(true);
+        }
+    }
+
+    /** 切换并退出 Activity 通知主界面刷新 */
+    private void switchTo(ServerStore.Profile p) {
+        saveLineInput(p.id, p.id.equals(ServerStore.ID_LINE1) ? base1In : base2In,
+                p.id.equals(ServerStore.ID_LINE1) ? user1In : user2In);
+        ServerStore st = ServerStore.get(this);
+        ServerStore.Profile now = st.setActive(p.id);
+        st.setOnboarded(true);
+        changed = true;
+        Ui.toast(this, "已切到「" + now.name + "」，正在重新连接…");
+        finishWith(true);
+    }
+
     private View wrapField(String label, View input) {
         LinearLayout box = new LinearLayout(this);
         box.setOrientation(LinearLayout.VERTICAL);
-        box.setPadding(Ui.dp(this, 16), Ui.dp(this, 8), Ui.dp(this, 16), 0);
-        TextView l = Ui.text(this, label, 12.5f, Ui.color(this, R.color.text_3), false);
-        l.setPadding(0, 0, 0, Ui.dp(this, 5));
+        box.setPadding(Ui.dp(this, 16), Ui.dp(this, 6), Ui.dp(this, 16), 0);
+        TextView l = Ui.text(this, label, 12f, Ui.color(this, R.color.text_3), false);
+        l.setPadding(0, 0, 0, Ui.dp(this, 4));
         box.addView(l);
         box.addView(input, new LinearLayout.LayoutParams(
                 ViewGroup.LayoutParams.MATCH_PARENT, ViewGroup.LayoutParams.WRAP_CONTENT));
         return box;
     }
 
-    /** 一行按钮（自动排布、自动留白） */
-    private View buttonRow(String[] labels, Runnable[] actions) {
-        LinearLayout row = new LinearLayout(this);
-        row.setOrientation(LinearLayout.HORIZONTAL);
-        row.setPadding(Ui.dp(this, 16), Ui.dp(this, 14), Ui.dp(this, 16), 0);
-        for (int i = 0; i < labels.length; i++) {
-            final Runnable a = actions[i];
-            // 第一个按钮是主操作（品牌红），其余是次要
-            TextView b = Ui.button(this, labels[i], i == 0, new View.OnClickListener() {
-                @Override
-                public void onClick(View v) {
-                    if (!busy) a.run();
-                }
-            });
-            LinearLayout.LayoutParams lp = new LinearLayout.LayoutParams(0, Ui.dp(this, 42), 1f);
-            if (i > 0) lp.setMargins(Ui.dp(this, 8), 0, 0, 0);
-            row.addView(b, lp);
-        }
-        return row;
-    }
-
-    /**
-     * 「已连接」那一行说明。
-     *
-     * ⚠ 不显示服务端版本与构建号（老板 2026-10-08：「服务端版本的显示，仅保留设置项里面，
-     * 其他页面去掉」）。这一页是**挑服务器**用的，要回答的是「哪台、什么时候通过信」。
-     * 唯一的例外是下面那条「版本对不上」的提示 —— 它不是一个给人看的数字，
-     * 而是一条可执行的建议，且本身不含任何版本值。
-     */
     private String statusLine(ServerStore.Profile p) {
         StringBuilder sb = new StringBuilder();
-        sb.append("上次握手：").append(p.brandName());
+        sb.append("上次连接：").append(p.brandName());
         if (p.checkedAt > 0) {
-            long min = (System.currentTimeMillis() - p.checkedAt) / 60000;
-            sb.append(min < 1 ? " · 刚刚" : (min < 60 ? " · " + min + " 分钟前" : " · " + (min / 60) + " 小时前"));
+            sb.append(" · ").append(handshakeAgo(p.checkedAt));
         }
         if (!p.version.isEmpty() && ClientBrand.compareVersion(p.version, ClientBrand.SERVICE_EXPECT) != 0) {
             sb.append("\n⚠ 版本与客户端期望的不同。通常仍然可用（接口是向后兼容的），"
-                            + "但如果遇到奇怪的问题，先把两边都升到同一版再试。");
+                    + "但如果遇到奇怪的问题，先把两边都升到同一版再试。");
         }
         return sb.toString();
     }
 
-    /* ══════════════════ 双地址一站式配置卡片 ══════════════════ */
-
-    private View buildDualAddressCard() {
-        final ServerStore st = ServerStore.get(this);
-        final ServerStore.Profile p1 = st.getLine1();
-        final ServerStore.Profile p2 = st.getLine2();
-
-        LinearLayout wrap = new LinearLayout(this);
-        wrap.setOrientation(LinearLayout.VERTICAL);
-        wrap.addView(Ui.section(this, "双服务器地址（一次填写两个地址）"));
-
-        LinearLayout card = Ui.card(this);
-        card.setPadding(0, Ui.dp(this, 10), 0, Ui.dp(this, 14));
-
-        TextView intro = Ui.text(this, "可同时配置两套后端（例如主线路填内网/自建 Docker，备用线路填 Cloudflare Workers），随时在设置里自由切换。",
-                12.5f, Ui.color(this, R.color.text_2), false);
-        intro.setPadding(Ui.dp(this, 16), 0, Ui.dp(this, 16), Ui.dp(this, 8));
-        card.addView(intro);
-
-        // ===== 节点 1：主线路 (Docker) =====
-        card.addView(Ui.divider(this, true));
-        TextView title1 = Ui.text(this, "【地址 1 · 主线路】", 13.5f, Ui.color(this, R.color.brand), true);
-        title1.setPadding(Ui.dp(this, 16), Ui.dp(this, 8), Ui.dp(this, 16), 0);
-        card.addView(title1);
-
-        final EditText base1In = Ui.input(this, "如: http://192.168.1.100:8080 或域名",
-                p1 != null ? p1.base : "", InputType.TYPE_CLASS_TEXT | InputType.TYPE_TEXT_VARIATION_URI);
-        card.addView(wrapField("服务器地址 1", base1In));
-
-        final EditText user1In = Ui.input(this, "用户名 1（可选）",
-                p1 != null ? p1.user : "", InputType.TYPE_CLASS_TEXT);
-        card.addView(wrapField("用户名 1", user1In));
-
-        final TextView hint1 = Ui.text(this, (p1 != null && p1.checkedAt > 0) ? statusLine(p1) : "",
-                12f, Ui.color(this, R.color.text_3), false);
-        hint1.setPadding(Ui.dp(this, 16), Ui.dp(this, 2), Ui.dp(this, 16), Ui.dp(this, 4));
-        card.addView(hint1);
-
-        // ===== 节点 2：备用线路 (Cloudflare) =====
-        card.addView(Ui.divider(this, true));
-        TextView title2 = Ui.text(this, "【地址 2 · 备用线路】", 13.5f, Ui.color(this, R.color.brand), true);
-        title2.setPadding(Ui.dp(this, 16), Ui.dp(this, 8), Ui.dp(this, 16), 0);
-        card.addView(title2);
-
-        final EditText base2In = Ui.input(this, "如: https://你的-worker.workers.dev",
-                p2 != null ? p2.base : "", InputType.TYPE_CLASS_TEXT | InputType.TYPE_TEXT_VARIATION_URI);
-        card.addView(wrapField("服务器地址 2", base2In));
-
-        final EditText user2In = Ui.input(this, "用户名 2（可选）",
-                p2 != null ? p2.user : "", InputType.TYPE_CLASS_TEXT);
-        card.addView(wrapField("用户名 2", user2In));
-
-        final TextView hint2 = Ui.text(this, (p2 != null && p2.checkedAt > 0) ? statusLine(p2) : "",
-                12f, Ui.color(this, R.color.text_3), false);
-        hint2.setPadding(Ui.dp(this, 16), Ui.dp(this, 2), Ui.dp(this, 16), Ui.dp(this, 4));
-        card.addView(hint2);
-
-        card.addView(Ui.divider(this, true));
-
-        // ===== 当前启用线路选择状态 =====
-        final String[] curSelect = new String[]{
-                ServerStore.ID_LINE2.equals(st.activeId()) ? ServerStore.ID_LINE2 : ServerStore.ID_LINE1
-        };
-        final TextView selectStatus = Ui.text(this,
-                "当前选用生效：" + (ServerStore.ID_LINE2.equals(curSelect[0]) ? "地址 2 (备用线路)" : "地址 1 (主线路)"),
-                13f, Ui.color(this, R.color.text), true);
-        selectStatus.setPadding(Ui.dp(this, 16), Ui.dp(this, 8), Ui.dp(this, 16), Ui.dp(this, 6));
-        card.addView(selectStatus);
-
-        // 线路切换辅助切换行
-        card.addView(buttonRow(new String[]{"测试地址 1 连通性", "测试地址 2 连通性"}, new Runnable[]{
-                new Runnable() {
-                    @Override
-                    public void run() {
-                        if (p1 != null) doProbe(p1, base1In, user1In, hint1, null);
-                    }
-                },
-                new Runnable() {
-                    @Override
-                    public void run() {
-                        if (p2 != null) doProbe(p2, base2In, user2In, hint2, null);
-                    }
-                }
-        }));
-
-        card.addView(buttonRow(new String[]{
-                "启用地址 1", "启用地址 2", "一键保存双地址并连接"
-        }, new Runnable[]{
-                new Runnable() {
-                    @Override
-                    public void run() {
-                        curSelect[0] = ServerStore.ID_LINE1;
-                        selectStatus.setText("当前选用生效：地址 1 (主线路)");
-                        Ui.toast(ServerActivity.this, "已选择地址 1 (主线路)");
-                    }
-                },
-                new Runnable() {
-                    @Override
-                    public void run() {
-                        curSelect[0] = ServerStore.ID_LINE2;
-                        selectStatus.setText("当前选用生效：地址 2 (备用线路)");
-                        Ui.toast(ServerActivity.this, "已选择地址 2 (备用线路)");
-                    }
-                },
-                new Runnable() {
-                    @Override
-                    public void run() {
-                        String b1 = Handshake.normalize(base1In.getText().toString());
-                        String u1 = user1In.getText().toString().trim();
-                        String b2 = Handshake.normalize(base2In.getText().toString());
-                        String u2 = user2In.getText().toString().trim();
-
-                        if (b1.isEmpty() && b2.isEmpty()) {
-                            Ui.toast(ServerActivity.this, "请至少填写一个服务器地址");
-                            return;
-                        }
-
-                        st.saveDualLines(b1, u1, b2, u2, curSelect[0]);
-                        rebuildList();
-                        finishWith(true);
-                    }
-                }
-        }));
-
-        wrap.addView(card);
-        return wrap;
+    private static String handshakeAgo(long checkedAt) {
+        long min = (System.currentTimeMillis() - checkedAt) / 60000;
+        if (min < 1) return "刚刚握过手";
+        if (min < 60) return min + " 分钟前握过手";
+        return (min / 60) + " 小时前握过手";
     }
 
-    /* ══════════════════ 握手 ══════════════════ */
-
-    /**
-     * 走一遍握手。**阻塞代码放工作线程**，UI 回主线程。
-     *
-     * @param thenOk runnable：握手成功后要做什么（保存并连接时为「设为当前并回主界面」）
-     */
     private void doProbe(final ServerStore.Profile p, final EditText baseIn,
-                         final EditText userIn, final TextView hint, final Runnable thenOk) {
+                         final EditText userIn, final TextView hint) {
         final String raw = baseIn.getText().toString();
         final String base = Handshake.normalize(raw);
         if (base.isEmpty()) {
             hint.setTextColor(Ui.color(this, R.color.brand));
             hint.setText("请先填写服务器地址");
+            Ui.toast(this, "请先填写服务器地址");
             return;
         }
         busy = true;
         hint.setTextColor(Ui.color(this, R.color.text_3));
-        hint.setText("正在连接 " + base + " …");
+        hint.setText("正在测试连接 " + base + " …");
 
         new Thread(new Runnable() {
             @Override
@@ -545,7 +357,6 @@ public class ServerActivity extends Activity {
                             Ui.toast(ServerActivity.this, "连不上：" + r.error);
                             return;
                         }
-                        // 握手成功 → 把结果落到档案上（品牌名 / 版本 / 构建号）再刷新界面
                         ServerStore st = ServerStore.get(ServerActivity.this);
                         st.saveHandshake(p.id, r);
                         ServerStore.Profile cur = st.find(p.id);
@@ -558,28 +369,18 @@ public class ServerActivity extends Activity {
                         StringBuilder sb = new StringBuilder();
                         sb.append("连接成功（").append(r.ms).append("ms）→ ")
                                 .append(r.brandName(ServerStore.KIND_DOCKER.equals(p.kind) ? "docker" : "cf"));
-                        if (r.needsSetup) sb.append("\n这台服务器还没建管理员，连接后会引导你创建。");
+                        if (r.needsSetup) sb.append("\n该服务器尚未初始化，连接后将引导设置管理员。");
                         if (r.versionMismatch) {
                             sb.append("\n⚠ 服务端版本与客户端期望的不同，通常仍可用。");
                         }
                         hint.setText(sb.toString());
-                        Ui.toast(ServerActivity.this, "连接成功：" + r.brandName("cf"));
-                        rebuildList();
-                        if (thenOk != null) thenOk.run();
+                        Ui.toast(ServerActivity.this, "连接成功 (" + r.ms + "ms)");
                     }
                 });
             }
         }, "lx-handshake").start();
     }
 
-    /* ══════════════════ 收尾 ══════════════════ */
-
-    /**
-     * 结束本页并告诉主界面「档案有没有变」。
-     *
-     * 变了就要整页重载（换后端意味着 token / 插件池 / 缓存 / 播放队列全要换一套），
-     * 没变（只是看了一眼、点了「完成」）就不打扰用户当前的界面。
-     */
     private void finishWith(boolean didChange) {
         if (didChange) changed = true;
         Intent data = new Intent();
@@ -590,8 +391,8 @@ public class ServerActivity extends Activity {
 
     @Override
     public void onBackPressed() {
+        saveAllInputs(false);
         super.onBackPressed();
-        // 用返回键退出时也要把结果带回去，否则主界面不知道要不要重载
         Intent data = new Intent();
         data.putExtra(EXTRA_CHANGED, changed);
         setResult(RESULT_OK, data);

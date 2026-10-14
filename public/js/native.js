@@ -500,13 +500,21 @@
    * JSON.stringify、store.get 会 JSON.parse。这里图省事直接塞裸字符串的话，
    * api.js 的 getToken() 会在 JSON.parse 时抛错并回落成空串，表现为「明明登录了
    * 却一直跳登录页」。所以这里显式做同样的编解码。
+   *
+   * ⚠ 键**按服务器分开**，与 api.js 的 tokenKey() 同一套口径（见那边的说明）：
+   * 两条线的令牌互不通用，共用一个键会让「切线路」变成「切一次登一次」。
+   * 网页端与「内置离线」的 base 为空 → 键仍是 `lx.token`，行为不变。
    */
+  function tokenKey() {
+    const b = String(serverBase || '').replace(/\/+$/, '')
+    return b ? TOKEN_KEY + '@' + b : TOKEN_KEY
+  }
   function saveToken(t) {
-    try { global.localStorage.setItem(TOKEN_KEY, JSON.stringify(t || '')) } catch { /* ignore */ }
+    try { global.localStorage.setItem(tokenKey(), JSON.stringify(t || '')) } catch { /* ignore */ }
   }
   function loadToken() {
     try {
-      const raw = global.localStorage.getItem(TOKEN_KEY)
+      const raw = global.localStorage.getItem(tokenKey())
       if (raw == null) return ''
       const v = JSON.parse(raw)
       return typeof v === 'string' ? v : ''

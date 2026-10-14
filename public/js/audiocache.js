@@ -393,8 +393,26 @@
     return { ok: true, bytes: Number(body.headers.get('content-length') || 0) }
   }
 
+  /**
+   * 当前服务器上的登录令牌。
+   *
+   * ⚠ 两个坑都在这里，别踩回去：
+   *   1) 键**按服务器分开**（与 api.js 的 tokenKey() 同一口径）。共用一个键的话，
+   *      在 A 线登录、切到 B 线后会把 A 的令牌拼进 B 的请求 → 401。
+   *   2) `U.store.set` 写进去的是 `JSON.stringify` 过的值（带引号）。这里原来读的是
+   *      **裸字符串**，于是 `token` 参数变成 `%22tk%22` —— 服务端验签必然不过。
+   *      所以要和 api.js 一样 JSON.parse 回来，解析失败才退回原文。
+   */
   function tokenOf() {
-    try { return global.localStorage.getItem('lx.token') || '' } catch { return '' }
+    try {
+      const base = String((global.LX_REMOTE_BASE || '')).replace(/\/+$/, '')
+      const raw = global.localStorage.getItem(base ? 'lx.token@' + base : 'lx.token')
+      if (raw == null) return ''
+      try {
+        const v = JSON.parse(raw)
+        return typeof v === 'string' ? v : ''
+      } catch { return raw }
+    } catch { return '' }
   }
 
   /**

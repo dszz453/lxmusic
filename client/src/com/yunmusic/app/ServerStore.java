@@ -64,6 +64,14 @@ public final class ServerStore {
     public static final String ID_LINE1 = ID_DOCKER;
     public static final String ID_LINE2 = ID_CF;
 
+    /**
+     * 三个固定槽位的显示名（代码写死，用户改不了）。
+     * 短、带序号、把「主/备」写清楚 —— 切换时一眼能认出哪条是哪条。
+     */
+    public static final String NAME_LINE1 = "地址 1 · 主线路";
+    public static final String NAME_LINE2 = "地址 2 · 备用线路";
+    public static final String NAME_BUILTIN = "内置离线";
+
     public static final class Profile {
         public String id = "";
         /** 界面上显示的名字 */
@@ -185,29 +193,36 @@ public final class ServerStore {
      *
      * 顺序即列表里的展示顺序：两条线路在前（老板要的「双线路」是主用法），
      * 内置离线垫后，作为「哪台服务器都连不上时的落脚点」。
+     *
+     * ⚠ 固定槽位的**名字由代码写死**（每轮 load 都重新盖一遍）：它们在界面上
+     * 不可改名，若只在新建时命名，老用户会一直留着上一个版本的长名字
+     * （曾叫「地址 1 (主线路 / Docker)」，在窄屏上把整行挤成省略号）。
      */
     private void ensureDefaults() {
         if (find(ID_LINE1) == null) {
             Profile p = new Profile();
             p.id = ID_LINE1;
-            p.name = "地址 1 (主线路 / Docker)";
             p.kind = KIND_DOCKER;
             profiles.add(p);
         }
+        find(ID_LINE1).name = NAME_LINE1;
+
         if (find(ID_LINE2) == null) {
             Profile p = new Profile();
             p.id = ID_LINE2;
-            p.name = "地址 2 (备用线路 / Cloudflare)";
             p.kind = KIND_CF;
             profiles.add(p);
         }
+        find(ID_LINE2).name = NAME_LINE2;
+
         if (find(ID_BUILTIN) == null) {
             Profile p = new Profile();
             p.id = ID_BUILTIN;
-            p.name = "内置离线";
             p.kind = KIND_BUILTIN;
             profiles.add(p);
         }
+        find(ID_BUILTIN).name = NAME_BUILTIN;
+
         if (find(activeId) == null) {
             activeId = ID_LINE1;
         }
@@ -272,57 +287,6 @@ public final class ServerStore {
     }
 
     /**
-     * 一次性配置两个地址，并指定激活其中一条
-     * @param addr1 地址 1 (如内网/公网 Docker)
-     * @param user1 地址 1 用户名
-     * @param addr2 地址 2 (如 Cloudflare Workers)
-     * @param user2 地址 2 用户名
-     * @param activeLine 要激活的线路 ID (ID_LINE1 或 ID_LINE2)
-     */
-    public Profile saveDualLines(String addr1, String user1, String addr2, String user2, String activeLine) {
-        Profile p1 = getLine1();
-        if (p1 != null) {
-            p1.base = addr1 != null ? addr1.trim() : "";
-            p1.user = user1 != null ? user1.trim() : "";
-        }
-        Profile p2 = getLine2();
-        if (p2 != null) {
-            p2.base = addr2 != null ? addr2.trim() : "";
-            p2.user = user2 != null ? user2.trim() : "";
-        }
-
-        if (activeLine != null && (activeLine.equals(ID_LINE1) || activeLine.equals(ID_LINE2))) {
-            activeId = activeLine;
-        } else if (p1 != null && p1.usable()) {
-            activeId = ID_LINE1;
-        } else if (p2 != null && p2.usable()) {
-            activeId = ID_LINE2;
-        } else {
-            activeId = ID_LINE1;
-        }
-        onboarded = true;
-        save();
-        return active();
-    }
-
-    /** 在地址 1 和 地址 2 之间快速切换 */
-    public Profile toggleDualLine() {
-        if (ID_LINE1.equals(activeId)) {
-            Profile p2 = getLine2();
-            if (p2 != null && p2.usable()) {
-                activeId = ID_LINE2;
-            }
-        } else {
-            Profile p1 = getLine1();
-            if (p1 != null && p1.usable()) {
-                activeId = ID_LINE1;
-            }
-        }
-        save();
-        return active();
-    }
-
-    /**
      * 首次启动（从没走完过引导）。
      * 注意判据不只是「有没有存过地址」—— 用户可能选了内置离线就打算这么用，
      * 那也算走完引导。所以单独立一个 onboarded 标记。
@@ -344,6 +308,11 @@ public final class ServerStore {
      * 只有**可用**（内置模式，或已填了地址）的档案才切得动 —— 点一个空地址的槽位
      * 等于把客户端切到「连不上任何东西」的状态，那不该是一次点击的后果。
      * 地址能不能真连通**不在这里校验**：那是握手的活。这里只管「有没有填」。
+     *
+     * ⚠ 切不动时**不抛异常也不报错**，只是原样返回当前生效的那条 ——
+     * 所以调用方**必须先看 `p.usable()`**，否则用户点了没反应还查不出原因。
+     * （2026-10-14 老板报「切换到线路 2 不生效」就是踩在这个静默失败上：
+     * 界面那边连 `setActive` 都没调，只改了一个局部变量。）
      */
     public Profile setActive(String id) {
         Profile p = find(id);

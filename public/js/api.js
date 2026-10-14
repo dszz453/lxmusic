@@ -4,8 +4,32 @@
 
   const TOKEN_KEY = 'lx.token'
 
-  function getToken() { return U.store.get(TOKEN_KEY, '') || '' }
-  function setToken(t) { U.store.set(TOKEN_KEY, t || '') }
+  /**
+   * token 的存储键**按服务器分开**。
+   *
+   * ── 为什么必须分开（2026-10-14 老板报「切换到线路 2 不生效」的连带根因）──
+   * 令牌是服务端用**自己的密钥**签的（`src/server/api.js` 的 verifyToken：
+   * `md5(userId.exp.secret(env))`），而 Docker 与 Cloudflare 两条线的密钥、
+   * 用户表、会话各不相同。用**一个全局键**存 token 的后果是：
+   * 从 A 线切到 B 线，B 线收到 A 的令牌 → 验签不过 → 401 → 前端把身份清掉、
+   * 跳登录页。用户看到的是「切过去了，但要重新登录」，切回来又要登一次 ——
+   * 「双线路随时切换」这件事就废了。
+   *
+   * ── 为什么网页端一行都不用改 ──
+   * 网页端没有 `LX_REMOTE_BASE`（页面自己的 origin 就是服务器），base 恒为空
+   * → 键还是原来的 `lx.token`，行为与改动前**完全一致**。
+   * 安卓壳里只有「远程档案」才有 base；「内置离线」base 为空，同样是老键。
+   *
+   * ⚠ 键里带的是地址原文，改档案地址等于换了键（会要求重新登录一次）——
+   * 这是对的：换了服务器本来就该重新认一次人。
+   */
+  function tokenKey() {
+    const base = String((global.LX_REMOTE_BASE || '')).replace(/\/+$/, '')
+    return base ? TOKEN_KEY + '@' + base : TOKEN_KEY
+  }
+
+  function getToken() { return U.store.get(tokenKey(), '') || '' }
+  function setToken(t) { U.store.set(tokenKey(), t || '') }
 
   /**
    * 请求超时。
