@@ -55,21 +55,27 @@ public final class ServerStore {
     /** 用户自建的其它地址（反代、局域网其它机器…） */
     public static final String KIND_CUSTOM = "custom";
 
-    /** 三档预设的固定 id —— 它们是「槽位」，地址由用户填，不随增删走动 */
+    /** 固定槽位 id（内置离线 + 单一服务器地址）—— 地址由用户填，不随增删走动 */
     public static final String ID_BUILTIN = "builtin";
+    /** 保留历史 id：老版本存过 "cf" / "docker" 两条线，读回来时仍要认得 */
     public static final String ID_CF = "cf";
     public static final String ID_DOCKER = "docker";
 
-    /** 双地址槽位映射：地址 1 (主线路) 与 地址 2 (备用线路) */
-    public static final String ID_LINE1 = ID_DOCKER;
-    public static final String ID_LINE2 = ID_CF;
-
     /**
-     * 三个固定槽位的显示名（代码写死，用户改不了）。
-     * 短、带序号、把「主/备」写清楚 —— 切换时一眼能认出哪条是哪条。
+     * 单一服务器槽位。
+     *
+     * ⚠ 2026-10-15（V2.21）：老板要求「docker 版本不要写两个线路了，一个就行」。
+     * 于是去掉「主线路 / 备用线路」的二分，只留一个服务器地址槽位。
+     * `ID_SERVER` 就是它 —— 沿用老的主线路 id（"docker"），这样**老用户升级后
+     * 已填的地址直接还在**，不用重新手打一遍。
      */
-    public static final String NAME_LINE1 = "地址 1 · 主线路";
-    public static final String NAME_LINE2 = "地址 2 · 备用线路";
+    public static final String ID_SERVER = ID_DOCKER;
+    /** 兼容别名：老代码 / 老配置里读到的 ID_LINE1 与 ID_SERVER 是同一个槽位 */
+    public static final String ID_LINE1 = ID_SERVER;
+
+    /** 槽位的显示名（单线路设计：一个服务器线路 + 内置离线）。 */
+    public static final String NAME_SERVER = "服务器地址";
+    public static final String NAME_LINE1 = NAME_SERVER;
     public static final String NAME_BUILTIN = "内置离线";
 
     public static final class Profile {
@@ -189,14 +195,16 @@ public final class ServerStore {
     }
 
     /**
-     * 补齐预设槽位：地址 1 (主线路 / Docker)、地址 2 (备用线路 / Cloudflare)、内置离线。
+     * 补齐固定槽位：单一「服务器地址」与「内置离线」。
      *
-     * 顺序即列表里的展示顺序：两条线路在前（老板要的「双线路」是主用法），
-     * 内置离线垫后，作为「哪台服务器都连不上时的落脚点」。
+     * 单线路模型（V2.21）：用户只需填写**一个**服务器地址，不再区分线路 1 / 线路 2。
      *
-     * ⚠ 固定槽位的**名字由代码写死**（每轮 load 都重新盖一遍）：它们在界面上
-     * 不可改名，若只在新建时命名，老用户会一直留着上一个版本的长名字
-     * （曾叫「地址 1 (主线路 / Docker)」，在窄屏上把整行挤成省略号）。
+     * ── 老配置的平滑迁移 ──────────────────────────────────────────────
+     * V2.20 及以前存过两条线：`docker`（主线路）与 `cf`（备用线路）。现在只留一个槽位，
+     * 迁移规则按「哪条是用户真在用的」来：
+     *   ① 若当前生效的是老备用线路（cf）→ 把它的地址搬到服务器槽位，并让服务器槽位生效；
+     *   ② 否则老备用线路的地址若比服务器槽位更完整，也搬过来（别让用户填过的地址白丢）；
+     * 迁移完成后**删掉 cf 槽位**，避免它在存档里长期游离（它的地址已经被吸收）。
      */
     private void ensureDefaults() {
         if (find(ID_LINE1) == null) {
@@ -205,15 +213,23 @@ public final class ServerStore {
             p.kind = KIND_DOCKER;
             profiles.add(p);
         }
-        find(ID_LINE1).name = NAME_LINE1;
+        Profile server = find(ID_LINE1);
+        server.name = NAME_LINE1;
 
-        if (find(ID_LINE2) == null) {
-            Profile p = new Profile();
-            p.id = ID_LINE2;
-            p.kind = KIND_CF;
-            profiles.add(p);
+        // 老「备用线路」(cf) 的收编：地址搬到唯一槽位，然后移除该槽位
+        Profile legacy = find(ID_CF);
+        if (legacy != null) {
+            if (legacy.usable() && ID_CF.equals(activeId)) {
+                // 用户当时正在用备用线路 → 它才是「当前地址」，整份搬过去
+                copyInto(server, legacy);
+                activeId = ID_LINE1;
+            } else if (legacy.usable() && !server.usable()) {
+                // 服务器槽位还是空的，而备用线路填过 → 接过来，别让地址白填
+                copyInto(server, legacy);
+            }
+            profiles.remove(legacy);
+            save();
         }
-        find(ID_LINE2).name = NAME_LINE2;
 
         if (find(ID_BUILTIN) == null) {
             Profile p = new Profile();
@@ -226,6 +242,16 @@ public final class ServerStore {
         if (find(activeId) == null) {
             activeId = ID_LINE1;
         }
+    }
+
+    /** 把 from 的连接信息整份搬到 to（迁移老线路用；只搬地址与握手结果，不动 id/name） */
+    private static void copyInto(Profile to, Profile from) {
+        to.base = from.base;
+        to.user = from.user;
+        to.host = from.host;
+        to.version = from.version;
+        to.build = from.build;
+        to.checkedAt = from.checkedAt;
     }
 
     public void save() {
@@ -266,22 +292,12 @@ public final class ServerStore {
         return activeId;
     }
 
-    /** 获取地址 1 (主线路) 档案 */
+    /** 获取唯一的服务器地址档案 */
     public Profile getLine1() {
         Profile p = find(ID_LINE1);
         if (p == null) {
             ensureDefaults();
             p = find(ID_LINE1);
-        }
-        return p;
-    }
-
-    /** 获取地址 2 (备用线路) 档案 */
-    public Profile getLine2() {
-        Profile p = find(ID_LINE2);
-        if (p == null) {
-            ensureDefaults();
-            p = find(ID_LINE2);
         }
         return p;
     }
@@ -311,7 +327,7 @@ public final class ServerStore {
      *
      * ⚠ 切不动时**不抛异常也不报错**，只是原样返回当前生效的那条 ——
      * 所以调用方**必须先看 `p.usable()`**，否则用户点了没反应还查不出原因。
-     * （2026-10-14 老板报「切换到线路 2 不生效」就是踩在这个静默失败上：
+     * （2026-10-14 老板报「切换线路不生效」就是踩在这个静默失败上：
      * 界面那边连 `setActive` 都没调，只改了一个局部变量。）
      */
     public Profile setActive(String id) {
@@ -356,11 +372,17 @@ public final class ServerStore {
         return find(p.id);
     }
 
-    /** 删除档案。三个预设槽位（地址 1 / 地址 2 / 内置离线）不给删，双地址槽位只清空地址 */
+    /**
+     * 删除档案。
+     *
+     * 两个固定槽位（服务器地址 / 内置离线）不给删：内置离线没有地址可清，
+     * 服务器槽位则只把地址清空（槽位本身必须一直在，否则界面没东西可填）。
+     * 只有「用户自建档案」才真的会被移除。
+     */
     public boolean remove(String id) {
         // 内置离线没有地址可清，固定槽位直接拒绝删除
         if (ID_BUILTIN.equals(id)) return false;
-        if (ID_LINE1.equals(id) || ID_LINE2.equals(id)) {
+        if (ID_LINE1.equals(id)) {
             Profile p = find(id);
             if (p != null) {
                 p.base = "";

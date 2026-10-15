@@ -8,14 +8,14 @@
       网页版是 https，会被浏览器按混合内容拦掉；壳里放开这一层，直连命中率更高。
 -->
 <manifest xmlns:android="http://schemas.android.com/apk/res/android"
-    package="com.zyplnn.musicedge"
-    android:versionCode="131"
-    android:versionName="2.12">
+    package="com.yunmusic.cf"
+    android:versionCode="410"
+    android:versionName="2.21">
     <!--
       versionCode / versionName 是 aapt2 link 时用 version-code / version-name 参数覆盖的
-      （见 build-apk.sh，值来自 src/version.js）。这里写的是兜底值：
+      （见 build-apk.sh，值来自 android/version.mjs）。这里写的是兜底值：
       直接用 Android Studio 打开这个工程、或有人手敲 aapt2 时，不至于没有版本号。
-      改版本请改 src/version.js，不要改这里。
+      改版本请改 android/version.mjs，不要改这里。
 
       注意：XML 注释里不能出现连续两个连字符（会报 not well-formed），
       所以上面写的是不带前导连字符的参数名。
@@ -48,7 +48,7 @@
         android:usesCleartextTraffic="true">
 
         <activity
-            android:name=".MainActivity"
+            android:name="com.zyplnn.musicedge.MainActivity"
             android:configChanges="orientation|screenSize|smallestScreenSize|keyboardHidden|uiMode|screenLayout"
             android:exported="true"
             android:launchMode="singleTask"
@@ -63,7 +63,7 @@
              mediaPlayback 这个类型有两个作用：Android 14 起前台服务必须声明类型；
              声明之后系统也不会因为「用户从最近任务划掉了 App」而顺手把它收掉。 -->
         <service
-            android:name=".PlaybackService"
+            android:name="com.zyplnn.musicedge.PlaybackService"
             android:exported="false"
             android:foregroundServiceType="mediaPlayback"
             android:stopWithTask="false" />

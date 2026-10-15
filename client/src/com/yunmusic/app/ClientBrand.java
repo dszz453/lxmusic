@@ -39,7 +39,7 @@ public final class ClientBrand {
     /* ---------------- 名字 ---------------- */
 
     /** 客户端自身的产品名。装到桌面上、关于页抬头都用它（必须与 client/version.mjs 的 CLIENT_APP_NAME 一致） */
-    public static final String CLIENT_NAME = "云音乐";
+    public static final String CLIENT_NAME = "云音乐(Docker版)";
 
     /** Docker / 本机 node 那条线的品牌名。必须与 public/js/brand.js 的 NAMES.docker 一致 */
     public static final String NAME_DOCKER = "LX-MUSIC";
@@ -91,7 +91,7 @@ public final class ClientBrand {
      * 它的用途只有一个：握手后如果服务端回了个**不同的**版本，在服务器页给一句提示。
      * 只提示、不阻断 —— 差一格版本通常仍然可用，硬拦会把用户锁在门外。
      */
-    public static final String SERVICE_EXPECT = "V2.12";
+    public static final String SERVICE_EXPECT = "V2.13";
 
     /** 客户端自己的版本名（形如 "1.0"）。读不到时给兜底，不让界面显示 null */
     public static String versionName(Context ctx) {

@@ -343,6 +343,27 @@ public final class Ui {
         return r;
     }
 
+    /** 圆形数字小徽章（如 1、2） */
+    public static TextView badge(Context c, String text, int bg, int fg) {
+        TextView t = text(c, text, 11f, fg, true);
+        t.setGravity(Gravity.CENTER);
+        t.setBackground(shape(c, bg, 999, 0, 0));
+        int size = dp(c, 20);
+        LinearLayout.LayoutParams lp = new LinearLayout.LayoutParams(size, size);
+        t.setLayoutParams(lp);
+        return t;
+    }
+
+    /** 状态呼吸指示小圆点 */
+    public static View dot(Context c, int dotColor) {
+        View v = new View(c);
+        v.setBackground(shape(c, dotColor, 999, 0, 0));
+        int size = dp(c, 7);
+        LinearLayout.LayoutParams lp = new LinearLayout.LayoutParams(size, size);
+        v.setLayoutParams(lp);
+        return v;
+    }
+
     /** 小胶囊标签（如「已连接 · V1.3」） */
     public static TextView pill(Context c, String s, int fg, int bg) {
         TextView t = text(c, s, 11.5f, fg, false);
@@ -350,6 +371,23 @@ public final class Ui {
         t.setPadding(dp(c, 10), dp(c, 3), dp(c, 10), dp(c, 3));
         t.setBackground(shape(c, bg, 999, 0, 0));
         return t;
+    }
+
+    /** 带状态小圆点的胶囊标签（更精致、更一目了然） */
+    public static LinearLayout pillWithDot(Context c, String s, int fg, int bg, int dotColor) {
+        LinearLayout row = new LinearLayout(c);
+        row.setOrientation(LinearLayout.HORIZONTAL);
+        row.setGravity(Gravity.CENTER_VERTICAL);
+        row.setPadding(dp(c, 8), dp(c, 3), dp(c, 10), dp(c, 3));
+        row.setBackground(shape(c, bg, 999, 0, 0));
+
+        View d = dot(c, dotColor);
+        row.addView(d);
+
+        TextView t = text(c, s, 11.5f, fg, true);
+        margin(c, t, 4, 0, 0, 0);
+        row.addView(t);
+        return row;
     }
 
     /** 输入框（原生页面里的地址、用户名） */

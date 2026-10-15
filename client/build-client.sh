@@ -1,20 +1,22 @@
 #!/usr/bin/env bash
 # ============================================================
-#  云音乐客户端 · APK 构建脚本（不依赖 Gradle / Maven）
+#  云音乐(Docker版) · APK 构建脚本（不依赖 Gradle / Maven）
 #
-#  与隔壁 android/build-apk.sh（music-edge 壳）同一个套路：
+#  与隔壁 android/build-apk.sh（CF 版壳）同一个套路：
 #    aapt2 → javac → d8 → zipalign → apksigner 五步走完，全程离线。
 #  差别只在四处：
-#    1) 版本号取自 client/version.mjs（**客户端自己的版本线**，不是服务端的）；
+#    1) 版本号取自 client/version.mjs（**Docker 客户端自己的版本线**，
+#       既不是服务端的、也不是 CF 版 APK 的）；
 #    2) 先跑 tools/build-client-rn.mjs 把跨端业务层打成 client-layer.js，
 #       再连同 public/ 一起塞进 assets/www；
-#    3) 包名 com.yunmusic.app（与 com.zyplnn.musicedge 并存，互不覆盖）；
-#    4) 产物落在 outputs/云音乐-V<版本>.apk（并拷一份到 dist/）。
+#    3) 包名 com.yunmusic.docker（与 com.yunmusic.cf 并存，互不覆盖）；
+#    4) 产物落在 outputs/云音乐(Docker版)-V<版本>.apk（并拷一份到 dist/）。
 #
-#  ⚠ 包名与签名**沿用** V2.19 及更早那套手写客户端（曾放在 yunmusic-client/）：
-#    老用户原地覆盖安装即可升级，不必卸载重装。
-#    密钥在 client/keystore/yunmusic-app.keystore（别名 debug / 口令 android）——
-#    换掉它 = 老用户装不上，只能卸载重装（数据全丢）。
+#  ⚠ V2.20 起 Docker 版改用新包名 com.yunmusic.docker，桌面名「云音乐(Docker版)」。
+#    旧版 com.yunmusic.app 是**另一个应用**，不会被自动覆盖或迁移 ——
+#    手机里若仍装着旧版，它会原样留在设备上，两份数据互不可见。
+#    签名沿用 client/keystore/yunmusic-app.keystore（别名 debug / 口令 android）——
+#    换掉它 = 用户装不上，只能卸载重装（数据全丢）。
 #
 #  依赖（各下一份就够，之后全程离线，与壳共用同一份）：
 #    · JDK 17            android-build/jdk/
@@ -52,10 +54,8 @@ export JAVA_TOOL_OPTIONS="-Dfile.encoding=UTF-8 -Dsun.stdout.encoding=UTF-8 -Dsu
 W() { cygpath -m "$1"; }                                  # MSYS 路径 → Windows 正斜杠路径
 LIST_WIN() { find "$@" | while read -r f; do printf '"%s"\n' "$(cygpath -m "$f")"; done; }
 
-# ── 客户端产品名（装在桌面上的名字，也是产物文件名）。
-#    注意与**品牌**不是一回事：连 CF 时界面显示 music-edge、连 Docker 时显示
-#    LX-MUSIC，那是运行期由服务端自报的（见 public/js/brand.js 的 NAMES）。
-APP_NAME="云音乐"
+# ── 客户端产品名从 client/version.mjs 读取
+APP_NAME="$(cd "$ROOT" && node -e "import('./client/version.mjs').then(m=>console.log(m.CLIENT_APP_NAME))" 2>/dev/null || echo "云音乐(Docker版)")"
 
 # ⚠ 版本号不在这里写死 —— 从 client/version.mjs 读（单一事实来源）。
 #    要发新版：改 client/version.mjs 的 CLIENT_VERSION 与 CLIENT_VERSION_CODE，重跑构建。
@@ -154,6 +154,7 @@ echo "== 2. aapt2 link：链接资源与清单，生成 R.java =="
   -A "$(W "$ASSETS")" \
   -R "$OUT/res.zip" \
   --java "$OUT/gen" \
+  --custom-package com.yunmusic.app \
   --min-sdk-version 21 \
   --target-sdk-version 34 \
   --version-code $VERSION_CODE \

@@ -2,19 +2,15 @@
 <!--
   云音乐客户端（安卓）
 
-  ── 与隔壁 music-edge 壳（android/）是什么关系 ──────────────────
-  同一份 public/ 前端资源、同一套桥接思路，但产品定位不同：
-    · android/（包名 com.zyplnn.musicedge）—— CF 那条线上的**离线自包含壳**：
-      后端整个跑在设备内，不连任何服务器。
-    · client/（包名 com.yunmusic.app，本工程）—— **云音乐客户端**：
-      首启让你选连哪条线（内置离线 / Cloudflare / Docker 自托管 / 任意自建地址），
-      连通后服务端自报是什么，界面就显示什么品牌。
-  两者包名不同 → 可以同时装在一台机器上互不覆盖，方便对照。
+  ── 与 CF 版（android/）是什么关系 ─────────────────────────────
+  两个版本保留各自宿主实现，不把 Docker 客户端错误地套成 CF 壳：
+    · android/（包名 com.yunmusic.cf）—— CF 版：WebView + 本地 backend.bundle.js 自包含。
+    · client/（包名 com.yunmusic.docker，本工程）—— Docker 版：原生多页面客户端，
+      基于 V2.21，保留服务器配置、本地音乐库、设置与媒体会话。
+  包名不同，因此可以同时安装在一台手机上。
 
-  ⚠ 这个包名是**沿用**的：V2.19 及更早的「云音乐客户端」是另一套手写前端
-  （曾放在 yunmusic-client/），也是 com.yunmusic.app、也用同一把 debug.keystore 签的。
-  V2.20 起前端换成 public/ 整包，但包名与签名保持不变 —— 老用户**原地覆盖安装**
-  即可升级，不必卸载重装（卸载会丢数据）。
+  V2.20 起 Docker 版改用 com.yunmusic.docker，旧版 com.yunmusic.app 会作为独立应用保留；
+  Android 不会把旧包自动迁移到新包。新旧版的数据也彼此隔离。
 
   ── 分层（对应网易云客户端的 原生 + RN 混合架构）────────────────
     · 原生宿主层（Java）：ClientActivity 顶栏 / 原生底部导航 / 原生页面
@@ -35,9 +31,9 @@
       用 maxSdkVersion 卡住范围，新系统上不白要旧权限。
 -->
 <manifest xmlns:android="http://schemas.android.com/apk/res/android"
-    package="com.yunmusic.app"
-    android:versionCode="400"
-    android:versionName="2.20">
+    package="com.yunmusic.docker"
+    android:versionCode="410"
+    android:versionName="2.21">
     <!--
       versionCode / versionName 是 aapt2 link 时用 version-code / version-name 参数覆盖的
       （见 build-client.sh，值来自 client/version.mjs —— 客户端自己的版本线）。
@@ -78,7 +74,7 @@
 
         <!-- 主界面：原生顶栏 + 原生底部导航 + 跨端内容区 -->
         <activity
-            android:name=".ClientActivity"
+            android:name="com.yunmusic.app.ClientActivity"
             android:configChanges="orientation|screenSize|smallestScreenSize|keyboardHidden|uiMode|screenLayout"
             android:exported="true"
             android:launchMode="singleTask"
@@ -96,25 +92,25 @@
 
         <!-- 服务器连接（首启向导 + 设置页入口） -->
         <activity
-            android:name=".ServerActivity"
+            android:name="com.yunmusic.app.ServerActivity"
             android:exported="false"
             android:theme="@style/ClientPageTheme" />
 
         <!-- 设置 -->
         <activity
-            android:name=".SettingsActivity"
+            android:name="com.yunmusic.app.SettingsActivity"
             android:exported="false"
             android:theme="@style/ClientPageTheme" />
 
         <!-- 本地音乐（底层能力层的入口） -->
         <activity
-            android:name=".LocalMusicActivity"
+            android:name="com.yunmusic.app.LocalMusicActivity"
             android:exported="false"
             android:theme="@style/ClientPageTheme" />
 
         <!-- 关于（客户端版本 / 服务端版本 / 品牌 / 构建标识） -->
         <activity
-            android:name=".AboutActivity"
+            android:name="com.yunmusic.app.AboutActivity"
             android:exported="false"
             android:theme="@style/ClientPageTheme" />
 
@@ -122,7 +118,7 @@
              mediaPlayback 这个类型有两个作用：Android 14 起前台服务必须声明类型；
              声明之后系统也不会因为「用户从最近任务划掉了 App」而顺手把它收掉。 -->
         <service
-            android:name=".PlaybackService"
+            android:name="com.yunmusic.app.PlaybackService"
             android:exported="false"
             android:foregroundServiceType="mediaPlayback"
             android:stopWithTask="false" />

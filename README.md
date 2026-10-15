@@ -1,12 +1,11 @@
 # 云音乐 · 全平台音乐播放器
 
-> **当前版本：V2.12**（服务端）· 客户端 V2.20
+> **当前版本：V2.13**（服务端）· 客户端 V2.21
 >
-> 一个自托管的音乐播放系统，支持 **Cloudflare Workers 线上部署**、**Docker 自建服务器**、**安卓 APK 客户端** 三种形态。
-> 同一份源码服务三个宿主，运行时自动适配，不做编译期分叉。
+> 一个自托管的音乐播放系统，支持 **Cloudflare Workers 线上部署**、**Docker 自建服务器**，并提供可在同一手机共存的 **云音乐(CF版)** 与 **云音乐(Docker版)** 两个独立 APK。
+> 两个 APK 保留各自宿主：CF 版基于 `android/` WebView + 本地 bundle；Docker 版基于 `client/` 原生多页面客户端。
 >
-> 服务端与客户端是**两条独立的版本线**：服务端改一次，三端同时生效，不必重新装 App；
-> 客户端只在出包时才动。两条线各自维护，当前不同号（客户端 V2.20 / 服务端 V2.12）。
+> 服务端、CF APK 与 Docker APK 的版本号分别维护。服务端改动可部署生效，不必重新装 App；宿主侧改动只重建对应 APK。当前 APK 均为 V2.21，服务端为 V2.13。
 >
 > **客户端的前端就是网页端本身**：`client/assets/www` 是构建时从 `public/` 整包拷进去的，
 > 只多一个客户端专属的 `js/client-layer.js`（跨端层）。改 `public/` 就等于改客户端界面。
@@ -54,21 +53,27 @@ docker compose up -d
 
 > ⚠️ `--user 1000:1000` 和 `chown` **不能省**。镜像进程以 `node`（uid 1000）运行，挂载目录属主不对会导致 SQLite 无法写入，服务无限重启。
 
-### 方式三：安卓 APK（云音乐客户端）
+### 方式三：安卓 APK（云音乐 · CF 版 / Docker 版）
 
-直接安装到手机，**无需自建服务器**，支持双线路自由切换。
+直接安装到手机，**无需自建服务器**。两个 APK 包名不同，**可以装在同一台手机上共存**。
 
-- 包名：`com.yunmusic.app`
-- 最低 Android 5.0（API 21），目标 API 34
-- 已签名（v1 + v2 + v3），可原地覆盖升级
-- 构建：`bash client/build-client.sh` → `outputs/云音乐-V2.20.apk`
+| APK | 包名 | 宿主 | 定位 |
+|---|---|---|---|
+| **云音乐(CF版)** | `com.yunmusic.cf` | `android/` WebView + 本地 bundle | 离线自包含，后端整个跑在设备内 |
+| **云音乐(Docker版)** | `com.yunmusic.docker` | `client/` 原生多页面客户端 | 连自建服务器或内置离线，保留本地音乐库与设置 |
 
-首启让你选连哪条线，三条可选：
+两者共同点：最低 Android 5.0（API 21），目标 API 34，已签名（v1 + v2 + v3）。
+
+```bash
+bash client/build-client.sh    # → outputs/云音乐(Docker版)-V2.21.apk
+bash android/build-apk.sh      # → outputs/云音乐(CF版)-V2.21.apk
+```
+
+Docker 版首启让你选连哪条线，两条可选：
 
 | 连接方式 | 说明 |
 |---|---|
-| **地址 1（主线路）** | 自建 Docker / 局域网服务器 |
-| **地址 2（备用线路）** | Cloudflare Workers |
+| **服务器地址** | 自建 Docker / 局域网服务器，或任意 Cloudflare Workers 地址 |
 | **内置离线** | 后端完全跑在设备内，不连任何服务器（数据只在这台手机上） |
 
 下载：[Releases](https://github.com/dszz453/lxmusic/releases) 或直接用 CI 产物。
@@ -94,7 +99,7 @@ docker compose up -d
 
 | 功能 | 说明 |
 |---|---|
-| **双线路管理** | 同时保存两条服务器地址（如 Cloudflare + Docker），一键切换 |
+| **服务器地址管理** | 保存一个自建服务器地址（CF / Docker 均可），或切到内置离线 |
 | **离线播放** | 首次启动自动创建本机账号，无需联网即可搜索、播放 |
 | **封面缓存** | 原生级 LRU 缓存 + 磁盘缓存，切页零等待 |
 | **锁屏控制** | MediaSession 驱动，支持锁屏卡片、控制中心、蓝牙耳机/车机 AVRCP |
@@ -209,7 +214,7 @@ LX_BASE=http://127.0.0.1:8787 LX_PASS='密码' node test/ui.mjs
 发版规矩：
 - 服务端 `APP_VERSION` 每版 **升 0.1**，同时 `APP_VERSION_CODE` **+1**
 - 客户端每版 **升 0.1**，`versionCode` **+10**
-- 当前：**服务端 V2.12 (131) / 客户端 V2.20 (400)**
+- 当前：**服务端 V2.13 (132) / 客户端 V2.21 (410)**
 - 客户端版本改 `client/version.mjs`，然后 `bash client/build-client.sh` 出包
   （包内 `client-build.txt` 记录构建时的 HEAD，所以**先提交再构建**）
 

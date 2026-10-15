@@ -125,15 +125,15 @@ console.log('\n== 1. 两条版本线各就各位，且客户端知道该跟哪�
 
 /* ══════════════ 2. 与老壳并存 ══════════════ */
 
-console.log('\n== 2. 与 music-edge 壳并存，互不覆盖 ==')
+console.log('\n== 2. 与 CF 版 APK 共存，互不覆盖 ==')
 {
   const pkg = (src) => (src.match(/package="([\w.]+)"/) || [])[1]
-  ok('客户端包名与老壳包名不同（否则后装的会把先装的顶掉，用户数据全丢）',
+  ok('Docker 与 CF APK 包名不同（可同时安装且各自数据隔离）',
     pkg(C_MANIFEST) !== pkg(A_MANIFEST), `${pkg(C_MANIFEST)} vs ${pkg(A_MANIFEST)}`)
   ok('客户端包名与 client/version.mjs 声明的一致', pkg(C_MANIFEST) === V.CLIENT_PACKAGE)
 
-  // 密钥：云音乐客户端用**自己那把**（client/keystore/yunmusic-app.keystore），
-  // 与隔壁 music-edge 壳那把不是同一把 —— 包名不同、历史签名也不同。
+  // 密钥：Docker 客户端用**自己那把**（client/keystore/yunmusic-app.keystore），
+  // 与 CF 版壳那把不是同一把 —— 包名不同、历史签名也不同。
   // ⚠ 这把密钥从 V2.19（手写前端那版）起就在用，换掉它 = 老用户装不上，
   //    只能卸载重装（数据全丢）。所以下面第二条盯的就是「别顺手换成老壳那把」。
   // 且绝不能放 build/ —— build/ 每轮被清，密钥一丢就只能让用户卸载重装。
@@ -162,10 +162,10 @@ console.log('\n== 3. 构建脚本：版本从哪来、白名单够不够 ==')
   ok('同步残留的清理排除了客户端专属文件（否则每轮都被删一次）',
     /CLIENT_ONLY=/.test(BUILD) && /continue 2/.test(BUILD))
   ok('产物名是 云音乐-V<版本>（沿用老客户端的产品名，与老壳的 music-edge-* 区分开）',
-    /APP_NAME="云音乐"/.test(BUILD) && /APP_NAME-V\$VERSION_NAME\.apk/.test(BUILD))
+    /云音乐/.test(BUILD) && /APP_NAME-V\$VERSION_NAME\.apk/.test(BUILD))
   ok('清单声明了四个原生页面 + 主界面 + 播放服务',
-    ['.ClientActivity', '.ServerActivity', '.SettingsActivity', '.LocalMusicActivity',
-      '.AboutActivity', '.PlaybackService'].every((c) => C_MANIFEST.includes(`android:name="${c}"`)))
+    ['ClientActivity', 'ServerActivity', 'SettingsActivity', 'LocalMusicActivity',
+      'AboutActivity', 'PlaybackService'].every((c) => C_MANIFEST.includes(`android:name="com.yunmusic.app.${c}"`)))
 }
 
 /* ══════════════ 4. 跨端业务层 ══════════════ */
@@ -357,24 +357,30 @@ console.log('\n== 8. 底层能力层、权限与主题 ════════�
   // 2026-10-11：档案槽位曾重构成「两档线路」（地址 1 = Docker 主线路、
   //   地址 2 = CF 备用线路），内置离线档案一度被删掉。
   // 2026-10-14：客户端参照 web 端重新开发时，老板明确要求**保留「内置离线」**
-  //   （不连服务器也能用）→ 内置离线恢复成**第三个固定槽位**，垫在两条线路之后。
-  //   三档都是固定槽位：用户不能改名、不能删，品牌判定靠它。
+  //   （不连服务器也能用）→ 内置离线与自建服务器地址共存。
+  //   2026-10-15（V2.21）单线路精简：老板要求「docker 版本不要写两个线路了，一个就行」，
+  //   于是去掉「主线路 / 备用线路」的二分，只留一个服务器地址槽位 + 内置离线。
+  //   老配置的 cf 槽位在 ensureDefaults 里被收编（地址搬到唯一槽位后移除）。
   // 断言跟着钉当前设计。
-  ok('ServerStore 是三档固定槽位（内置离线 / Docker 主线路 / CF 备用线路）',
-    /ID_CF\s*=\s*"cf"/.test(STORE_JAVA)
+  ok('ServerStore 是单服务器地址与内置离线槽位（不再有备用线路槽位）',
+    /ID_SERVER\s*=\s*ID_DOCKER/.test(STORE_JAVA)
     && /ID_DOCKER\s*=\s*"docker"/.test(STORE_JAVA)
     && /ID_BUILTIN\s*=\s*"builtin"/.test(STORE_JAVA)
-    && /ID_LINE1\s*=\s*ID_DOCKER/.test(STORE_JAVA)
-    && /ID_LINE2\s*=\s*ID_CF/.test(STORE_JAVA)
-    && /KIND_BUILTIN\s*=\s*"builtin"/.test(STORE_JAVA))
+    && /KIND_BUILTIN\s*=\s*"builtin"/.test(STORE_JAVA)
+    // 不再声明 ID_LINE2 / NAME_LINE2 这类双线路常量
+    && !/ID_LINE2\s*=/.test(STORE_JAVA)
+    && !/NAME_LINE2\s*=/.test(STORE_JAVA))
+  ok('⚠ 老配置平滑迁移：cf 槽位的地址被收编进唯一槽位后被移除',
+    /Profile legacy = find\(ID_CF\)/.test(STORE_JAVA)
+    && /copyInto\(server, legacy\)/.test(STORE_JAVA)
+    && /profiles\.remove\(legacy\)/.test(STORE_JAVA))
   ok('内置离线槽位：可用、有自己的品牌名、且不允许被删',
     /if\s*\(KIND_BUILTIN\.equals\(kind\)\)\s*return\s*true/.test(STORE_JAVA)
     && /if\s*\(KIND_BUILTIN\.equals\(kind\)\)\s*return\s*ClientBrand\.builtinName\(\)/.test(STORE_JAVA)
     && /if\s*\(ID_BUILTIN\.equals\(id\)\)\s*return\s*false/.test(STORE_JAVA))
-  ok('品牌判定优先用握手自报的 host；三条固定槽位都由 ensureDefaults 补回来',
+  ok('品牌判定优先用握手自报的 host；固定槽位由 ensureDefaults 补齐',
     /if\s*\(!host\.isEmpty\(\)\)\s*return\s*ClientBrand\.nameOf\(host\)/.test(STORE_JAVA)
     && /if\s*\(find\(ID_LINE1\)\s*==\s*null\)/.test(STORE_JAVA)
-    && /if\s*\(find\(ID_LINE2\)\s*==\s*null\)/.test(STORE_JAVA)
     && /if\s*\(find\(ID_BUILTIN\)\s*==\s*null\)/.test(STORE_JAVA))
   ok('Handshake 不会只看状态码就判定成功（必须看正文像不像本项目的接口）',
     /trimmed\.startsWith\("<"\)/.test(read('client/src/com/yunmusic/app/Handshake.java'))

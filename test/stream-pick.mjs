@@ -326,6 +326,42 @@ check('候选构造中无插件时为空，不从 provider 生成原生取流候
   /return out\s*\n\}/.test(candidateBuilder)
   && !/getMusicUrlCandidates?\s*\(/.test(candidateBuilder))
 
+console.log('\n== 8. /url 与 /stream 共享候选缓存（CF 版「歌单第一首歌播不出来」的修复） ==')
+/**
+ * 背景（2026-10-15 老板报「CF 版本，每个歌单的第一首歌，默认服务端取流，然后播放不出来」）：
+ *
+ * CF 边缘上一条播放请求的实际经过：
+ *   ① 前端打 `/api/url?id=…&fast=1`（direct 级）→ 拿到候选直链喂给 <audio>
+ *   ② 首曲的直链通常因为防盗链 / 只有 http / CDN 认 IP 而失败
+ *   ③ <audio> 掉到 server 级 → 请求 `/api/stream`
+ *   ④ 此时服务端**完全不知道**刚才 /url 已经解析出了哪些候选，从零重新解析一遍
+ *   ⑤ 冷解析 2~3 秒，而浏览器的 Range 探测请求早就掐断重连了 → 502 / 静音
+ *
+ * 修法：/url 解析出来的候选顺手写进 streamCandCache，/stream 直接复用。
+ * 下面是钉住这件事的断言 —— 缺任何一条，症状都会原样复现，而且很难再查。
+ */
+const apiSrc = fs.readFileSync(path.join(ROOT, 'src', 'server', 'api.js'), 'utf8')
+const apiCode = deComment(apiSrc)
+check('/url 命中候选后写进代理流候选缓存',
+  /if \(r\.url\) setStreamCand\(candKey, r\.urls && r\.urls\.length \? r\.urls : \[\{ url: r\.url, from: r\.from \}\]\)/.test(apiCode))
+check('⚠ 缓存键只有一个来源 streamCandKey()（两处各拼一遍必然对不上）',
+  /function streamCandKey\(song, quality\) \{/.test(apiCode)
+  && (apiCode.match(/streamCandKey\(song, quality\)/g) || []).length === 3,
+  'streamCandKey 出现 ' + ((apiCode.match(/streamCandKey\(song, quality\)/g) || []).length) + ' 处（1 定义 + /url 写 + /stream 读）')
+check('⚠ 旧的「/stream 自己拼键」写法已消失（拼一遍就少读一次缓存）',
+  !/const candKey = `\$\{song\.source\}:\$\{song\.songmid \|\| song\.id \|\| ''\}:\$\{quality\}`/.test(apiCode))
+check('/stream 读到缓存时不再铺一遍候选列表（skipCandidateList）',
+  /skipCandidateList: !!preferUrls/.test(apiCode))
+check('⚠ retry=1 时跳过缓存并重新解析（重试同一份候选只会同样失败）',
+  /const isRetry = url\.searchParams\.get\('retry'\) === '1'/.test(apiCode)
+  && /let preferUrls = isRetry \? null : getStreamCand\(candKey\)/.test(apiCode))
+check('player.js 的代理地址带 retry 标记（第二遍才带）',
+  /if \(attempt\) qs\.set\('retry', '1'\)/.test(player))
+check('候选缓存有 TTL 与容量上限（不许无限涨）',
+  /const STREAM_CAND_TTL = \d+ \* 1000/.test(apiCode) && /streamCandCache\.size > 100/.test(apiCode))
+check('/url 的解析结果同时喂了 /stream 的预筛路径（preferUrls 非空即命中缓存）',
+  /let preferUrls = isRetry \? null : getStreamCand\(candKey\)/.test(apiCode))
+
 console.log('\n===== stream-pick：' + pass + ' 通过 / ' + fail + ' 失败 =====')
 if (failures.length) console.log('失败项：\n  - ' + failures.join('\n  - '))
 process.exit(fail ? 1 : 0)

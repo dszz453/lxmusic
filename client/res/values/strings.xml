@@ -4,12 +4,10 @@
          品牌（music-edge / LX-MUSIC）由所连的服务端决定，运行时显示在顶栏；
          这里只是「这个 App 叫什么」，装到桌面上用。
          ⚠ 沿用 V2.19 及更早那套手写客户端的名字，老用户升级后桌面图标下的字不变。 -->
-    <string name="app_name">云音乐</string>
+    <string name="app_name">云音乐(Docker版)</string>
 
-    <!-- 客户端产品名（与 public/js/brand.js 的 NAMES 区分开：
-         那是**服务端两条线**的名字 docker→LX-MUSIC / cf→music-edge，
-         这里是「这个 App 自己」的名字） -->
-    <string name="brand_client">云音乐</string>
+    <!-- 客户端产品名 -->
+    <string name="brand_client">云音乐(Docker版)</string>
     <string name="brand_cf">music-edge</string>
     <string name="brand_docker">LX-MUSIC</string>
 

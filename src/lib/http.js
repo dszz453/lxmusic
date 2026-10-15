@@ -66,7 +66,7 @@ export function allowHttpAudio() {
 export function resolveBudget() {
   return globalThis.LX_NATIVE === true
     ? { deadline: 3500, probeDeadline: 1500, totalBudget: 3800 }
-    : {}
+    : { deadline: 3200, probeDeadline: 1500, totalBudget: 3600 }
 }
 
 /**

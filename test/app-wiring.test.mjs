@@ -23,6 +23,7 @@ import fs from 'node:fs'
 import path from 'node:path'
 import vm from 'node:vm'
 import { fileURLToPath } from 'node:url'
+import { CF_APP_NAME, CF_PACKAGE, CF_VERSION, CF_VERSION_CODE } from '../android/version.mjs'
 
 const HERE = path.dirname(fileURLToPath(import.meta.url))
 const ROOT = path.resolve(HERE, '..')
@@ -48,13 +49,11 @@ const buildSh = read('android/build-apk.sh')
 /**
  * 版本号的**单一事实来源**。
  *
- * 1.10 起 build-apk.sh 不再写死 VERSION_CODE / VERSION_NAME ——
- * 它是 `VERSION_CODE="$(node -e "import('./src/version.js')…")"` 这样读出来的。
- * 于是早先那版「拿正则去 build.sh 里抠数字」的断言必然抠不到（实测报 `脚本 null`），
- * 但**产品其实是对的**：两处都对，只是比对的中介物选错了。
+ * CF 壳 APK 有独立版本线：android/version.mjs 是 CF 应用版本事实来源，
+ * src/version.js 仍只描述服务端版本，不能拿服务端号给 CF APK 当包版本。
  *
- * 正确口径是「清单(兜底值) ↔ src/version.js(事实来源)」，
- * 顺带保证 build-apk.sh 确实是从那边取的（否则改了 version.js 而包里没变）。
+ * 正确口径是「CF 清单(兜底值) ↔ android/version.mjs」，并保证
+ * build-apk.sh 确实从该文件读取（否则改了版本号而包里没变）。
  */
 const versionJs = read('src/version.js')
 const srcCode = /APP_VERSION_CODE\s*=\s*(\d+)/.exec(versionJs)
@@ -201,22 +200,39 @@ ok('src/version.js 声明了 APP_VERSION 与 APP_VERSION_CODE',
 
 const wantName = (srcName && srcName[1] || '').replace(/^v/i, '')
 const wantCode = srcCode && srcCode[1]
-ok('清单里的 versionCode 与 src/version.js 一致',
-  !!mc && !!wantCode && mc[1] === wantCode, `清单 ${mc && mc[1]} / version.js ${wantCode}`)
-ok('清单里的 versionName 与 src/version.js 一致',
-  !!mn && !!wantName && mn[1] === wantName, `清单 ${mn && mn[1]} / version.js ${wantName}`)
+const cfName = CF_VERSION.replace(/^v/i, '')
+ok('android/version.mjs 声明 CF APK 独立版本线',
+  CF_VERSION === 'V' + cfName && Number.isInteger(CF_VERSION_CODE) && CF_VERSION_CODE >= 100,
+  `${CF_VERSION} / code ${CF_VERSION_CODE}`)
+ok('CF 清单版本与 android/version.mjs 一致',
+  !!mc && !!mn && mc[1] === String(CF_VERSION_CODE) && mn[1] === cfName,
+  `清单 ${mn && mn[1]} (${mc && mc[1]}) / CF ${cfName} (${CF_VERSION_CODE})`)
+ok('CF APK 使用独立包名，可与 Docker 版同机安装',
+  manifest.includes(`package="${CF_PACKAGE}"`) && CF_PACKAGE !== 'com.yunmusic.docker',
+  CF_PACKAGE)
+ok('CF 桌面名与 android/version.mjs 一致',
+  read('android/res/values/strings.xml').includes(`<string name="app_name">${CF_APP_NAME}</string>`))
+ok('CF 清单显式指向 CF 壳 Java 类（包名独立后不能再用相对类名）',
+  manifest.includes('android:name="com.zyplnn.musicedge.MainActivity"') &&
+  manifest.includes('android:name="com.zyplnn.musicedge.PlaybackService"'))
 
-// 构建脚本必须是**从 version.js 取**，不能自己写死一套 —— 否则改了 version.js 包里没变
-ok('build-apk.sh 从 src/version.js 读版本（不是自己写死一套）',
-  /VERSION_CODE="\$\(node[^)]*src\/version\.js/.test(buildSh) &&
-  /VERSION_NAME="\$\(node[^)]*src\/version\.js/.test(buildSh),
-  '没看到从 src/version.js 取值的写法')
-ok('aapt2 link 用的就是这两个变量（取到了却没传进去 = 白取）',
+// CF 构建使用 android/version.mjs，不与服务端版本线共用包版本。
+ok('build-apk.sh 从 android/version.mjs 读取 CF 版本',
+  /import\('\.\/version\.mjs'\)\.then\(m=>console\.log\(m\.CF_VERSION_CODE\)\)/.test(buildSh) &&
+  /import\('\.\/version\.mjs'\)\.then\(m=>console\.log\(m\.CF_VERSION\.replace/.test(buildSh),
+  '没看到从 android/version.mjs 取 CF 版本的写法')
+ok('aapt2 将资源类保留在 Java 源码包名中',
+  buildSh.includes('--custom-package com.zyplnn.musicedge'))
+ok('D8 通过 classpath 主类启动且避免 Windows 路径空格的 cmd 参数截断',
+  /java -cp "\$\(W "\$BT\/lib\/d8\.jar"\)" com\.android\.tools\.r8\.D8/.test(buildSh))
+ok('aapt2 link 使用 CF 版本变量',
   /--version-code\s+\$VERSION_CODE/.test(buildSh) && /--version-name\s+"\$VERSION_NAME"/.test(buildSh))
+ok('CF APK 文件名与构建输出目录包含产品名和版本号',
+  buildSh.includes('APP_NAME="云音乐(CF版)"') && /APP_NAME-V\$VERSION_NAME\.apk/.test(buildSh))
 
 // 本版说明段：约定形如 `# 1.0：……`
 ok('构建脚本里有本版说明（每次改包都该写清楚改了什么）',
-  buildSh.includes('# ' + wantName + '：'), '没找到 `# ' + wantName + '：` 的说明段')
+  buildSh.includes('# ' + cfName + '：'), '没找到 `# ' + cfName + '：` 的说明段')
 
 /* 发版规矩（老板 2026-10-06 定）：每发一版 APP_VERSION 升 0.1、APP_VERSION_CODE +1。
  * 这条规矩没法靠测试「强制」—— 测试不知道什么时候算发了一版。

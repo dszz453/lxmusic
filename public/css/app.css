@@ -1105,3 +1105,147 @@ a.menu-item { display: flex; }
   }
   .skeleton { transition: none; }
 }
+
+/* ==========================================================================
+   整体视觉精修（2026-10-15 · V2.21）
+   ──────────────────────────────────────────────────────────────────────────
+   这一节只做「观感提升」，不改任何 DOM 结构与类名 —— 所以它对网页端、
+   两个安卓壳同时生效，也不会动到任何行为测试。
+
+   原则：**层次感靠留白与细边框，不靠堆阴影**。移动端屏幕小，过重的阴影会
+   让相邻卡片糊成一片；这里的取舍是「卡片轻、分隔清楚、交互有反馈」。
+   ========================================================================== */
+
+/* ---------- 1. 区块标题：加一根品牌色小竖条 ----------
+   原来标题与正文之间只有字号差，长列表里扫读时「这一节从哪开始」不明显。
+   加一根 3×15 的圆角竖条后，视觉锚点立刻出来，且不增加任何高度。 */
+.section__head { position: relative; }
+.section__title {
+  display: inline-flex;
+  align-items: center;
+  gap: 8px;
+}
+.section__title::before {
+  content: '';
+  width: 3px; height: 15px;
+  border-radius: 2px;
+  background: linear-gradient(180deg, #ff7a7a, var(--brand));
+  flex: 0 0 auto;
+}
+/* 二级页的标题栏（.searchbar）不需要这根竖条 —— 它已经有返回箭头做锚点 */
+.searchbar .section__title::before { display: none; }
+
+/* ---------- 2. 歌曲行：细分隔 + 更清晰的「正在播放」 ---------- */
+
+/* 行与行之间用极细的分隔线，比纯留白更容易「对齐视线」。
+   最后一行不画线，避免列表底部多出一条悬空的横线。 */
+.songlist .song + .song { box-shadow: inset 0 1px 0 var(--line); }
+.song { transition: background-color .16s var(--ease); }
+
+/* 正在播放的那一行：左侧一根品牌色指示条 + 歌名变品牌色。
+   队列抽屉里已经在用 .is-current，这里把它做得更明显一点。 */
+.song.is-current { position: relative; background: var(--brand-soft); }
+.song.is-current::before {
+  content: '';
+  position: absolute; left: 0; top: 50%;
+  transform: translateY(-50%);
+  width: 3px; height: 60%;
+  border-radius: 0 2px 2px 0;
+  background: var(--brand);
+}
+.song.is-current .song__name { color: var(--brand); font-weight: 600; }
+
+/* 歌曲行右侧的操作按钮：平时淡一点，点按才实心 —— 一排歌看下来不会被
+   一列心形图标抢走注意力（网易云也是这个处理）。 */
+.song__act {
+  display: inline-flex; align-items: center; justify-content: center;
+  width: 32px; height: 32px; border-radius: 50%;
+  transition: background-color .16s var(--ease), color .16s;
+}
+.song__act:active { background: rgba(0, 0, 0, .06); }
+.song.is-current .song__act { color: var(--brand); }
+
+/* ---------- 3. 卡片：按下有反馈、桌面悬停有轻微抬起 ---------- */
+
+.card__cover { transition: transform .22s var(--ease), box-shadow .22s var(--ease); }
+.card:active .card__cover { transform: scale(.975); }
+.card__badge--play { transition: transform .18s var(--ease), opacity .18s; }
+.card__badge--play:active { transform: scale(.9); }
+
+/* 只有真有指针的设备才做 hover —— 触屏上 :hover 会「粘住」上一次点的卡片 */
+@media (hover: hover) and (pointer: fine) {
+  .card:hover .card__cover {
+    transform: translateY(-2px);
+    box-shadow: 0 8px 20px rgba(0, 0, 0, .12);
+  }
+  .card:hover .card__title { color: var(--brand); }
+  .btn:hover { opacity: .92; }
+  .btn--ghost:hover { background: #f0f0f2; }
+  .icon-btn:hover { background: rgba(0, 0, 0, .05); }
+  .song:hover { background: var(--surface-2); }
+  .song__act:hover { color: var(--brand); }
+}
+
+/* ---------- 4. 滚动条：细、低调，不与内容抢视线 ---------- */
+
+.view, .sheet__body, .errdetail__raw { scrollbar-width: thin; scrollbar-color: rgba(0,0,0,.16) transparent; }
+.view::-webkit-scrollbar { width: 6px; height: 6px; }
+.view::-webkit-scrollbar-track { background: transparent; }
+.view::-webkit-scrollbar-thumb { background: rgba(0, 0, 0, .14); border-radius: 3px; }
+.view::-webkit-scrollbar-thumb:hover { background: rgba(0, 0, 0, .24); }
+
+/* ---------- 5. 表单控件：统一焦点环，键盘操作也看得见 ---------- */
+
+.input:focus, .textarea:focus, .select:focus {
+  box-shadow: 0 0 0 3px rgba(236, 65, 65, .12);
+}
+/* 键盘 Tab 到按钮上时给一圈焦点环（鼠标点击不出现，避免碍眼） */
+.btn:focus-visible, .chip:focus-visible, .icon-btn:focus-visible, .switch input:focus-visible + i {
+  outline: 2px solid var(--brand);
+  outline-offset: 2px;
+}
+
+/* 音质 / 音源那类 chip：选中态给一点品牌色底，未选中态保持中性 */
+.chip {
+  transition: background-color .16s var(--ease), color .16s, border-color .16s;
+}
+.chip:active { transform: scale(.96); }
+
+/* ---------- 6. 播放器：进度条拖点稍大一点，指哪打哪 ---------- */
+
+.range__thumb {
+  width: 12px; height: 12px;
+  box-shadow: 0 1px 5px rgba(0, 0, 0, .45);
+  transition: transform .12s var(--ease);
+}
+.range:active .range__thumb { transform: translate(-50%, -50%) scale(1.25); }
+/* 拖动时进度条加粗一点，手指底下更有「抓住了」的感觉 */
+.range__track { transition: height .12s var(--ease); }
+.range:active .range__track { height: 5px; }
+
+/* 播放/暂停主按钮：轻微按压 + 柔光，比纯色圆更有质感 */
+.play-btn { transition: transform .12s var(--ease), box-shadow .2s var(--ease); box-shadow: 0 4px 14px rgba(0, 0, 0, .28); }
+.play-btn:active { transform: scale(.93); box-shadow: 0 2px 8px rgba(0, 0, 0, .3); }
+
+/* ---------- 7. 抽屉：顶部加一条拖拽指示条（暗示可下滑关闭） ---------- */
+
+/* 用 ::before 画在面板顶边，不动 DOM —— 两个抽屉（队列 / 通用）都能沾到。
+   对话框（.sheet--dialog）不加：它是居中的，加一条「拖拽条」会误导成可下滑。 */
+.sheet:not(.sheet--dialog) .sheet__panel::before {
+  content: '';
+  display: block;
+  width: 36px; height: 4px; border-radius: 2px;
+  background: var(--line-strong);
+  margin: 8px auto -4px;
+}
+
+/* ---------- 8. 歌单详情头部：封面投影更柔和，长名字不撑破 ---------- */
+
+.block .card__cover { box-shadow: 0 4px 14px rgba(0, 0, 0, .10); }
+
+/* ---------- 9. Toast：加一点模糊与阴影，浮起来更像一层 ---------- */
+
+.toast {
+  backdrop-filter: saturate(160%) blur(10px);
+  box-shadow: 0 6px 22px rgba(0, 0, 0, .22);
+}

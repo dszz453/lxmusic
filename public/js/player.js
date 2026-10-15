@@ -249,9 +249,13 @@
    * 远程模式（安卓壳指向自建服务器，见 native.js 第 8 节）必须带上服务器基址：
    * 页面自己那个 origin 是「假域名」（内容由 APK 供给），相对路径会打到本地 assets 上，
    * 拿回来的是一段 HTML 而不是音频。
+   *
+   * `attempt` 是给服务端的「这是第几次尝试」提示（0 = 首次）—— 见 stageCandidates
+   * 里 server 级的说明。它进的是查询参数，<audio> 自己发请求时也能带上。
    */
-  function serverStreamUrl(song) {
+  function serverStreamUrl(song, attempt) {
     const qs = new URLSearchParams({ id: song.id, q: state.quality, token: TOKEN() })
+    if (attempt) qs.set('retry', '1')
     return (global.LX_REMOTE_BASE || '') + '/api/stream?' + qs.toString()
   }
 
@@ -337,7 +341,13 @@
     if (stage === 'direct') {
       if (directCache) return directCache
       try {
-        const r = await API.songUrl(song.id, state.quality, true)
+        let r = await API.songUrl(song.id, state.quality, true).catch(() => null)
+        // 冷启动自愈重试：若首次返回 404/空（CF 边缘冷启动解析耗时偶尔踩线），
+        // 延时 350ms 重新发起一次，此时后端已预热，极大概率命中直链，防止误退到代理流。
+        if (!r || !r.ok || (!r.url && (!r.urls || !r.urls.length))) {
+          await new Promise(res => setTimeout(res, 350))
+          r = await API.songUrl(song.id, state.quality, true).catch(() => null)
+        }
         if (!r || !r.ok) { directCache = []; return directCache }
         const raw = (r.urls && r.urls.length) ? r.urls : [{ url: r.url, from: r.from }]
         const list = raw
@@ -421,7 +431,23 @@
           return list
         } catch { return [] }
       }
-      return [{ url: serverStreamUrl(song), from: '服务端代理' }]
+
+      /**
+       * ⚠ 远程（CF / 自建）模式下这一级的地址**由服务端现场解析**，因此
+       * `<audio src>` 一旦挂上去就会触发一次完整的服务端取流。
+       *
+       * CF 版「歌单第一首歌播不出来」的关键在这里：`/api/url` 的候选缓存
+       * （见 src/server/api.js 的 streamCandCache）已经有 60 秒 TTL，但浏览器
+       * 对首曲的 Range 探测常常「先发一个 bytes=0- 掐断、再发真正的 Range」，
+       * 两次请求之间服务端隔离（不同 isolate、或缓存正好过期）时第二次仍要现解析。
+       *
+       * 客户端的对策很轻：**在代理地址上带一个 attempt 计数**。同一个 attempt
+       * 的地址不变（缓存键稳定、不会每次刷新都错过缓存），但 <audio> 报错降级
+       * 到本级的第 2 条时 attempt 变成 1 —— 服务端收到就知道「这已经是重试了」，
+       * 可以让预算多铺开一点。见 server 侧 /stream 对 attempt 的处理。
+       */
+      const attempt = curPos > 0 ? 1 : 0
+      return [{ url: serverStreamUrl(song, attempt), from: '服务端代理' }]
     }
     return []
   }

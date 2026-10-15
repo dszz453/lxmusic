@@ -72,10 +72,10 @@ public class AboutActivity extends Activity {
                 "品牌名由服务端自报：判据是 /api/version 里的 host 字段 —— "
                         + "CF 那条线回 music-edge，Docker 那条线回 LX-MUSIC。"
                         + "不用响应头或 CDN 特征判断，因为那些过一层反向代理就没了。"
-                        + "点下面的「切换服务器」可以直接换一条线。"));
+                        + "点下面的「服务器地址」可以填写 / 修改自建服务器地址。"));
 
         LinearLayout cSwitch = Ui.card(this);
-        cSwitch.addView(Ui.row(this, null, "切换服务器", "双服务器地址 (主线路 / 备用线路) / 自建",
+        cSwitch.addView(Ui.row(this, null, "服务器地址", "配置自建服务器地址或切换内置离线",
                 null, true, new View.OnClickListener() {
                     @Override
                     public void onClick(View v) {
@@ -90,7 +90,7 @@ public class AboutActivity extends Activity {
                 "同一份核心代码驱动多端宿主：\n"
                         + "· Docker 自托管 —— Node.js + 内置 SQLite 适配层，数据在自己手里；\n"
                         + "· Cloudflare Workers —— 零运维 Serverless + 全球 D1 数据库；\n"
-                        + "· 安卓客户端（本 App）—— 原生宿主 + 跨端业务层 + 底层能力层，支持双服务器地址自由切换。\n\n"
+                        + "· 安卓客户端（本 App）—— 原生宿主 + 跨端业务层 + 底层能力层，支持自建服务器地址与内置离线自由切换。\n\n"
                         + "客户端的分层（对应网易云客户端那套 原生 + React Native 混合架构）：\n"
                         + "· 原生宿主层：顶栏 / 底部导航 / 本页这类原生页面 / 播放前台服务；\n"
                         + "· 跨端桥接层：http / 数据库 / 媒体会话 / 原生 UI 能力统一门面；\n"

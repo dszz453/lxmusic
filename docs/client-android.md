@@ -1,22 +1,20 @@
-# 安卓客户端（云音乐 · 通用客户端）
+# 安卓客户端（云音乐 Docker 版 / CF 版）
 
-同一个仓库里有**两个安卓工程**，做的是两件不同的事，别混：
+同一个仓库里保留两套安卓宿主：UI 与后端路径不同，分别构建、分别维护：
 
-| | `android/` | **`client/`（本文档）** |
+| | `android/`（CF 版） | `client/`（Docker 版） |
 |---|---|---|
-| 包名 | `com.zyplnn.musicedge` | `com.yunmusic.app` |
-| 定位 | CF 那条线上的**离线自包含壳** | **通用客户端**：连 CF / Docker / 自建 / 内置都行 |
-| 前端 | `public/` 整包（离线自包含） | **同一份 `public/` 整包** + 跨端层 `client/rn/` |
-| 后端 | 永远在设备内（`backend.bundle.js` + 手机 SQLite） | 跟着「服务器档案」走：远程就放服务器上，内置就在设备内 |
-| 名字 | 固定 `music-edge` | App 自称 **云音乐**；界面品牌由所连服务端自报（`music-edge` / `LX-MUSIC`） |
-| 版本线 | 与服务端同号 | **客户端自己的版本线（V2.20）** |
-| 产物 | `dist/music-edge-<版本>.apk` | `outputs/云音乐-V<版本>.apk`（另拷一份到 `dist/`） |
+| 包名 | `com.yunmusic.cf` | `com.yunmusic.docker` |
+| 桌面名称 | **云音乐(CF版)** | **云音乐(Docker版)** |
+| 宿主架构 | 单 Activity + WebView，嵌入本地 `backend.bundle.js` 自包含壳 | 原生多页面 + WebView 跨端层，保留服务器配置、本地音乐库与设置 |
+| 代码来源 | `android/` 独立 Java 壳 + `public/` + 本地 bundle | `client/` Docker 客户端 + 共用 `public/` |
+| 应用版本来源 | `android/version.mjs`（CF APK） | `client/version.mjs`（Docker APK） |
+| 产物 | `outputs/云音乐(CF版)-V2.21.apk` | `outputs/云音乐(Docker版)-V2.21.apk` |
 
-两者包名不同 → **可以同时装在一台设备上互不覆盖**，方便对照。
-签名**各自一把**，互不通用：
-`android/keystore/yunmusic.keystore`（music-edge 壳）与
-`client/keystore/yunmusic-app.keystore`（云音乐，别名 `debug` / 口令 `android`，
-**沿用 V2.19 及更早那套手写客户端的签名** → 老用户**原地覆盖安装**即可升级，不必卸载重装）。
+包名不同，所以两个 App **可以同时安装在同一台手机上**，各自的数据与设置隔离。
+签名密钥也分别保存在 `android/keystore/yunmusic.keystore` 与
+`client/keystore/yunmusic-app.keystore`。Docker 版 V2.20 使用新包名 `com.yunmusic.docker`；
+旧版 `com.yunmusic.app` 不会自动迁移，若手机里仍装有旧版，它会作为另一个 App 留在设备上。
 
 > ⚠ 2026-10-14：原本还有**第三个**安卓工程 `yunmusic-client/`（包名同样是 `com.yunmusic.app`，
 > 但前端是**手写单文件** `assets/web/index.html`，4727 行）。老板要求「客户端参照 web 端重新开发」
@@ -98,8 +96,12 @@
 四件事拼起来，缺一件就会出现「界面显示 A、实际连的是 B」：
 
 1. **服务器档案**（`ServerStore`，SharedPreferences）
-   三档固定槽位（内置离线 / Cloudflare / Docker）+ 任意多条自建。槽位不随用户改名或删除 ——
+   两档固定槽位（内置离线 / 服务器地址）+ 任意多条自建。槽位不随用户改名或删除 ——
    品牌判定要靠它，用户不该有办法把「我连的是哪条线」这件事搞乱。
+   > 2026-10-15（V2.21）：老板要求「docker 版本不要写两个线路了，一个就行」，
+   > 于是去掉「主线路 / 备用线路」的二分，只留**一个服务器地址槽位** + 内置离线。
+   > 老配置里的 `cf` 备用槽位在 `ensureDefaults()` 里被收编：地址搬进唯一槽位后移除，
+   > 用户升级后不会丢地址。
 
 2. **握手**（`Handshake`，`GET /api/version`）
    服务端自报 `host`（`cf` / `docker`）、`version`、`build`。
@@ -120,36 +122,35 @@
    - 注入一段 CSS 隐藏网页自带的顶栏/底栏（原生接管），并把排版里为它们预留的空间收回来。
    改内存而不改 `public/index.html`：共用前端**一行都不动**，网页端与老壳行为零变化。
 
-5. **双线路一站式直配与 Token 隔离**
-   - **交互极简**：地址 1 (主线路 / Docker) 与 地址 2 (备用线路 / Cloudflare) 直接在主卡片展开输入框，用户进页面即可直接打字修改，无需再点开多层抽屉。
-   - **切换即落盘**：点击「切换并使用此线路」时，自动保存输入框内未提交的新地址，避免握手失败导致的配置丢失。
-   - **多服务器 Token 隔离**：前端鉴权令牌按 `lx.token@<serverBase>` 区分存储，解决双线路切换后因令牌混用导致的 401 掉登录问题。
+5. **单服务器地址直配与 Token 隔离**
+   - **交互极简**：服务器地址（自建 Docker / CF 均可）直接在卡片上展开输入框，
+     用户进页面即可直接打字修改，无需再点开多层抽屉；内置离线作为另一档并列可选。
+   - **切换即落盘**：点击「保存并启用」时，自动保存输入框内未提交的新地址，
+     避免握手失败导致的配置丢失。
+   - **多服务器 Token 隔离**：前端鉴权令牌按 `lx.token@<serverBase>` 区分存储，
+     解决换服务器后因令牌混用导致的 401 掉登录问题。
 
 ---
 
-## 四、两条版本线
+## 四、版本号分线
 
-| | 谁 | 现在 | 改哪儿 |
+| 版本线 | 现在 | 改哪儿 | 对应 APK |
 |---|---|---|---|
-| 客户端版本 | 这个 APK | **V2.20**（`versionCode 400`） | `client/version.mjs` |
-| 服务端版本 | CF Worker / Docker | **V2.12**（`versionCode 131`） | `src/version.js` |
+| CF 客户端 | **V2.21**（`versionCode 410`） | `android/version.mjs` | `云音乐(CF版)-V2.21.apk` |
+| Docker 客户端 | **V2.21**（`versionCode 410`） | `client/version.mjs` | `云音乐(Docker版)-V2.21.apk` |
+| CF Worker / Docker 服务端 | **V2.13**（`versionCode 132`） | `src/version.js` | 服务端，不等同 APK 版本 |
 
-**两者不必同号，也不该强求同号**：服务端升到 V2.13 时，只要接口兼容，App 不用重装；
-客户端修个原生层的 bug 时，服务端一行都不用动。强行同号的后果是
-「服务端发个版，全量用户就得重装 App」。
+三个版本值分别维护；服务端发布不要求 App 重装，某个 App 宿主有改动也不要求另一份跟着发版。
+CF 与 Docker APK 的 versionCode 当前相同，但 Android 用不同包名识别应用，因此两者可共存。
+各自发版时都只在对应版本文件里递增，不要拿服务端版本号覆盖 APK 版本号。
 
-⚠ 客户端版本号**只增不减、不许同号原地覆盖**：`versionCode` 是安卓判断
-「这个包能不能覆盖安装」的唯一依据，退号或同号会让用户**装不上**
-（V2.19 是 390，V2.20 必须是 400；改客户端时 `CLIENT_VERSION` 与
-`CLIENT_VERSION_CODE` 一起 +0.1 / +10）。
-
-但客户端必须知道**自己该跟哪一版服务端说话** —— 那就是
-`client/version.mjs` 的 `SERVICE_VERSION`（= 服务端 `APP_VERSION`，由
+客户端必须知道**自己该跟哪一版服务端说话** —— Docker 客户端的
+`client/version.mjs` `SERVICE_VERSION`（= 服务端 `APP_VERSION`，由
 `test/client-wiring.test.mjs` 钉住）与 Java 侧的 `ClientBrand.SERVICE_EXPECT`。
-握手回来版本不一致时**只提示、不阻断**：差一格通常仍然可用，硬拦会把用户锁在门外。
+握手回来版本不一致时**只提示、不阻断**。CF 壳是本地自包含实现，其 APK 版本独立由 `android/version.mjs` 管理。
 
 顺带修掉一个会立刻出现的假告警：共用前端原本拿**客户端版本**去比**服务端版本**，
-在通用客户端上必然不等（2.20 vs V2.12）→ 一条永远亮着的「⚠ 与服务端版本不一致」。
+在通用客户端上必然不等（2.21 vs V2.13）→ 一条永远亮着的「⚠ 与服务端版本不一致」。
 现在比的是 `window.LX_CLIENT_SERVICE`（客户端期望的服务端版本），
 拿不到时退回老行为（老壳不受影响）。
 
@@ -158,20 +159,20 @@
 ## 五、构建与验证
 
 ```bash
-# 构建（会自动先打包跨端业务层，再重建离线后端 bundle）
+# Docker 版：原生多页面客户端，自动打包跨端层与离线后端 bundle
 bash client/build-client.sh
-bash client/build-client.sh --skip-backend   # 只改前端/跨端层时更快
+bash client/build-client.sh --skip-backend   # 仅改 UI/跨端层时使用
 
-# 产物（版本号从 client/version.mjs 读，文件名随之变）
-client/build/云音乐-V2.20.apk                # 主产物
-outputs/云音乐-V2.20.apk                     # 副本（历史惯例，方便取件）
-dist/云音乐-V2.20.apk                        # 副本（与 android/ 壳同一惯例）
+# CF 版：android/ 自己的 WebView + 本地 backend.bundle.js 构建链
+bash android/build-apk.sh
 
-# 静态接线审计（112 项，秒级，不需要安卓运行时）
+# 产物都会复制到 outputs/ 供安装
+outputs/云音乐(Docker版)-V2.21.apk
+outputs/云音乐(CF版)-V2.21.apk
+
+# 静态接线审计
 node test/client-wiring.test.mjs
-
-# 跨端层行为（34 项，秒级，不需要浏览器/安卓 —— 自带一个极小 DOM 替身）
-# 产物缺失或落后于 client/rn/src/ 时会先自动重打一遍，不会静默测旧产物
+node test/app-wiring.test.mjs
 node test/client-layer.mjs
 ```
 
@@ -179,10 +180,11 @@ node test/client-layer.mjs
 
 ```bash
 node test/brand.test.mjs              # 38 项：品牌判定（客户端的同步判据在这里被钉住）
-node test/app-wiring.test.mjs         # 47 项：版本落点 / 媒体会话接线
-node test/client-wiring.test.mjs      # 112 项：客户端四条链路（静态接线审计）
+node test/app-wiring.test.mjs         # 53 项：CF APK 版本落点 / 媒体会话接线
+node test/client-wiring.test.mjs      # 113 项：客户端四条链路（静态接线审计）
 node test/client-layer.mjs            # 34 项：跨端层行为（守卫 / 路由归属 / 入口接管 / 桥崩容错）
 node test/boot-speed.test.mjs         # 52 项：启动路径（首屏不等网络 / 档案读取顺序）
+node test/stream-pick.mjs             # 78 项：取流候选排序 + /url 与 /stream 共享候选缓存
 ```
 
 > ⚠ 构建脚本第 1.5 步是 `cp -r "$ROOT/public/." "$ASSETS/www/"` ——

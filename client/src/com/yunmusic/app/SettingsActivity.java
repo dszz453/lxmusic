@@ -39,58 +39,23 @@ public class SettingsActivity extends Activity {
 
         final ServerStore st = ServerStore.get(this);
         final ServerStore.Profile p = st.active();
-        final ServerStore.Profile p1 = st.getLine1();
-        final ServerStore.Profile p2 = st.getLine2();
 
         /* ---------------- 连接 ---------------- */
-        col.addView(Ui.section(this, "服务器连接与切换"));
+        col.addView(Ui.section(this, "服务器连接"));
         LinearLayout c1 = Ui.card(this);
 
         // 1. 当前所连服务器信息
         final TextView curServerTv = Ui.text(this,
-                "当前生效：" + p.name + (p.base.isEmpty() ? "（未配置地址）" : " · " + p.base),
+                "当前生效：" + p.name + (p.base.isEmpty() ? (ServerStore.ID_BUILTIN.equals(p.id) ? " · 全本地运行" : "（未配置地址）") : " · " + p.base),
                 13.5f, Ui.color(this, R.color.brand), true);
         curServerTv.setPadding(Ui.dp(this, 16), Ui.dp(this, 12), Ui.dp(this, 16), Ui.dp(this, 4));
         c1.addView(curServerTv);
 
-        // 2. 双线路直接切换按钮（一键切换）
-        final String targetName;
-        final String targetId;
-        final String targetBase;
-        if (ServerStore.ID_LINE1.equals(st.activeId())) {
-            targetName = "地址 2 (备用线路)";
-            targetId = ServerStore.ID_LINE2;
-            targetBase = (p2 != null && !p2.base.isEmpty()) ? p2.base : "尚未配置地址";
-        } else {
-            targetName = "地址 1 (主线路)";
-            targetId = ServerStore.ID_LINE1;
-            targetBase = (p1 != null && !p1.base.isEmpty()) ? p1.base : "尚未配置地址";
-        }
-
-        final TextView toggleSubtitle = Ui.text(this, "目标：" + targetBase, 12f, Ui.color(this, R.color.text_2), false);
-        c1.addView(Ui.row(this, null, "⇄ 一键切换至：" + targetName,
-                "轻触立即在两套服务器节点间切换", "立即切换", true,
-                new View.OnClickListener() {
-                    @Override
-                    public void onClick(View v) {
-                        ServerStore.Profile targetProfile = st.find(targetId);
-                        if (targetProfile == null || !targetProfile.usable()) {
-                            Ui.toast(SettingsActivity.this, targetName + " 尚未配置地址，请先点击下方进行配置");
-                            return;
-                        }
-                        st.setActive(targetId);
-                        changed = true;
-                        Ui.toast(SettingsActivity.this, "已切换为：" + targetProfile.name);
-                        // 重新刷新显示
-                        curServerTv.setText("当前生效：" + targetProfile.name + " · " + targetProfile.base);
-                    }
-                }));
-
         c1.addView(Ui.divider(this, true));
 
-        // 3. 进入双地址完整配置页面
-        c1.addView(Ui.row(this, null, "配置双服务器地址",
-                "一次性填写/修改地址 1 与地址 2（测速握手）",
+        // 2. 进入服务器地址完整配置页面
+        c1.addView(Ui.row(this, null, "服务器地址与离线设置",
+                "配置自建服务器地址、连通性握手测试或切换内置离线",
                 null, true, new View.OnClickListener() {
                     @Override
                     public void onClick(View v) {

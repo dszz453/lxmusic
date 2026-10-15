@@ -42,8 +42,18 @@
  * v45：`js/backend.bundle.js` 的所有播放取流改为仅调用 `musicUrl` 插件，不再回退到
  *      provider 原生取流接口。bundle 由内置客户端直接加载，且 Web 端会通过 SWR 缓存；
  *      抬高 VERSION 以清除旧缓存，确保本地客户端和网页端尽快运行新策略。
+ *
+ * v48：三处一起变，都走「同源静态资源 SWR」或 PRECACHE 分支，不抬 VERSION 用户会先跑旧前端：
+ *      ① `js/backend.bundle.js`：修「每个歌单的第一首歌默认服务端取流、然后播不出来」——
+ *         `/api/url` 解析出的候选顺手写进 streamCandCache，`/api/stream` 直接复用，
+ *         不再从零冷解析（冷态 2~3 秒，撞上浏览器 Range 探测掐断重连 → 502 / 静音）；
+ *         `src/lib/http.js` 的边缘解析预算同时放宽（1600/1200/1800 → 3200/1500/3600 毫秒）。
+ *      ② `js/player.js`：代理级第二条候选给 URL 带 `retry=1`，服务端据此跳过缓存重新解析
+ *         （重试同一份已失败的候选只会同样失败）。
+ *      ③ `css/app.css` + `js/app.js`：整体视觉精修，并给歌曲行加 `data-song-id` +
+ *         `syncNowPlaying()`，把「正在播放」那一行高亮出来（原来切歌后列表看不出播的是哪首）。
  */
-const VERSION = 'v47'
+const VERSION = 'v48'
 const STATIC_CACHE = 'lxmusic-static-' + VERSION
 const SHELL_CACHE = 'lxmusic-shell-' + VERSION
 

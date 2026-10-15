@@ -161,7 +161,11 @@
       if (token !== routeToken) return
       view.innerHTML = emptyState('出错了', esc((e && e.message) || String(e)))
     }
-    if (token === routeToken) emitRoute(r)
+    if (token === routeToken) {
+      // 页面刚渲染完，把「正在播放」那一行标出来（列表页才有行，别的页是空操作）
+      syncNowPlaying(Player.current())
+      emitRoute(r)
+    }
   }
 
   function emitRoute(r) {
@@ -230,7 +234,8 @@
 
     const duration = song.interval ? '<span class="dot">·</span>' + formatTime(song.interval) : ''
 
-    return '<div class="song' + (o.showCover ? ' song--rich' : '') + '" data-list="' + esc(o.list) + '" data-i="' + o.i + '">'
+    return '<div class="song' + (o.showCover ? ' song--rich' : '') + '" data-list="' + esc(o.list) + '" data-i="' + o.i + '"'
+      + ' data-song-id="' + esc(song.id || '') + '">'
       + index
       + '<div class="song__meta">'
       + '<div class="song__name">' + esc(song.name || '未知歌曲') + '</div>'
@@ -2816,9 +2821,27 @@
     if (btn && Player.current()) btn.style.opacity = '1'
   }
 
-  function syncFavIcons() {
-    // 列表中的收藏图标在重新渲染时刷新即可，这里只保证当前页状态一致
+  /**
+   * 当前播放的歌在**可见列表**里高亮。
+   *
+   * 为什么要有它：歌单 / 榜单 / 搜索结果里的每一行都长得一样，用户点了一首之后
+   * 回头再看列表，完全认不出刚才点的是哪一行（队列抽屉里有 is-current，
+   * 但那要额外打开抽屉才看得到）。这里在切歌时给列表里同 id 的行打上 .is-current，
+   * 样式由 app.css 负责（左侧品牌色指示条 + 歌名变色）。
+   *
+   * 实现取舍：只按 id 匹配、只动 class，不重绘列表 —— 重绘会打断滚动位置，
+   * 也会让封面重新加载一遍（闪一下）。
+   */
+  function syncNowPlaying(song) {
+    const rows = view.querySelectorAll('.song')
+    const id = song && song.id ? String(song.id) : ''
+    for (const row of rows) {
+      const on = !!id && row.dataset && row.dataset.songId === id
+      row.classList.toggle('is-current', on)
+    }
   }
+  /** 兼容旧调用名（内部只有这一个实现，避免两处各写一份） */
+  function syncFavIcons(song) { syncNowPlaying(song) }
 
   async function handleAction(node) {
     const act = node.dataset.act

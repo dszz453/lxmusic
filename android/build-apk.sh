@@ -31,12 +31,28 @@ export PATH="$JDK/bin:$PATH"
 # 让 javac/d8 的中文提示按 UTF-8 输出，否则在 Git Bash 里是一堆乱码
 export JAVA_TOOL_OPTIONS="-Dfile.encoding=UTF-8 -Dsun.stdout.encoding=UTF-8 -Dsun.stderr.encoding=UTF-8"
 
-W() { cygpath -w "$1"; }                          # MSYS 路径 → Windows 路径
-# 写进 argfile 的路径必须换成 Windows 形式：MSYS 只会自动转换「命令行上的」路径参数，
-# argfile 里的内容原样传给 javac，/d/... 会被当成盘符 \d\... → 报「找不到文件」
-LIST_WIN() { find "$@" | while read -r f; do cygpath -w "$f"; done; }
+W() { cygpath -m "$1"; }                          # MSYS 路径 → Windows 正斜杠路径
+# javac argfile 不经过 MSYS 参数转换；路径必须加引号，否则工作区目录含空格时
+# `C:\Users\...\WorkBuddy AI\...` 会被拆成多个参数而编译失败。
+LIST_WIN() { find "$@" | while read -r f; do printf '"%s"\n' "$(cygpath -m "$f")"; done; }
+# D8 的 response file 不接受路径外围引号，单独输出不加引号的正斜杠路径。
+LIST_D8() { find "$@" | while read -r f; do cygpath -m "$f"; done; }
 
-APP_NAME="music-edge"
+APP_NAME="云音乐(CF版)"
+# 2.21：整体视觉精修 + 「正在播放」行高亮，并让 CF 版带上服务端那条
+#      「歌单第一首歌播不出来」的修复（内嵌 backend.bundle.js 随 src/ 一起重打）。
+#      · 前端（两个 APK 共用 public/）新增：区块标题品牌色小竖条、歌曲行分隔线与
+#        .is-current 指示条、卡片按压反馈、细滚动条、表单焦点环、进度条拖点、
+#        抽屉顶部拖拽指示条、封面柔投影、Toast 模糊阴影；
+#        app.js 给歌曲行加 data-song-id，渲染后 syncNowPlaying(Player.current())
+#        把正在播放那一行高亮出来（原来切歌后列表看不出播的是哪首）。
+#      · 服务端（同源，Worker / Docker / 本机 bundle 一并生效）：/api/url 解析出的
+#        候选顺手写进 streamCandCache，/api/stream 直接复用，不再从零冷解析；
+#        前端代理级第二条候选带 retry=1，服务端据此跳过缓存重新解析。
+#        详见 src/server/api.js 与 test/stream-pick.mjs 第 8 节。
+# 2.20：CF 原生包独立命名、独立包名、独立版本线，与 Docker 客户端同机共存。
+#      本包保留 android/ 下的 WebView + 本地 backend.bundle.js 自包含实现，
+#      不把 client/ 的多页面 Docker 客户端代码误打进 CF 版。
 # 2.12：修「播 30 秒就没了」—— 交给客户端的候选列表**没按完整度排序**。
 #     ① 根因：resolveMusicUrlFast 在「有候选探通」那条路径上交出去的 ordered 是
 #        「best 打头 + 其余按**探测完成先后**」。完成顺序是网络快慢，与完整度无关：
@@ -586,15 +602,15 @@ APP_NAME="music-edge"
 #      1.1 只是个套壳，页面仍要从线上站点拉。
 #      虽然安卓壳里用不到音频代理（http 可直放），但这份代码是同一份，行为保持一致。
 #
-# ⚠ 版本号**不在这里写死**。1.10 起改为从 src/version.js 读（单一事实来源），
-#   否则「服务端 V1.0 / APP 1.10」这种对不上的事还会再发生一次。
-#   要发新版：改 src/version.js 里的 APP_VERSION 与 APP_VERSION_CODE，然后重跑构建。
-VERSION_CODE="$(node -e "import('./src/version.js').then(m=>console.log(m.APP_VERSION_CODE))" 2>/dev/null)"
-VERSION_NAME="$(node -e "import('./src/version.js').then(m=>console.log(m.APP_VERSION.replace(/^v/i,'')))" 2>/dev/null)"
-# 兜底：万一 node 不在 PATH（比如只装了 JDK 的构建机），不至于让构建整个挂掉
-VERSION_CODE="${VERSION_CODE:-100}"
-VERSION_NAME="${VERSION_NAME:-1.0}"
-echo "   版本：$VERSION_NAME (code $VERSION_CODE) ← src/version.js"
+# CF APK 使用 android/version.mjs 独立版本线，不与服务端或 Docker 客户端版本混为一谈。
+VERSION_CODE="$(cd "$HERE" && node -e "import('./version.mjs').then(m=>console.log(m.CF_VERSION_CODE))" 2>/dev/null)"
+VERSION_NAME="$(cd "$HERE" && node -e "import('./version.mjs').then(m=>console.log(m.CF_VERSION.replace(/^v/i,'')))" 2>/dev/null)"
+[ -n "$VERSION_CODE" ] && [ -n "$VERSION_NAME" ] || {
+  echo "❌ 读取 android/version.mjs 失败，停止构建，避免生成错误版本号的 APK"
+  exit 1
+}
+echo "   CF 客户端版本：$VERSION_NAME (code $VERSION_CODE) ← android/version.mjs"
+APK="$OUT/$APP_NAME-V$VERSION_NAME.apk"
 
 echo "== 0. 环境 =="
 [ -f "$PLAT" ] || { echo "缺 android.jar: $PLAT"; exit 1; }
@@ -648,6 +664,7 @@ echo "== 2. aapt2 link：链接资源与清单，生成 R.java =="
   -A "$(W "$ASSETS")" \
   -R "$OUT/res.zip" \
   --java "$OUT/gen" \
+  --custom-package com.zyplnn.musicedge \
   --min-sdk-version 21 \
   --target-sdk-version 34 \
   --version-code $VERSION_CODE \
@@ -661,8 +678,8 @@ javac -encoding UTF-8 -nowarn -source 11 -target 11 \
   -classpath "$(W "$PLAT")" -d "$(W "$OUT/classes")" "@$(W "$OUT/sources.txt")"
 
 echo "== 4. d8：转 Dex =="
-LIST_WIN "$OUT/classes" -name '*.class' > "$OUT/classes.txt"
-"$BT/d8.bat" --lib "$(W "$PLAT")" --min-api 21 --output "$(W "$OUT/dex")" "@$(W "$OUT/classes.txt")"
+LIST_D8 "$OUT/classes" -name '*.class' > "$OUT/classes.txt"
+java -cp "$(W "$BT/lib/d8.jar")" com.android.tools.r8.D8 --lib "$(W "$PLAT")" --min-api 21 --output "$(W "$OUT/dex")" "@$(W "$OUT/classes.txt")"
 
 echo "== 5. 合成 APK：dex 塞进 aapt2 产物 =="
 cp "$OUT/app-base.apk" "$OUT/app-unsigned.apk"
@@ -695,15 +712,22 @@ else
 fi
 
 echo "== 8. apksigner：签名 =="
-"$BT/apksigner.bat" sign \
-  --ks "$KS" --ks-pass pass:android --key-pass pass:android --ks-key-alias yunmusic \
+java -jar "$(W "$BT/lib/apksigner.jar")" sign \
+  --ks "$(W "$KS")" --ks-pass pass:android --key-pass pass:android --ks-key-alias yunmusic \
   --v1-signing-enabled true --v2-signing-enabled true --v3-signing-enabled true \
-  --out "$OUT/$APP_NAME-$VERSION_NAME.apk" \
-  "$OUT/app-aligned.apk"
+  --out "$(W "$APK")" \
+  "$(W "$OUT/app-aligned.apk")"
 
 echo "== 9. 校验 =="
-"$BT/apksigner.bat" verify --print-certs "$OUT/$APP_NAME-$VERSION_NAME.apk" | head -8
-ls -la "$OUT/$APP_NAME-$VERSION_NAME.apk"
+java -jar "$(W "$BT/lib/apksigner.jar")" verify --print-certs "$(W "$APK")" | head -8
+"$BT/aapt2.exe" dump badging "$(W "$APK")" 2>/dev/null \
+  | grep -E "^package|^application-label|^launchable-activity" | head -6
+ls -la "$APK"
+
+# 复制到用户取件目录，保留 android/build/ 中的中间构建目录不对外当产物。
+mkdir -p "$HERE/../outputs"
+cp "$APK" "$HERE/../outputs/$(basename "$APK")"
 
 echo ""
-echo "✅ 产物: $OUT/$APP_NAME-$VERSION_NAME.apk"
+echo "✅ 产物: $APK"
+echo "   副本: $HERE/../outputs/$(basename "$APK")"

@@ -1,5 +1,5 @@
 /* 由 tools/build-app.mjs 自动生成，请勿手动修改。
- * 源摘要: 1d3174b72c04722a
+ * 源摘要: 4c37555a498e129b
  * 模块数: 25
  *
  * 这是给安卓壳用的后端展平版：把 src/ 的 ESM 后端打成单个 IIFE，
@@ -733,6 +733,39 @@ function regenDailyIfStale(env, record, toWeb, { sync = true, budgetMs } = {}) {
     .catch(() => false)
 }
 
+// 代理流短期候选缓存：浏览器加载音频时往往先发 HEAD 或 bytes=0- 拉取元数据，
+// 随后立刻掐断并发起真实 Range 请求。缓存直链 60 秒，避免二次分片时退回 15 秒串行解析导致 CF 502。
+const streamCandCache = new Map()
+const STREAM_CAND_TTL = 60 * 1000
+
+/**
+ * 候选缓存的键。
+ *
+ * ⚠ `/url`（写）与 `/stream`（读）**必须用同一个函数**算这个键。
+ * 早先两处各写一遍字符串拼接，看着一样其实差一点（有的带 songmid 有的不带），
+ * 结果是「/url 明明解析过了、/stream 还是重新解析」—— 白等一轮。
+ * 抽成一个函数，改一处就两边都跟着改。
+ */
+function streamCandKey(song, quality) {
+  return `${song.source}:${song.songmid || song.id || ''}:${quality || '320k'}`
+}
+
+function getStreamCand(key) {
+  const hit = streamCandCache.get(key)
+  if (!hit) return null
+  if (Date.now() - hit.ts > STREAM_CAND_TTL) { streamCandCache.delete(key); return null }
+  return hit.urls
+}
+
+function setStreamCand(key, urls) {
+  if (!key || !urls || !urls.length) return
+  if (streamCandCache.size > 100) {
+    const oldest = Array.from(streamCandCache.entries()).sort((a, b) => a[1].ts - b[1].ts)[0]
+    if (oldest) streamCandCache.delete(oldest[0])
+  }
+  streamCandCache.set(key, { ts: Date.now(), urls })
+}
+
 async function handleApi(request, env, url) {
   const path = url.pathname.replace(/^\/api/, '') || '/'
   const method = request.method.toUpperCase()
@@ -1133,9 +1166,27 @@ async function handleApi(request, env, url) {
       // fast=1：只解析直链、不做字节探测，浏览器直连播放用（必须秒回）。
       // 默认：逐候选真拉字节验证，服务端代理播放前先筛掉死链。
       const fast = url.searchParams.get('fast') === '1'
-      const r = fast
-        ? await resolveMusicUrlFast(song, quality, env.PLUGIN_POOL)
-        : await resolvePlayableUrl(song, quality, env.PLUGIN_POOL)
+      const candKey = streamCandKey(song, quality)
+      let r
+      if (fast) {
+        r = await resolveMusicUrlFast(song, quality, env.PLUGIN_POOL)
+      } else {
+        r = await resolvePlayableUrl(song, quality, env.PLUGIN_POOL)
+      }
+      /**
+       * ⚠ 把 /url 解析出来的候选**同时写进代理流的候选缓存**。
+       *
+       * 为什么这一条很重要（CF 版「歌单第一首歌播不出来」的根因之一）：
+       * 播放一首歌时前端先打 `/url?fast=1`（direct 级），拿到候选直接喂 <audio>；
+       * 直连因为防盗链 / 无 https 而失败时，<audio> 落到下一级——远程模式下就是
+       * `/api/stream`。此刻服务端如果**不知道**刚才 /url 已经解析出哪些候选，
+       * 就会从零开始重新解析一遍（冷态 2~3 秒，正好踩过 Worker 的响应窗口），
+       * 于是 502 / 静音。
+       *
+       * 写缓存之后，/stream 直接复用这一份，几乎瞬时就能建流。
+       * 缓存键与 /stream 里的完全一致（见 streamCandKey），两边天然对得上。
+       */
+      if (r.url) setStreamCand(candKey, r.urls && r.urls.length ? r.urls : [{ url: r.url, from: r.from }])
       if (!r.url) return json({ ok: false, error: r.error || '无可用播放地址', errors: r.tried }, 404)
       return json({ ok: true, url: r.url, urls: r.urls || null, from: r.from, verified: !r.unverified, tried: r.tried })
     }
@@ -1168,19 +1219,34 @@ async function handleApi(request, env, url) {
         marks.push({ step: '串行解析全部候选', ms: Date.now() - t0, candidates: trace })
         return json({ ok: true, song: { name: song.name, source: song.source, id: song.id }, marks })
       }
-      const isFirstPull = !rangeHeader || /^bytes=0-$/i.test(rangeHeader.trim())
-      let preferUrls = null
-      if (isFirstPull) {
+      const candKey = streamCandKey(song, quality)
+      /**
+       * `retry=1` 表示这次请求是**降级重试**（浏览器首次 Range 探测失败后重连）。
+       *
+       * 此时缓存里那份候选已经被试过一遍且失败了 —— 再拿同一份只会同样失败，
+       * 还会白耗一次预算。所以重试时跳过缓存、重新解析一轮。
+       * ⚠ 重试这一轮**不写回缓存**：这份新候选同样没经过验证，钉进缓存只会让
+       * 接下来 60 秒的请求都取它，把一次偶发失败放大成一段时间的持续失败。
+       *
+       * 这是 CF 版「第一首歌播不出来」的第二道保险：第一次失败往往是因为
+       * 候选恰好是条死链/防盗链地址，换一批通常就好了。
+       */
+      const isRetry = url.searchParams.get('retry') === '1'
+      let preferUrls = isRetry ? null : getStreamCand(candKey)
+      if (!preferUrls) {
         try {
           const pre = await resolveMusicUrlFast(song, quality, env.PLUGIN_POOL)
-          // 不论 verified 与否都把候选带上：它们已经被**并行**解析过了。
-          // 不带的话下面会退回串行解析，实测同一份列表串行要 15.9 秒（空槽位各等 ~3 秒）。
-          if (pre.urls && pre.urls.length) preferUrls = pre.urls
-        } catch { /* 预筛失败就退化成原来的串行试错 */ }
+          if (pre.urls && pre.urls.length) {
+            preferUrls = pre.urls
+            if (!isRetry) setStreamCand(candKey, preferUrls)
+          }
+        } catch { /* 预筛失败退化成原逻辑 */ }
       }
       const r = await openAudioStream(song, quality, env.PLUGIN_POOL, {
         rangeHeader,
         preferUrls,
+        // ⚠ 命中缓存时用 skipCandidateList：候选已经排好序交下去了，再铺一遍候选列表
+        // 等于把预算花在「重新解析」上 —— 而这正是 CF 上 502 的来源。
         skipCandidateList: !!preferUrls,
       })
       if (!r.ok) return json({ ok: false, error: r.error, errors: r.errors }, 502)
@@ -4912,7 +4978,7 @@ function allowHttpAudio() {
 function resolveBudget() {
   return globalThis.LX_NATIVE === true
     ? { deadline: 3500, probeDeadline: 1500, totalBudget: 3800 }
-    : {}
+    : { deadline: 3200, probeDeadline: 1500, totalBudget: 3600 }
 }
 
 /**
@@ -8661,7 +8727,7 @@ __modules["src/version.js"] = function (__exports, __require) {
  * 所以统一读这里，谁也别再各写各的。
  *
  * ── 两条版本线，别混 ──────────────────────────────────────────
- *   APP_VERSION      产品版本，人看的。改功能才动它。当前 V2.12
+ *   APP_VERSION      产品版本，人看的。改功能才动它。当前 V2.13
  *   APP_VERSION_CODE 整数构建号，Android 靠它判断「能不能覆盖安装」。
  *                    每次要发新版就 +1，**不能倒退、不能重复**，
  *                    否则手机上会报「应用未安装」（签名相同也装不上）。
@@ -8687,10 +8753,10 @@ __modules["src/version.js"] = function (__exports, __require) {
  */
 
 /** 产品版本（对外展示用）。每发一版升 0.1。 */
-const APP_VERSION = 'V2.12'
+const APP_VERSION = 'V2.13'
 
 /** Android versionCode：整数、单调递增、跨次发布不可重复。每发一版 +1。 */
-const APP_VERSION_CODE = 131
+const APP_VERSION_CODE = 132
 
 /** 人类可读的完整标识，日志/关于页用。 */
 const APP_ID = 'lxmusic'
