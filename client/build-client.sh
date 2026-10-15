@@ -21,6 +21,12 @@
 #  依赖（各下一份就够，之后全程离线，与壳共用同一份）：
 #    · JDK 17            android-build/jdk/
 #    · Android SDK       android-build/sdk/   build-tools;34.0.0 + platforms;android-34
+#    · python3（塞 classes.dex 用；本机与 ubuntu-latest 都在 PATH 上）
+#
+#  ⚠ 这个脚本**跨平台**：本机是 Windows + Git Bash，CI 是 ubuntu-latest。
+#    三处平台差异集中处理在下面「跨平台三件事」那一节（路径转换 / .exe 后缀 / python 定位），
+#    别再往正文里写 cygpath 或 aapt2.exe —— 那正是 2026-10-15 CI 第一次真跑时
+#    `aapt2.exe: No such file or directory` 的原因（本机全绿、CI 127）。
 #
 #  用法：
 #    bash client/build-client.sh                   # 完整构建
@@ -56,8 +62,24 @@ export PATH="$JDK/bin:$PATH"
 # 让 javac/d8 的中文提示按 UTF-8 输出，否则在 Git Bash 里是一堆乱码
 export JAVA_TOOL_OPTIONS="-Dfile.encoding=UTF-8 -Dsun.stdout.encoding=UTF-8 -Dsun.stderr.encoding=UTF-8"
 
-W() { cygpath -m "$1"; }                                  # MSYS 路径 → Windows 正斜杠路径
-LIST_WIN() { find "$@" | while read -r f; do printf '"%s"\n' "$(cygpath -m "$f")"; done; }
+# ── 跨平台三件事：路径转换 / 可执行文件后缀 / python 定位 ──────────────
+# 本脚本既要在本机（Windows + Git Bash，靠 cygpath）跑，也要在 CI（ubuntu-latest）
+# 上跑。下面三个差异不处理的话，症状都是「本机全绿、CI 第一步就 127/找不到文件」：
+#   · MSYS 需要把 /d/a/… 转成 Windows 路径，Linux 原样即可；
+#   · build-tools 里的二进制在 Windows 带 .exe，Linux 不带；
+#   · 塞 classes.dex 那步用 python，两端都在 PATH 上，但名字可能是 python3。
+if command -v cygpath >/dev/null 2>&1; then
+  W() { cygpath -m "$1"; }                                # MSYS 路径 → Windows 正斜杠路径
+else
+  W() { printf '%s' "$1"; }                               # Linux / macOS：原样
+fi
+LIST_Q() { find "$@" | while read -r f; do printf '"%s"\n' "$(W "$f")"; done; }
+
+EXE=""
+if [ -x "$BT/aapt2.exe" ]; then EXE=".exe"; fi           # Windows 的 build-tools 带 .exe
+
+PY="$(command -v python3 || command -v python || true)"
+[ -n "$PY" ] || { echo "❌ 找不到 python3 —— 第 5 步要往 APK 里塞 classes.dex"; exit 1; }
 
 # ── 客户端产品名从 client/version.mjs 读取
 APP_NAME="$(cd "$ROOT" && node -e "import('./client/version.mjs').then(m=>console.log(m.CLIENT_APP_NAME))" 2>/dev/null || echo "云音乐(Docker版)")"
@@ -84,7 +106,7 @@ echo "   构建标识：$BUILD_ID"
 
 echo "== 0. 环境 =="
 [ -f "$PLAT" ] || { echo "缺 android.jar: $PLAT"; exit 1; }
-[ -x "$BT/aapt2.exe" ] || [ -x "$BT/aapt2" ] || { echo "缺 aapt2: $BT"; exit 1; }
+[ -x "$BT/aapt2$EXE" ] || { echo "缺 aapt2: $BT"; exit 1; }
 java -version 2>&1 | head -1
 
 echo "== 0.5. 打包跨端业务层（client/rn/src → client-layer.js） =="
@@ -115,7 +137,7 @@ mv "$OUT"/*.apk "$OUT"/*.apk.idsig "$TRASH/" 2>/dev/null || true
 mkdir -p "$OUT/res" "$OUT/gen" "$OUT/classes" "$OUT/dex"
 
 echo "== 1. aapt2 compile：编译资源 =="
-"$BT/aapt2.exe" compile --dir "$HERE/res" -o "$OUT/res.zip"
+"$BT/aapt2$EXE" compile --dir "$HERE/res" -o "$OUT/res.zip"
 
 echo "== 1.5. 前端整包 + 跨端业务层进 assets/www =="
 ASSETS="$HERE/assets"
@@ -152,7 +174,7 @@ done
 echo "   assets/www 就绪：$(find "$ASSETS/www" -type f | wc -l) 个文件，$(du -sh "$ASSETS/www" | cut -f1)"
 
 echo "== 2. aapt2 link：链接资源与清单，生成 R.java =="
-"$BT/aapt2.exe" link \
+"$BT/aapt2$EXE" link \
   -o "$OUT/app-base.apk" \
   -I "$PLAT" \
   --manifest "$HERE/AndroidManifest.xml" \
@@ -167,18 +189,18 @@ echo "== 2. aapt2 link：链接资源与清单，生成 R.java =="
   --auto-add-overlay
 
 echo "== 3. javac：编译 Java 源码 =="
-LIST_WIN "$HERE/src" "$OUT/gen" -name '*.java' > "$OUT/sources.txt"
+LIST_Q "$HERE/src" "$OUT/gen" -name '*.java' > "$OUT/sources.txt"
 echo "   源文件数: $(wc -l < "$OUT/sources.txt")"
 javac -encoding UTF-8 -nowarn -source 11 -target 11 \
   -classpath "$(W "$PLAT")" -d "$(W "$OUT/classes")" "@$(W "$OUT/sources.txt")"
 
 echo "== 4. d8：转 Dex =="
-find "$OUT/classes" -name '*.class' | while read -r f; do cygpath -m "$f"; done > "$OUT/classes.txt"
+find "$OUT/classes" -name '*.class' | while read -r f; do printf '%s\n' "$(W "$f")"; done > "$OUT/classes.txt"
 java -cp "$(W "$BT/lib/d8.jar")" com.android.tools.r8.D8 --lib "$(W "$PLAT")" --min-api 21 --output "$(W "$OUT/dex")" "@$(W "$OUT/classes.txt")"
 
 echo "== 5. 合成 APK：dex 塞进 aapt2 产物 =="
 cp "$OUT/app-base.apk" "$OUT/app-unsigned.apk"
-"C:/Users/zhangxiaonan/.workbuddy-ai/binaries/python/versions/3.13.12/python.exe" -c "
+"$PY" -c "
 import zipfile, sys
 p = sys.argv[1]
 z = zipfile.ZipFile(p, 'a', zipfile.ZIP_DEFLATED)
@@ -188,7 +210,7 @@ print('   已写入 classes.dex')
 " "$OUT/app-unsigned.apk" "$OUT/dex/classes.dex"
 
 echo "== 6. zipalign：4 字节对齐（v2 签名要求，必须先于签名） =="
-"$BT/zipalign.exe" -f -p 4 "$OUT/app-unsigned.apk" "$OUT/app-aligned.apk"
+"$BT/zipalign$EXE" -f -p 4 "$OUT/app-unsigned.apk" "$OUT/app-aligned.apk"
 
 echo "== 7. 签名密钥 =="
 # ⚠ 这把密钥**不是**隔壁 android/ 壳那把（android/keystore/yunmusic.keystore）。
@@ -219,7 +241,7 @@ java -jar "$(W "$BT/lib/apksigner.jar")" sign \
 
 echo "== 9. 校验 =="
 java -jar "$(W "$BT/lib/apksigner.jar")" verify --print-certs "$(W "$OUT/$APP_NAME-V$VERSION_NAME.apk")" | head -6
-"$BT/aapt2.exe" dump badging "$OUT/$APP_NAME-V$VERSION_NAME.apk" 2>/dev/null \
+"$BT/aapt2$EXE" dump badging "$OUT/$APP_NAME-V$VERSION_NAME.apk" 2>/dev/null \
   | grep -E "^package|^application-label|^launchable-activity|^uses-permission" | head -12
 ls -la "$OUT/$APP_NAME-V$VERSION_NAME.apk"
 

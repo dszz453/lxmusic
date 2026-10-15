@@ -177,6 +177,13 @@ outputs/云音乐(CF版)-V2.21.apk
 > 这个目录 —— 传目录时脚本会打印 `缺 android.jar: …/platforms/android-34` 然后退出 1，
 > 而 `sdkmanager` 那步明明装成功了，很容易误判成「SDK 没装好」。
 > `test/app-wiring.test.mjs` 第 9 节把这条钉住了（传目录会精确报红）。
+>
+> ⚠ `client/build-client.sh` 是**跨平台**的（本机 Windows + Git Bash / CI ubuntu）。
+> 平台差异只集中在脚本开头那一节：`W()`（cygpath 路径转换，无 cygpath 时原样）、
+> `EXE`（`.exe` 后缀）、`LIST_Q()`（@argfile 列表）、`PY`（python 定位）。
+> **正文里不要再出现 `aapt2.exe` 或本机绝对路径** —— 那正是 CI 第一次真跑时
+> `aapt2.exe: No such file or directory`（exit 127）的原因：本机全绿、CI 直接挂。
+> 这两条也在第 9 节里钉住了。
 
 ```bash
 # 静态接线审计
@@ -189,7 +196,7 @@ node test/client-layer.mjs
 
 ```bash
 node test/brand.test.mjs              # 38 项：品牌判定（客户端的同步判据在这里被钉住）
-node test/app-wiring.test.mjs         # 57 项：CF APK 版本落点 / 媒体会话接线 / CI 出包环境契约
+node test/app-wiring.test.mjs         # 59 项：CF APK 版本落点 / 媒体会话接线 / CI 出包环境契约
 node test/client-wiring.test.mjs      # 113 项：客户端四条链路（静态接线审计）
 node test/client-layer.mjs            # 34 项：跨端层行为（守卫 / 路由归属 / 入口接管 / 桥崩容错）
 node test/boot-speed.test.mjs         # 52 项：启动路径（首屏不等网络 / 档案读取顺序）

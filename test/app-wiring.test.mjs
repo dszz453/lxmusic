@@ -306,6 +306,16 @@ ok('CI 测试 job 跑的是那五套零依赖测试',
 ok('CI 触发路径包含 public/（客户端前端就是 public/ 那一份，漏了会静默不跑）',
   /'public\/\*\*'/.test(ci))
 
+// build-client.sh 要同时在「本机 Windows + Git Bash」和「CI ubuntu」上跑。
+// 平台差异只允许集中在开头那一节（EXE / W / LIST_Q / PY 四个），
+// 正文里再出现 .exe 或本机绝对路径，就又变成「本机全绿、CI 127」了。
+const bcs = read('client/build-client.sh')
+ok('build-client.sh 只在平台探测处提到 aapt2.exe，调用点一律走 $EXE',
+  (bcs.match(/"\$BT\/aapt2\.exe"/g) || []).length === 1 &&
+  /aapt2\$EXE/.test(bcs) && /zipalign\$EXE/.test(bcs))
+ok('build-client.sh 不含本机绝对路径（python 等一律靠 PATH 定位）',
+  !/C:\/Users\//i.test(bcs))
+
 /* ------------------------------------------------------------------------- 汇总 */
 console.log('\n' + '='.repeat(62))
 if (fails.length) {
