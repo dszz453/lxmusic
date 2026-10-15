@@ -131,6 +131,14 @@ async function tryCandidates(thunks, song, errors, seen, opts) {
       return {
         ok: true,
         from: cand.from,
+        /**
+         * 这条候选**实际用的地址**（可能是升级后的 https，也可能是退回的原 http 链）。
+         *
+         * 为什么要带出来：调用方（`/api/stream`）拿它写「已经真的吐过字节」的
+         * 直链缓存 —— 同一首歌第二次播放就能直接命中，省掉整轮解析与探测。
+         * 见 src/server/api.js 的 streamUrlCache。
+         */
+        url: cand.url,
         response: new Response(upstream.body, { status: upstream.status === 206 ? 206 : 200, headers: outHeaders }),
       }
     } catch (e) {

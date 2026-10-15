@@ -12,7 +12,7 @@ import {
 import { songToSubsonic } from './subsonic.js'
 import { safeInt } from '../lib/util.js'
 import { openAudioStream, resolvePlayableUrl, resolveMusicUrlFast } from '../lib/stream.js'
-import { outboundFetch } from '../lib/http.js'
+import { outboundFetch, allowHttpAudio } from '../lib/http.js'
 import { generatePlaylist, loadAiConfig, chatOnce, AI_PROVIDERS } from '../lib/ai.js'
 import { PLUGIN_SCORES } from '../generated/plugin-scores.js'
 import { BUNDLED_PLUGINS } from '../generated/plugins.js'
@@ -382,6 +382,19 @@ const edgeCache = {
     }
     memEdgeCache.set(key.url, res.clone())
   },
+  /**
+   * 主动作废一条。
+   *
+   * 为什么需要它：缓存里存的是**会过期的东西**（播放直链），
+   * 一旦确认它已经失效，就得能立刻丢掉 —— 否则接下来整个 TTL 内
+   * 每个请求都会先试它一遍、白花一次往返。只用于「已知这条坏了」的场景，
+   * 不做批量清空（那会把跨 isolate 的收益一起清掉）。
+   */
+  async delete(key) {
+    const c = globalThis.caches && globalThis.caches.default
+    if (c) { try { return await c.delete(key) } catch { return } }
+    memEdgeCache.delete(key.url)
+  },
 }
 
 /**
@@ -446,6 +459,123 @@ function once(key, run) {
   p.then(() => { if (singleFlight.get(key) === p) singleFlight.delete(key) },
     () => { if (singleFlight.get(key) === p) singleFlight.delete(key) })
   return p
+}
+
+/* ---------------- 回源结果的边缘缓存（通用层） ---------------- */
+
+/**
+ * 「上游取回来的东西」的统一缓存 —— 榜单曲目 / 专辑曲目 / 歌词 / 导入匹配搜索。
+ *
+ * ══════════════ 为什么必须有这一层 ══════════════
+ *
+ * CF 版上「点开一张歌单/榜单要转圈」「同一首歌每次都要重新解析」的根因不是
+ * 上游慢，而是**这些东西一次都没被缓存过**：
+ *
+ *   · `/api/chart`  每次打开都 `fetchChart()` 回源打一次平台接口（网易 100 首的
+ *                   歌单详情要 1~3 秒）；
+ *   · `/api/album`  同上；
+ *   · `/api/lyric`  每首歌起播都问一次插件/平台；
+ *   · `/api/suggest` 歌单导入时逐首匹配，N 首歌就是 N 次搜索。
+ *
+ * 而这些内容**跟哪个用户无关**，几分钟到几小时内也几乎不变 —— 让每个请求都
+ * 各自回源一次，纯属把上游的延迟乘以并发数。
+ *
+ * ══════════════ 三条必须守住的边界 ══════════════
+ *
+ * 1. **缓存落在 `edgeCache`（CF 上是 Cache API），不是进程内 Map**。
+ *    Worker 的 isolate 会被频繁回收，进程内 Map 的命中率低到没有意义 ——
+ *    这正是 `streamCandCache` 那种「60 秒 Map」在 CF 上形同虚设的原因。
+ *
+ * 2. **TTL 按记录里的时间戳自己算，不交给 Cache-Control**。
+ *    安卓壳里没有 Cache API，`edgeCache` 会退化成进程内 Map，那时寿命只能由
+ *    时间戳决定 —— 两套宿主行为才一致（否则「CF 上 10 分钟、壳里永久」这种
+ *    差异极难查）。同时把**实际用的 TTL 一起写进记录**，好让同一份缓存
+ *    按内容给不同寿命（如「有歌词 12 小时 / 没歌词 5 分钟」）。
+ *
+ * 3. **失败与空结果不写**（由 `cacheable` 决定）。
+ *    一次上游抖动不该被钉住一整个 TTL —— 这是本项目在 `cachedToplists` /
+ *    `cachedHomeFallback` 上已经栽过的同一条纪律。
+ *
+ * 另外两个从既有实现里继承的做法：
+ *   · 用 `once()` 合并**同一刻的并发**：冷缓存时浏览器、两个 App、一次冷启动
+ *     可能同时在问同一份内容，算三遍等于把上游延迟乘三；
+ *   · 可选的 SWR（`staleMs`）：过期但还在宽限期内 → 先返回旧的、后台重算，
+ *     用户永远不为了「让时间戳变新」而干等。后台那一趟用 `env.waitUntil` 挂到
+ *     请求生命周期上（壳内没有 waitUntil 就让它自由跑完）。
+ *
+ * @param {object}   env
+ * @param {string}   keyUrl   缓存键（**只由内容本身决定**，绝不含 token/用户 id）
+ * @param {number}   ttlMs    新鲜期
+ * @param {Function} compute  回源函数
+ * @param {object}   [opts]
+ *        - staleMs   宽限期（相对 ttlMs）。0 = 不做 SWR
+ *        - cacheable 收不收这份结果，默认「非 null/undefined 就收」
+ *        - ttlFor    按内容给不同 TTL（配合记录里的 ttl 字段）
+ */
+const JSON_CACHE_BASE = 'https://lx.cache.internal/json/'
+
+/**
+ * 四类内容的 TTL。都是「跟哪个用户无关、几分钟到几小时不变」的东西。
+ *
+ *   CHART / ALBUM —— 10 分钟新鲜 + 12 小时宽限（SWR）。
+ *                   榜单/歌单曲目偶尔有更新（新歌上榜、下架），10 分钟是
+ *                   「用户察觉不到旧、又足够挡掉绝大多数重复回源」的位置。
+ *   LYRIC         —— 歌词基本永不改，给 12 小时；但**「这首歌没歌词」只给 5 分钟**，
+ *                    因为那多半是插件临时抽风，钉住半天会让用户以为歌词没了。
+ *   SUGGEST       —— 导入歌单时逐首匹配用的搜索。10 分钟。
+ */
+const CHART_CACHE_TTL_MS = 10 * 60 * 1000
+const CHART_CACHE_STALE_MS = 12 * 60 * 60 * 1000
+const ALBUM_CACHE_TTL_MS = 10 * 60 * 1000
+const ALBUM_CACHE_STALE_MS = 12 * 60 * 60 * 1000
+const LYRIC_CACHE_TTL_MS = 12 * 60 * 60 * 1000
+const LYRIC_MISS_CACHE_TTL_MS = 5 * 60 * 1000
+const SUGGEST_CACHE_TTL_MS = 10 * 60 * 1000
+
+
+async function cachedEdgeJson(env, keyUrl, ttlMs, compute, opts = {}) {
+  const staleMs = Math.max(0, Number(opts.staleMs) || 0)
+  const cacheable = typeof opts.cacheable === 'function'
+    ? opts.cacheable
+    : (d) => d !== null && d !== undefined
+  const ttlFor = typeof opts.ttlFor === 'function' ? opts.ttlFor : null
+  const key = new Request(JSON_CACHE_BASE + keyUrl, { method: 'GET' })
+
+  let stale = null
+  let hasStale = false
+  try {
+    const hit = await edgeCache.match(key)
+    if (hit) {
+      const rec = await hit.json()
+      if (rec && typeof rec.ts === 'number' && rec.data !== undefined) {
+        const ttl = Number(rec.ttl) > 0 ? Number(rec.ttl) : ttlMs
+        const age = Date.now() - rec.ts
+        if (age < ttl) return rec.data
+        if (staleMs && age < ttl + staleMs) { stale = rec.data; hasStale = true }
+      }
+    }
+  } catch { /* 坏缓存当没命中，继续回源 */ }
+
+  const run = () => once(key.url + '#compute', async () => {
+    const data = await compute()
+    if (cacheable(data)) {
+      const rec = { ts: Date.now(), ttl: ttlFor ? ttlFor(data) : ttlMs, data }
+      try {
+        await edgeCache.put(key, new Response(JSON.stringify(rec), {
+          headers: { 'Content-Type': 'application/json' },
+        }))
+      } catch { /* 缓存写失败不影响本次返回 */ }
+    }
+    return data
+  })
+
+  if (hasStale) {
+    // ⚠️ 这里不能等它：要的是「让它完整跑完，只是不等」，所以走 waitUntil
+    const work = run().catch(() => { /* 后台重算失败：旧内容继续顶着 */ })
+    try { if (env && env.waitUntil) env.waitUntil(work) } catch { /* 自由跑完即可 */ }
+    return stale
+  }
+  return run()
 }
 
 async function cachedToplists() {
@@ -747,6 +877,96 @@ function setStreamCand(key, urls) {
   streamCandCache.set(key, { ts: Date.now(), urls })
 }
 
+/* ---------------- 播放直链缓存（播放插件的结果） ---------------- */
+
+/**
+ * 「这条地址刚刚真的吐出了音频字节」的缓存 —— 也就是**播放插件解析结果**的缓存。
+ *
+ * ══════════════ 和上面那份 streamCandCache 的分工 ══════════════
+ *
+ *   streamCandCache  —— **60 秒、进程内**。它解决的是**一次播放内部**的交接：
+ *                       前端先打 `/url?fast=1` 拿候选喂 <audio>，直连失败后
+ *                       <audio> 掉到 `/api/stream`，服务端得知道刚才解析过什么，
+ *                       否则从零冷解析 2~3 秒 → 撞 Worker 响应窗口 → 502。
+ *                       它的候选是**没验证过**的（fast 模式不做字节探测）。
+ *
+ *   streamUrlCache  —— **5 分钟、跨 isolate（走 edgeCache）**。它解决的是
+ *                       **两次播放之间**的重复劳动：同一首歌第二次点开时，
+ *                       服务端早就知道哪个地址真的能出声了，没有任何理由
+ *                       再把「插件池逐个解析 + 逐个 Range 探测」重跑一遍
+ *                       （实测 0.6~3.5 秒，这正是「点开慢」的主要来源）。
+ *                       只收**已经取到过字节**的地址，所以命中即可直接用。
+ *
+ * ══════════════ 为什么 TTL 只有 5 分钟 ══════════════
+ *
+ * 音乐源给的直链基本都带时效（几十分钟到几小时），且大量绑 IP / 绑 UA。
+ * 缓存「解析出来的直链」本身就是在缓存一个会烂掉的东西，所以宁可短：
+ * 5 分钟足够覆盖「同一首歌重播 / 来回切歌 / 拖动进度后重连」这些真实场景，
+ * 又远短于绝大多数 CDN 的签名有效期。
+ *
+ * 而且**烂了也不会卡死**：命中之后仍要过 `tryCandidates` 的真拉字节那一步，
+ * 死了就退回常规候选列表（`skipCandidateList: false`），只是白花一次请求。
+ *
+ * ══════════════ 为什么必须跨 isolate ══════════════
+ *
+ * 进程内 Map 在 CF 上会被 isolate 回收带走，命中率低到没有意义（见上面
+ * cachedEdgeJson 的同一条说明）。所以写入走 `edgeCache`，并用 `env.waitUntil`
+ * 把写操作挂到请求生命周期上 —— 不能让它拖慢本次响应，也不能不等它。
+ * 内存 Map 留一份**只作为快速通道**（省掉一次 Cache API 往返）。
+ */
+const STREAM_URL_BASE = 'https://lx.cache.internal/stream-url/'
+const STREAM_URL_TTL = 5 * 60 * 1000
+const STREAM_URL_MAX = 200
+const streamUrlMem = new Map()
+
+function streamUrlMemSet(key, ts, url) {
+  if (streamUrlMem.size > STREAM_URL_MAX) {
+    for (const [k, v] of Array.from(streamUrlMem.entries()).sort((a, b) => a[1].ts - b[1].ts).slice(0, STREAM_URL_MAX / 2)) {
+      streamUrlMem.delete(k)
+    }
+  }
+  streamUrlMem.set(key, { ts, url })
+}
+
+async function getStreamUrl(env, key) {
+  if (!key) return null
+  const mem = streamUrlMem.get(key)
+  if (mem) {
+    if (Date.now() - mem.ts < STREAM_URL_TTL) return mem.url
+    streamUrlMem.delete(key)
+  }
+  try {
+    const hit = await edgeCache.match(new Request(STREAM_URL_BASE + key, { method: 'GET' }))
+    if (hit) {
+      const rec = await hit.json()
+      if (rec && rec.url && typeof rec.ts === 'number' && Date.now() - rec.ts < STREAM_URL_TTL) {
+        streamUrlMemSet(key, rec.ts, rec.url)
+        return rec.url
+      }
+    }
+  } catch { /* 坏缓存当没命中 */ }
+  return null
+}
+
+function setStreamUrl(env, key, url) {
+  if (!key || !url) return
+  const ts = Date.now()
+  streamUrlMemSet(key, ts, url)
+  const put = edgeCache.put(new Request(STREAM_URL_BASE + key, { method: 'GET' }),
+    new Response(JSON.stringify({ ts, url }), { headers: { 'Content-Type': 'application/json' } }))
+    .catch(() => { /* 缓存写失败不影响播放 */ })
+  try { if (env && env.waitUntil) env.waitUntil(put) } catch { /* 自由跑完即可 */ }
+}
+
+/** 确认缓存里那条已经取不到字节 → 立刻作废，别让它顶满整个 TTL */
+function dropStreamUrl(env, key) {
+  if (!key) return
+  streamUrlMem.delete(key)
+  const del = edgeCache.delete(new Request(STREAM_URL_BASE + key, { method: 'GET' }))
+    .catch(() => { /* 删不掉也只是多试一次 */ })
+  try { if (env && env.waitUntil) env.waitUntil(del) } catch { /* 自由跑完即可 */ }
+}
+
 export async function handleApi(request, env, url) {
   const path = url.pathname.replace(/^\/api/, '') || '/'
   const method = request.method.toUpperCase()
@@ -979,8 +1199,22 @@ export async function handleApi(request, env, url) {
       const source = url.searchParams.get('source') || 'wy'
       const limit = Math.min(safeInt(url.searchParams.get('limit'), 100) || 100, 300)
       if (!id) return bad('缺少榜单 id')
-      const data = await fetchChart({ source, id }, limit)
-      if (!data.songs.length) return bad('榜单为空或获取失败')
+      /**
+       * 榜单/歌单曲目**必须缓存**。
+       *
+       * 这是 CF 版「点开一张歌单要转圈」最大的那一笔：`fetchChart` 每次都要
+       * 回源打一次平台接口（网易 100 首的歌单详情实测 1~3 秒），而它
+       * **跟哪个用户无关**、10 分钟内几乎不变。缓存键只由「源 + 榜单 id + 条数」
+       * 决定，绝不带 token/用户 id —— 带了就等于每人一份缓存，等于没缓存
+       * （这一条在 /cover 的 cacheKey 注释里已经立过规矩）。
+       *
+       * 空结果不写缓存：一次上游抖动不该被钉住 10 分钟。
+       */
+      const data = await cachedEdgeJson(
+        env, `chart/${source}/${id}/${limit}`, CHART_CACHE_TTL_MS,
+        () => fetchChart({ source, id }, limit),
+        { staleMs: CHART_CACHE_STALE_MS, cacheable: (d) => !!(d && Array.isArray(d.songs) && d.songs.length) })
+      if (!data || !data.songs.length) return bad('榜单为空或获取失败')
       // 详情页头图与卡片图口径一致：都是「榜首歌手的头像，缺图退回专辑封面」。
       // 这里曲目已经全拿到了，不用再拉一次上游歌单，只补一次歌手头像查询（12 小时缓存）。
       const first = data.songs.find(s => s && (s.img || s.artistId))
@@ -1062,11 +1296,16 @@ export async function handleApi(request, env, url) {
       if (!source || !id) return bad('缺少 source 或 id')
       let data
       try {
-        data = await fetchAlbumTracks(source, id, limit)
+        // 专辑曲目与榜单曲目同一条纪律：跟哪个用户无关、10 分钟内不变 → 缓存
+        // （见 /chart 的说明）。空结果不写，抛错也不写（异常会原样穿出来走 502）。
+        data = await cachedEdgeJson(
+          env, `album/${source}/${id}/${limit}`, ALBUM_CACHE_TTL_MS,
+          () => fetchAlbumTracks(source, id, limit),
+          { staleMs: ALBUM_CACHE_STALE_MS, cacheable: (d) => !!(d && Array.isArray(d.songs) && d.songs.length) })
       } catch (e) {
         return bad(`专辑曲目获取失败：${(e && e.message) || e}`, 502)
       }
-      if (!data.songs.length) return bad('该专辑没有可用曲目', 404)
+      if (!data || !data.songs.length) return bad('该专辑没有可用曲目', 404)
       return json({
         ok: true,
         album: {
@@ -1083,8 +1322,22 @@ export async function handleApi(request, env, url) {
     if (path === '/suggest') {
       const q = url.searchParams.get('q') || ''
       if (!q) return json({ ok: true, list: [] })
-      const res = await searchOnline(q, { sources: await searchSources(env, db), limit: 10, pluginPool: env.PLUGIN_POOL })
-      return json({ ok: true, list: res.list.slice(0, 10).map(songForWeb) })
+      /**
+       * 「按关键词找一首能播的歌」—— 歌单导入匹配（一次 N 首就是 N 次搜索）、
+       * AI 歌单落库都走它。同一批关键词在 10 分钟内重复问的概率很高
+       * （用户重试导入、导入同一张歌单），所以整份结果按关键词缓存。
+       *
+       * ⚠ 缓存键里带上**生效的搜索源清单**：用户改了「默认搜索源」之后，
+       *   同一关键词的命中结果本来就该不一样，不带清单会串台
+       *   （与 cachedHomeFallback 的键同一个理由）。
+       */
+      const sources = await searchSources(env, db)
+      const res = await cachedEdgeJson(
+        env, `suggest/${sources.join('-')}/${q}`, SUGGEST_CACHE_TTL_MS,
+        () => searchOnline(q, { sources, limit: 10, pluginPool: env.PLUGIN_POOL }),
+        // 空结果不写：多半是上游集体抽风，钉住 10 分钟会让「本来搜得到」的歌消失
+        { cacheable: (d) => !!(d && Array.isArray(d.list) && d.list.length) })
+      return json({ ok: true, list: (res.list || []).slice(0, 10).map(songForWeb) })
     }
 
     if (path === '/history') {
@@ -1148,6 +1401,26 @@ export async function handleApi(request, env, url) {
       // 默认：逐候选真拉字节验证，服务端代理播放前先筛掉死链。
       const fast = url.searchParams.get('fast') === '1'
       const candKey = streamCandKey(song, quality)
+      /**
+       * 先看「刚刚真的取到过音频字节」的那条直链缓存（跨 isolate，5 分钟）。
+       *
+       * 命中的意义：同一首歌第二次点开时，服务端已经知道哪个地址能出声，
+       * 不必再把「插件池逐个解析 + 逐个 Range 探测」重跑一遍（实测 0.6~3.5 秒）。
+       * 这正是「点开慢」里最实在的那一刀。
+       *
+       * 只回这一条（urls 为 null）：它是**验证过**的地址，客户端一级一条足够；
+       * 万一已经过期，客户端的 plugin / server 两级兜底照旧接得住。
+       */
+      const cachedUrl = await getStreamUrl(env, candKey)
+      /**
+       * ⚠ 只把**本宿主播得了的形态**交出去：网页里 http 直链会被浏览器当混合内容
+       * 拦掉（见 http.js 的 allowHttpAudio），交出去等于让客户端白试一条、
+       * 再降一级 —— 比不给还慢。判据复用同一个开关，不在这里另立一套。
+       * （`/stream` 那条读取路径不受此限：字节由服务端代拉，http 无所谓。）
+       */
+      if (cachedUrl && (/^https:\/\//i.test(cachedUrl) || allowHttpAudio())) {
+        return json({ ok: true, url: cachedUrl, urls: null, from: '缓存直链', verified: true, tried: [] })
+      }
       let r
       if (fast) {
         r = await resolveMusicUrlFast(song, quality, env.PLUGIN_POOL)
@@ -1214,6 +1487,24 @@ export async function handleApi(request, env, url) {
        */
       const isRetry = url.searchParams.get('retry') === '1'
       let preferUrls = isRetry ? null : getStreamCand(candKey)
+      /**
+       * 第二优先：**跨 isolate** 的「已经吐过音频字节」直链缓存（5 分钟）。
+       *
+       * 与上面那份 60 秒候选缓存的分工见 streamUrlCache 的说明 —— 简单说：
+       * 那份解决「一次播放内部的 /url → /stream 交接」，这份解决
+       * 「同一首歌第二次播放时的重复解析」。
+       *
+       * ⚠ 命中它时 `skipCandidateList` **必须是 false**：这份地址可能已经过期，
+       *   死了要能退回常规候选列表，而不是直接掉进跨源兜底（那是另一个语义）。
+       */
+      let fromUrlCache = false
+      if (!isRetry && !preferUrls) {
+        const hitUrl = await getStreamUrl(env, candKey)
+        if (hitUrl) {
+          preferUrls = [{ url: hitUrl, from: '缓存直链' }]
+          fromUrlCache = true
+        }
+      }
       if (!preferUrls) {
         try {
           const pre = await resolveMusicUrlFast(song, quality, env.PLUGIN_POOL)
@@ -1228,16 +1519,51 @@ export async function handleApi(request, env, url) {
         preferUrls,
         // ⚠ 命中缓存时用 skipCandidateList：候选已经排好序交下去了，再铺一遍候选列表
         // 等于把预算花在「重新解析」上 —— 而这正是 CF 上 502 的来源。
-        skipCandidateList: !!preferUrls,
+        // 但「跨 isolate 的直链缓存」不算 —— 它可能过期，要留退路（见 fromUrlCache）。
+        skipCandidateList: !!preferUrls && !fromUrlCache,
       })
-      if (!r.ok) return json({ ok: false, error: r.error, errors: r.errors }, 502)
+      if (!r.ok) {
+        // 缓存那条死了 → 把烂缓存丢掉，下一次请求走正常解析，别让坏地址顶满 5 分钟
+        if (fromUrlCache) dropStreamUrl(env, candKey)
+        return json({ ok: false, error: r.error, errors: r.errors }, 502)
+      }
+      /**
+       * 真的取到音频字节了 → 记下这条地址。
+       *
+       * 这是「播放插件缓存」的写入点：只有**已经被验证过能出声**的地址才配进缓存，
+       * 没验证过的候选（/url?fast=1 那一批）不进 —— 否则等于把一个可能已经烂掉的
+       * 地址钉住 5 分钟，把一次偶发失败放大成一段时间的持续失败。
+       */
+      if (r.url) setStreamUrl(env, candKey, r.url)
       return r.response
     }
 
     if (path === '/lyric') {
       const song = decodeSongId(url.searchParams.get('id'))
       if (!song) return bad('无效歌曲 ID')
-      const lyric = await resolveLyric(song, env.PLUGIN_POOL)
+      /**
+       * 歌词缓存。
+       *
+       * 前端**每加载一首歌都会问一次**（public/js/player.js 的 loadLyric），
+       * 而歌词是「同一首歌永远同一份」的东西 —— 不缓存等于每次起播都白跑一趟
+       * 插件 + 平台接口。
+       *
+       * ⚠ TTL 分两档（`ttlFor`）：
+       *   有歌词 → 12 小时。歌词基本不会变。
+       *   没歌词 → 5 分钟。这个 null 多半是插件临时抽风（而不是真的没有），
+       *            钉住半天会让用户以为「这首歌的歌词没了」。
+       *   所以「没歌词」也写缓存（否则每次都要重新问一遍），但只写短 TTL。
+       *
+       * 缓存键用「源 + 平台内 id」：song.id 是本项目自己编的（含源前缀），
+       * 拿它当键更稳，但同一首歌在不同音质下 id 相同 —— 歌词与音质无关，正合适。
+       */
+      const lyric = await cachedEdgeJson(
+        env, `lyric/${song.source}/${song.songmid || song.id || ''}`, LYRIC_CACHE_TTL_MS,
+        () => resolveLyric(song, env.PLUGIN_POOL),
+        {
+          cacheable: () => true,
+          ttlFor: (d) => (d ? LYRIC_CACHE_TTL_MS : LYRIC_MISS_CACHE_TTL_MS),
+        })
       return json({ ok: true, lyric: lyric || null })
     }
 

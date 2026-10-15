@@ -32,6 +32,7 @@ on:
       - 'test/brand.test.mjs'
       - 'test/app-wiring.test.mjs'
       - 'test/boot-speed.test.mjs'
+      - 'test/edge-cache.mjs'
       - '.github/workflows/yunmusic-android.yml'
   workflow_dispatch:
 
@@ -45,13 +46,19 @@ jobs:
         with:
           node-version: '22'
 
-      # 这五套是客户端相关、且**不需要安卓运行时**的（零第三方依赖，不用 npm install）：
+      # 这六套是客户端相关、且**不需要安卓运行时**的（零第三方依赖，不用 npm install）：
       #   client-wiring  静态接线审计：源码里有没有写对
       #   client-layer   跨端层行为：跑起来是不是那个行为（自带极小 DOM 替身）
       #   两者互补，别只跑一个（见 docs/client-android.md）
       #   brand          品牌判定（客户端的包名/名字/版本落点也钉在这里）
-      #   app-wiring     版本落点与媒体会话接线
+      #   app-wiring     版本落点、媒体会话接线与 CI 出包链路的环境契约
       #   boot-speed     首屏启动速度护栏
+      #   edge-cache     边缘缓存（榜单/专辑/歌词/播放直链）的行为与接线
+      #
+      # ⚠ edge-cache 读的是 src/server/api.js 与 src/lib/stream.js。这两个文件本身
+      #   不在下面的 paths 里（服务端改动不该顺带跑安卓出包），但它们的产物
+      #   public/js/backend.bundle.js **是入库的**，改 src 必然跟着改它 →
+      #   照样会触发这里。所以别把 backend.bundle.js 从仓库里拿掉。
       - name: 客户端测试
         run: |
           node test/client-wiring.test.mjs
@@ -59,6 +66,7 @@ jobs:
           node test/brand.test.mjs
           node test/app-wiring.test.mjs
           node test/boot-speed.test.mjs
+          node test/edge-cache.mjs
 
   build:
     runs-on: ubuntu-latest

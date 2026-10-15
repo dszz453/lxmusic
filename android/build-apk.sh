@@ -39,6 +39,13 @@ LIST_WIN() { find "$@" | while read -r f; do printf '"%s"\n' "$(cygpath -m "$f")
 LIST_D8() { find "$@" | while read -r f; do cygpath -m "$f"; done; }
 
 APP_NAME="云音乐(CF版)"
+# 2.22：内嵌后端（backend.bundle.js）接上「回源结果边缘缓存」，与 CF 上的服务端同一份：
+#      · 榜单曲目 / 专辑曲目 / 歌词 / 导入匹配搜索 → edgeCache（CF 上是 Cache API，
+#        跨 isolate；壳内退化成进程内 Map），TTL 10 分钟 ~ 12 小时，带 SWR 宽限；
+#      · 「已经真的取到过音频字节」的播放直链缓存 5 分钟（跨 isolate），
+#        同一首歌第二次点开直接命中，不再把插件池解析 + Range 探测重跑一遍。
+#      详见 src/server/api.js 的 cachedEdgeJson / streamUrlCache 与 test/edge-cache.mjs。
+#
 # 2.21：整体视觉精修 + 「正在播放」行高亮，并让 CF 版带上服务端那条
 #      「歌单第一首歌播不出来」的修复（内嵌 backend.bundle.js 随 src/ 一起重打）。
 #      · 前端（两个 APK 共用 public/）新增：区块标题品牌色小竖条、歌曲行分隔线与

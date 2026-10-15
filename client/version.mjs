@@ -27,9 +27,10 @@
  * ── 2026-10-14：客户端改为「参照 web 端重新开发」──────────────────
  * 前端不再手写，改成**整包复用 public/**（详见 docs/client-android.md）。
  * 版本线不重置，接着往下走：V2.7 → … → V2.19（手写前端最后一版）
- * → V2.20（前端换成 public/ 整包）→ **V2.21（本版：单线路精简 + 整体视觉精修）**。
+ * → V2.20（前端换成 public/ 整包）→ V2.21（单线路精简 + 整体视觉精修）
+ * → **V2.22（本版：内嵌后端带上边缘缓存层）**。
  * ⚠ 版本号**必须接着涨、不能回退**：versionCode 是安卓判断「能不能覆盖安装」
- * 的唯一依据，退号或同号原地覆盖会让用户装不上（400 → 410 才能覆盖）。
+ * 的唯一依据，退号或同号原地覆盖会让用户装不上（410 → 420 才能覆盖）。
  *
  * 但客户端必须**知道自己该跟哪一版服务端说话** —— 这就是 SERVICE_VERSION。
  * 握手时（GET /api/version）拿服务端自报的 version 与它比对，不一致只提示、不阻断：
@@ -50,11 +51,11 @@
  * 注意分工：改客户端**不动** SERVICE_VERSION（那是「本 App 按哪版服务端设计」
  * 的声明）—— 只有服务端抬了 APP_VERSION，这里才跟着抬。 */
 
-/** 客户端产品版本。当前 V2.21（单线路精简 + 整体视觉精修），以后每个版本增加 0.1 */
-export const CLIENT_VERSION = 'V2.21'
+/** 客户端产品版本。当前 V2.22（内嵌后端带上边缘缓存层），以后每个版本增加 0.1 */
+export const CLIENT_VERSION = 'V2.22'
 
 /** 安卓 versionCode：整数、单调递增、跨次发布不可重复 */
-export const CLIENT_VERSION_CODE = 410
+export const CLIENT_VERSION_CODE = 420
 
 /** 客户端包名。Docker 专属版本独立包名，支持与 CF 版在同一台手机上共存 */
 export const CLIENT_PACKAGE = 'com.yunmusic.docker'
@@ -63,7 +64,7 @@ export const CLIENT_PACKAGE = 'com.yunmusic.docker'
 export const CLIENT_APP_NAME = '云音乐(Docker版)'
 
 /** 该客户端按哪一版服务端设计（对接 src/version.js 的 APP_VERSION） */
-export const SERVICE_VERSION = 'V2.13'
+export const SERVICE_VERSION = 'V2.14'
 
 /**
  * 构建标识：Dockerfile / CI 传 commit sha，本地直接构建就是 'dev'。

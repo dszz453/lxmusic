@@ -300,9 +300,13 @@ ok('CI 传的 PLATFORM 是 android.jar 的完整路径（脚本 `[ -f ]` 校验�
 ok('CI 给构建脚本备齐四个路径覆盖（JDK / BUILD_TOOLS / PLATFORM / OUT_DIR）',
   ['JDK_DIR', 'BUILD_TOOLS', 'PLATFORM', 'OUT_DIR']
     .every((k) => new RegExp('export\\s+' + k + '=').test(ci)))
-ok('CI 测试 job 跑的是那五套零依赖测试',
-  ['client-wiring.test.mjs', 'client-layer.mjs', 'brand.test.mjs', 'app-wiring.test.mjs', 'boot-speed.test.mjs']
+ok('CI 测试 job 跑的是那六套零依赖测试（漏一套 = 那套静默不跑）',
+  ['client-wiring.test.mjs', 'client-layer.mjs', 'brand.test.mjs', 'app-wiring.test.mjs',
+    'boot-speed.test.mjs', 'edge-cache.mjs']
     .every((f) => ci.includes(f)))
+ok('CI 测试 job 与触发路径都盯着 edge-cache（只加一处 = 改了也不跑）',
+  (ci.match(/test\/edge-cache\.mjs/g) || []).length >= 2,
+  `出现 ${(ci.match(/test\/edge-cache\.mjs/g) || []).length} 处`)
 ok('CI 触发路径包含 public/（客户端前端就是 public/ 那一份，漏了会静默不跑）',
   /'public\/\*\*'/.test(ci))
 

@@ -1,11 +1,11 @@
 # 云音乐 · 全平台音乐播放器
 
-> **当前版本：V2.13**（服务端）· 客户端 V2.21
+> **当前版本：V2.14**（服务端）· 客户端 V2.22
 >
 > 一个自托管的音乐播放系统，支持 **Cloudflare Workers 线上部署**、**Docker 自建服务器**，并提供可在同一手机共存的 **云音乐(CF版)** 与 **云音乐(Docker版)** 两个独立 APK。
 > 两个 APK 保留各自宿主：CF 版基于 `android/` WebView + 本地 bundle；Docker 版基于 `client/` 原生多页面客户端。
 >
-> 服务端、CF APK 与 Docker APK 的版本号分别维护。服务端改动可部署生效，不必重新装 App；宿主侧改动只重建对应 APK。当前 APK 均为 V2.21，服务端为 V2.13。
+> 服务端、CF APK 与 Docker APK 的版本号分别维护。服务端改动可部署生效，不必重新装 App；宿主侧改动只重建对应 APK。当前 APK 均为 V2.22，服务端为 V2.14。
 >
 > **客户端的前端就是网页端本身**：`client/assets/www` 是构建时从 `public/` 整包拷进去的，
 > 只多一个客户端专属的 `js/client-layer.js`（跨端层）。改 `public/` 就等于改客户端界面。
@@ -65,8 +65,8 @@ docker compose up -d
 两者共同点：最低 Android 5.0（API 21），目标 API 34，已签名（v1 + v2 + v3）。
 
 ```bash
-bash client/build-client.sh    # → outputs/云音乐(Docker版)-V2.21.apk
-bash android/build-apk.sh      # → outputs/云音乐(CF版)-V2.21.apk
+bash client/build-client.sh    # → outputs/云音乐(Docker版)-V2.22.apk
+bash android/build-apk.sh      # → outputs/云音乐(CF版)-V2.22.apk
 ```
 
 Docker 版首启让你选连哪条线，两条可选：
@@ -170,18 +170,47 @@ Docker 版首启让你选连哪条线，两条可选：
 
 > Cloudflare 版不支持运行时评分（无子进程、无可写文件系统），评分需在本地跑 `node tools/plugin-score.mjs` 后重新部署。
 
+### 边缘缓存
+
+服务端把「跟哪个用户无关、几分钟到几小时不变」的回源结果都缓存起来
+（`src/server/api.js` 的 `cachedEdgeJson` / `streamUrlCache`）。
+CF 上落在 **Cache API**（跨 isolate，进程内 Map 在 Worker 上会被回收带走、等于没缓存）；
+Docker / 安卓壳里没有 Cache API，自动退化成进程内 Map，TTL 由记录里的时间戳自己算 ——
+两套宿主行为一致。
+
+| 内容 | TTL | 宽限（SWR） |
+|---|---|---|
+| 榜单 / 歌单曲目（`/api/chart`） | 10 分钟 | 12 小时 |
+| 专辑曲目（`/api/album`） | 10 分钟 | 12 小时 |
+| 歌词（`/api/lyric`） | 12 小时（「没有歌词」只 5 分钟） | — |
+| 导入匹配搜索（`/api/suggest`） | 10 分钟 | — |
+| 播放直链（`/api/url` + `/api/stream`） | 5 分钟 | — |
+
+三条纪律：**缓存键只由内容决定**（不含 token / 用户 id，否则等于每人一份）；
+**失败与空结果不写**（一次上游抖动不该被钉住一整个 TTL）；
+**同刻并发用单飞合并**（冷缓存时三处同时问同一份内容，算三遍等于把上游延迟乘三）。
+
+播放直链那份只收「**已经真的吐出过音频字节**」的地址，且 TTL 刻意压到 5 分钟 ——
+直链带时效、常绑 IP / UA，缓存久了等于缓存一个坏地址。命中后仍要过一遍真拉字节，
+死了就退回常规候选列表并**立刻作废**那条缓存。
+
 ---
 
 ## 客户端线路配置
 
-云音乐 APK 支持同时保存两条服务器线路，随时切换：
+云音乐 APK 只有**一个服务器地址**槽位，与「内置离线」二选一（V2.21 起取消了原来的
+「主线路 / 备用线路」双槽位 —— 两个槽位实际只会让用户搞不清自己连的是哪一台）：
 
-| 线路 | 用途 | 示例 |
+| 连接方式 | 用途 | 示例 |
 |---|---|---|
-| 地址 1（主线路） | 自建 Docker / 本地服务器 | `https://你的服务器地址:端口` |
-| 地址 2（备用线路） | Cloudflare Workers | `https://你的Workers域名` |
+| 服务器地址 | 自建 Docker / 本地服务器，或 Cloudflare Workers | `https://你的域名` |
+| 内置离线 | 后端完全跑在设备内，不连任何服务器（数据只在这台手机上） | — |
 
-切换线路后自动清空 token 并重新登录，避免旧 token 打新服务器导致 401。
+从 V2.21 之前的版本升级上来时，老的「备用线路」槽位会被**自动收编**进服务器地址槽位
+（地址、用户名、握手结果一起搬），不需要重新填。
+
+换了服务器地址等于换了身份，token 按 `lx.token@<服务器地址>` 分开存 ——
+切到另一台服务器本来就应该重新认一次人，不会拿旧 token 去打新服务器导致 401。
 
 ---
 
@@ -191,8 +220,11 @@ Docker 版首启让你选连哪条线，两条可选：
 # 服务端端到端（真 HTTP，31 项）
 LX_BASE=http://127.0.0.1:8787 node test/server-node.mjs
 
-# 客户端静态接线审计（112 项，秒级，不需要安卓运行时）
+# 客户端静态接线审计（113 项，秒级，不需要安卓运行时）
 node test/client-wiring.test.mjs
+
+# 边缘缓存（46 项）：榜单/专辑/歌词/播放直链的缓存行为与接线
+node test/edge-cache.mjs
 
 # 客户端跨端层行为（34 项，自带极小 DOM 替身）
 node test/client-layer.mjs
@@ -214,7 +246,7 @@ LX_BASE=http://127.0.0.1:8787 LX_PASS='密码' node test/ui.mjs
 发版规矩：
 - 服务端 `APP_VERSION` 每版 **升 0.1**，同时 `APP_VERSION_CODE` **+1**
 - 客户端每版 **升 0.1**，`versionCode` **+10**
-- 当前：**服务端 V2.13 (132) / 客户端 V2.21 (410)**
+- 当前：**服务端 V2.14 (133) / 客户端 V2.22 (420)**
 - 客户端版本改 `client/version.mjs`，然后 `bash client/build-client.sh` 出包
   （包内 `client-build.txt` 记录构建时的 HEAD，所以**先提交再构建**）
 

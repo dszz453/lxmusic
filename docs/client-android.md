@@ -9,7 +9,7 @@
 | 宿主架构 | 单 Activity + WebView，嵌入本地 `backend.bundle.js` 自包含壳 | 原生多页面 + WebView 跨端层，保留服务器配置、本地音乐库与设置 |
 | 代码来源 | `android/` 独立 Java 壳 + `public/` + 本地 bundle | `client/` Docker 客户端 + 共用 `public/` |
 | 应用版本来源 | `android/version.mjs`（CF APK） | `client/version.mjs`（Docker APK） |
-| 产物 | `outputs/云音乐(CF版)-V2.21.apk` | `outputs/云音乐(Docker版)-V2.21.apk` |
+| 产物 | `outputs/云音乐(CF版)-V2.22.apk` | `outputs/云音乐(Docker版)-V2.22.apk` |
 
 包名不同，所以两个 App **可以同时安装在同一台手机上**，各自的数据与设置隔离。
 签名密钥也分别保存在 `android/keystore/yunmusic.keystore` 与
@@ -136,9 +136,9 @@
 
 | 版本线 | 现在 | 改哪儿 | 对应 APK |
 |---|---|---|---|
-| CF 客户端 | **V2.21**（`versionCode 410`） | `android/version.mjs` | `云音乐(CF版)-V2.21.apk` |
-| Docker 客户端 | **V2.21**（`versionCode 410`） | `client/version.mjs` | `云音乐(Docker版)-V2.21.apk` |
-| CF Worker / Docker 服务端 | **V2.13**（`versionCode 132`） | `src/version.js` | 服务端，不等同 APK 版本 |
+| CF 客户端 | **V2.22**（`versionCode 420`） | `android/version.mjs` | `云音乐(CF版)-V2.22.apk` |
+| Docker 客户端 | **V2.22**（`versionCode 420`） | `client/version.mjs` | `云音乐(Docker版)-V2.22.apk` |
+| CF Worker / Docker 服务端 | **V2.14**（`versionCode 133`） | `src/version.js` | 服务端，不等同 APK 版本 |
 
 三个版本值分别维护；服务端发布不要求 App 重装，某个 App 宿主有改动也不要求另一份跟着发版。
 CF 与 Docker APK 的 versionCode 当前相同，但 Android 用不同包名识别应用，因此两者可共存。
@@ -150,7 +150,7 @@ CF 与 Docker APK 的 versionCode 当前相同，但 Android 用不同包名识�
 握手回来版本不一致时**只提示、不阻断**。CF 壳是本地自包含实现，其 APK 版本独立由 `android/version.mjs` 管理。
 
 顺带修掉一个会立刻出现的假告警：共用前端原本拿**客户端版本**去比**服务端版本**，
-在通用客户端上必然不等（2.21 vs V2.13）→ 一条永远亮着的「⚠ 与服务端版本不一致」。
+在通用客户端上必然不等（2.22 vs V2.14）→ 一条永远亮着的「⚠ 与服务端版本不一致」。
 现在比的是 `window.LX_CLIENT_SERVICE`（客户端期望的服务端版本），
 拿不到时退回老行为（老壳不受影响）。
 
@@ -167,8 +167,8 @@ bash client/build-client.sh --skip-backend   # 仅改 UI/跨端层时使用
 bash android/build-apk.sh
 
 # 产物都会复制到 outputs/ 供安装
-outputs/云音乐(Docker版)-V2.21.apk
-outputs/云音乐(CF版)-V2.21.apk
+outputs/云音乐(Docker版)-V2.22.apk
+outputs/云音乐(CF版)-V2.22.apk
 ```
 
 > ⚠ **CI 上必须用环境变量给脚本指路**（本机走 `android-build/` 便携工具链，CI 上没有）：
@@ -196,12 +196,17 @@ node test/client-layer.mjs
 
 ```bash
 node test/brand.test.mjs              # 38 项：品牌判定（客户端的同步判据在这里被钉住）
-node test/app-wiring.test.mjs         # 59 项：CF APK 版本落点 / 媒体会话接线 / CI 出包环境契约
+node test/app-wiring.test.mjs         # 60 项：CF APK 版本落点 / 媒体会话接线 / CI 出包环境契约
 node test/client-wiring.test.mjs      # 113 项：客户端四条链路（静态接线审计）
 node test/client-layer.mjs            # 34 项：跨端层行为（守卫 / 路由归属 / 入口接管 / 桥崩容错）
 node test/boot-speed.test.mjs         # 52 项：启动路径（首屏不等网络 / 档案读取顺序）
 node test/stream-pick.mjs             # 78 项：取流候选排序 + /url 与 /stream 共享候选缓存
+node test/edge-cache.mjs              # 46 项：边缘缓存（榜单/专辑/歌词/播放直链）行为 + 接线
 ```
+
+> ⚠ `edge-cache.mjs` 读的是 `src/server/api.js` 与 `src/lib/stream.js`（服务端源码）。
+> 它进的是**客户端** CI，靠的是「改 `src/` 必然跟着重打入库的
+> `public/js/backend.bundle.js`」这条链 —— 所以 `backend.bundle.js` **不能**从仓库里拿掉。
 
 > ⚠ **跨端层产物（`client/rn/build/client-layer.js`）不进仓库** —— 它被 `.gitignore` 里
 > 那条无路径限定的 `build/` 规则挡住（见 `.gitignore` 第 28 行）。所以

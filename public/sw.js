@@ -52,8 +52,14 @@
  *         （重试同一份已失败的候选只会同样失败）。
  *      ③ `css/app.css` + `js/app.js`：整体视觉精修，并给歌曲行加 `data-song-id` +
  *         `syncNowPlaying()`，把「正在播放」那一行高亮出来（原来切歌后列表看不出播的是哪首）。
+ *
+ * v49：`js/backend.bundle.js` 变了 —— 内嵌后端接上「回源结果边缘缓存」：
+ *      榜单曲目 / 专辑曲目 / 歌词 / 导入匹配搜索都进 `edgeCache`（CF 上是 Cache API，
+ *      跨 isolate；壳内退化成进程内 Map），并把「已经真的取到过字节」的播放直链
+ *      缓存 5 分钟。不抬 VERSION 的话，网页端与内置客户端会先吃一轮旧 bundle，
+ *      「点开歌单要转圈」照旧。
  */
-const VERSION = 'v48'
+const VERSION = 'v49'
 const STATIC_CACHE = 'lxmusic-static-' + VERSION
 const SHELL_CACHE = 'lxmusic-shell-' + VERSION
 
