@@ -287,6 +287,25 @@ const stubNative = read('test/app-native.mjs')
 ok('app-media 替身提供了 mediaStatus（否则设置页会抛）', /mediaStatus/.test(stubMedia))
 ok('app-native 替身提供了 mediaStatus', /mediaStatus/.test(stubNative))
 
+/* ------------------------------------------------- 9. CI 出包链路的环境契约 */
+console.log('\n== 9. CI 出包链路的环境契约 ==')
+// 为什么值得钉：这一节的每一条都**不是本机能发现**的问题 ——
+//   · 本机有 client/rn/build/ 那份跨端层产物，CI 全新检出没有（它不进仓库）；
+//   · 本机跑 client/build-client.sh 走 android-build/ 便携工具链，CI 只能靠环境变量指路。
+// 2026-10-15 新 workflow 第一次真跑时两个 job 双双挂掉，正是各踩了其中一条，
+// 而本地全绿 —— 所以「CI 怎么调脚本」本身也得进静态审计。
+const ci = read('.github/workflows/yunmusic-android.yml')
+ok('CI 传的 PLATFORM 是 android.jar 的完整路径（脚本 `[ -f ]` 校验的是文件，传目录必挂）',
+  /export PLATFORM="\$ANDROID_HOME\/platforms\/android-34\/android\.jar"/.test(ci))
+ok('CI 给构建脚本备齐四个路径覆盖（JDK / BUILD_TOOLS / PLATFORM / OUT_DIR）',
+  ['JDK_DIR', 'BUILD_TOOLS', 'PLATFORM', 'OUT_DIR']
+    .every((k) => new RegExp('export\\s+' + k + '=').test(ci)))
+ok('CI 测试 job 跑的是那五套零依赖测试',
+  ['client-wiring.test.mjs', 'client-layer.mjs', 'brand.test.mjs', 'app-wiring.test.mjs', 'boot-speed.test.mjs']
+    .every((f) => ci.includes(f)))
+ok('CI 触发路径包含 public/（客户端前端就是 public/ 那一份，漏了会静默不跑）',
+  /'public\/\*\*'/.test(ci))
+
 /* ------------------------------------------------------------------------- 汇总 */
 console.log('\n' + '='.repeat(62))
 if (fails.length) {

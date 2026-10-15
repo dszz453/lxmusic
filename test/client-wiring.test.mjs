@@ -27,12 +27,37 @@
  */
 import fs from 'node:fs'
 import path from 'node:path'
+import { execFileSync } from 'node:child_process'
 import { fileURLToPath } from 'node:url'
 
 const HERE = path.dirname(fileURLToPath(import.meta.url))
 const ROOT = path.resolve(HERE, '..')
 const read = (p) => fs.readFileSync(path.join(ROOT, p), 'utf8')
 const exists = (p) => fs.existsSync(path.join(ROOT, p))
+
+const BUNDLE_REL = 'client/rn/build/client-layer.js'
+
+/**
+ * 跨端层产物（client/rn/build/client-layer.js）**不进仓库** —— 它由
+ * tools/build-client-rn.mjs 从 client/rn/src/ 现拼，被 .gitignore 里那条
+ * 无路径限定的 `build/` 规则挡在外面（见 .gitignore 第 28 行的注释）。
+ *
+ * ⚠ 所以「产物在不在」在**全新检出**（CI runner、别人刚 clone）上天然为假。
+ *   早期版本在这里直接断言存在 → 本机（有产物）全绿、CI 上必挂，
+ *   而这份测试恰恰是 CI 的第一个 job 要跑的。缺了/过期了就现打包一遍，
+ *   顺带把打包器本身也验了（与 client-layer.mjs 同一套做法）。
+ */
+function ensureBundle() {
+  const srcDir = path.join(ROOT, 'client/rn/src')
+  const bundle = exists(BUNDLE_REL) ? fs.statSync(path.join(ROOT, BUNDLE_REL)).mtimeMs : -1
+  const srcs = fs.existsSync(srcDir) ? fs.readdirSync(srcDir).filter((f) => f.endsWith('.js')) : []
+  const stale = srcs.filter((f) => fs.statSync(path.join(srcDir, f)).mtimeMs > bundle)
+  if (bundle >= 0 && stale.length === 0) return
+  console.log(bundle < 0
+    ? '  （还没有跨端层产物，先打包一遍）'
+    : '  （源文件比产物新：' + stale.join(', ') + '　先重打一遍）')
+  execFileSync(process.execPath, [path.join(ROOT, 'tools/build-client-rn.mjs')], { stdio: 'inherit' })
+}
 
 let pass = 0
 const fails = []
@@ -183,8 +208,9 @@ console.log('\n== 4. 跨端业务层：模块清单、守卫、桥调用 ==')
   ok('守卫模块排在第一个', listed[0] === '00-guard.js', listed[0])
   ok('编排模块排在最后一个', listed[listed.length - 1] === '50-shell.js', listed[listed.length - 1])
 
-  const bundlePath = 'client/rn/build/client-layer.js'
-  ok('跨端层产物已生成（构建脚本会现打包，这里查的是仓库里那份）', exists(bundlePath))
+  const bundlePath = BUNDLE_REL
+  ensureBundle()
+  ok('跨端层产物已生成（产物不进仓库，本测试会按需现打包）', exists(bundlePath))
   if (exists(bundlePath)) {
     const bundle = read(bundlePath)
     ok('产物头部带源码指纹（日志里能对上设备跑的是哪一版）', /指纹 [0-9a-f]{8}/.test(bundle))

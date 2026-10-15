@@ -88,10 +88,15 @@ jobs:
         # CI 上没有），所以这里把四个路径显式指到 setup-java / 预装 SDK 的位置。
         # 版本号由脚本自己从 client/version.mjs 读；读不到它会直接中止，
         # 不会像以前那样悄悄退回一个装不上的 versionCode。
+        #
+        # ⚠ PLATFORM 的契约是 **android.jar 的完整路径**，不是 platforms/android-34
+        #   这个目录（脚本里 `[ -f "$PLAT" ]` 校验的是文件）。早先这里漏了尾巴，
+        #   症状是 job 一开始就 `缺 android.jar: …/platforms/android-34` 退出 1，
+        #   而 sdkmanager 那步明明装成功了 —— 很容易误以为是 SDK 没装好。
         run: |
           export JDK_DIR="$JAVA_HOME"
           export BUILD_TOOLS="$ANDROID_HOME/build-tools/34.0.0"
-          export PLATFORM="$ANDROID_HOME/platforms/android-34"
+          export PLATFORM="$ANDROID_HOME/platforms/android-34/android.jar"
           export OUT_DIR="$PWD/client/build"
           bash client/build-client.sh
 

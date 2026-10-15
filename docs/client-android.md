@@ -169,7 +169,16 @@ bash android/build-apk.sh
 # 产物都会复制到 outputs/ 供安装
 outputs/云音乐(Docker版)-V2.21.apk
 outputs/云音乐(CF版)-V2.21.apk
+```
 
+> ⚠ **CI 上必须用环境变量给脚本指路**（本机走 `android-build/` 便携工具链，CI 上没有）：
+> `JDK_DIR` / `BUILD_TOOLS` / `PLATFORM` / `OUT_DIR` 四个。
+> 其中 `PLATFORM` 的契约是 **`android.jar` 的完整路径**，不是 `platforms/android-34`
+> 这个目录 —— 传目录时脚本会打印 `缺 android.jar: …/platforms/android-34` 然后退出 1，
+> 而 `sdkmanager` 那步明明装成功了，很容易误判成「SDK 没装好」。
+> `test/app-wiring.test.mjs` 第 9 节把这条钉住了（传目录会精确报红）。
+
+```bash
 # 静态接线审计
 node test/client-wiring.test.mjs
 node test/app-wiring.test.mjs
@@ -180,12 +189,18 @@ node test/client-layer.mjs
 
 ```bash
 node test/brand.test.mjs              # 38 项：品牌判定（客户端的同步判据在这里被钉住）
-node test/app-wiring.test.mjs         # 53 项：CF APK 版本落点 / 媒体会话接线
+node test/app-wiring.test.mjs         # 57 项：CF APK 版本落点 / 媒体会话接线 / CI 出包环境契约
 node test/client-wiring.test.mjs      # 113 项：客户端四条链路（静态接线审计）
 node test/client-layer.mjs            # 34 项：跨端层行为（守卫 / 路由归属 / 入口接管 / 桥崩容错）
 node test/boot-speed.test.mjs         # 52 项：启动路径（首屏不等网络 / 档案读取顺序）
 node test/stream-pick.mjs             # 78 项：取流候选排序 + /url 与 /stream 共享候选缓存
 ```
+
+> ⚠ **跨端层产物（`client/rn/build/client-layer.js`）不进仓库** —— 它被 `.gitignore` 里
+> 那条无路径限定的 `build/` 规则挡住（见 `.gitignore` 第 28 行）。所以
+> `client-wiring` / `client-layer` 都会在**产物缺失或比源码旧时现打包一遍**，
+> 全新检出（CI runner、别人刚 clone）也能直接跑。别把这条改回「直接断言产物存在」：
+> 本机有产物所以全绿，CI 上必挂 —— 2026-10-15 就这么挂过一次。
 
 > ⚠ 构建脚本第 1.5 步是 `cp -r "$ROOT/public/." "$ASSETS/www/"` ——
 > **APK 里的前端就是仓库里的 `public/`，逐字节同一份**，不是副本、不是「同步过来的」。

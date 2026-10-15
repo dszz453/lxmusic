@@ -39,6 +39,11 @@ JDK="${JDK:-$AB/jdk}"
 SDK="${SDK_DIR:-$AB/sdk}"
 BT="${BUILD_TOOLS:-$SDK/build-tools/34.0.0}"
 PLAT="${PLATFORM:-$SDK/platforms/android-34/android.jar}"
+# PLATFORM 的契约是 **android.jar 的完整路径**（下面 `[ -f "$PLAT" ]` 校验的是文件）。
+# 但「传目录」是很自然的误传法 —— CI 上就踩过：传了 platforms/android-34，
+# 校验失败时打印的也是这个目录名，看着像「SDK 没装好」，实际是漏了个尾巴。
+# 传目录就自动补上，省掉这类排查。
+if [ -d "$PLAT" ]; then PLAT="$PLAT/android.jar"; fi
 OUT="${OUT_DIR:-$HERE/build}"
 
 SKIP_BACKEND=0
