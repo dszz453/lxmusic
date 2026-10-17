@@ -58,8 +58,13 @@
  *      跨 isolate；壳内退化成进程内 Map），并把「已经真的取到过字节」的播放直链
  *      缓存 5 分钟。不抬 VERSION 的话，网页端与内置客户端会先吃一轮旧 bundle，
  *      「点开歌单要转圈」照旧。
+ * v50：`js/backend.bundle.js` 变了 —— `/api/stream` 不再被「未验证的候选」钉死。
+ *      原来只要 `/url?fast=1` 交过一批候选（哪怕一条都没探通），`/stream` 就把完整
+ *      候选列表关掉（`skipCandidateList`），于是那批死链成了唯一活路，只能 502。
+ *      现在只有**探通过**的候选才配关列表；未验证的一批只当「先试一下」。
+ *      不抬 VERSION 的话，网页端与内置客户端会先吃一轮旧 bundle。
  */
-const VERSION = 'v49'
+const VERSION = 'v50'
 const STATIC_CACHE = 'lxmusic-static-' + VERSION
 const SHELL_CACHE = 'lxmusic-shell-' + VERSION
 

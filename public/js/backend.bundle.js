@@ -1,5 +1,5 @@
 /* 由 tools/build-app.mjs 自动生成，请勿手动修改。
- * 源摘要: 6c21cb4ef338acef
+ * 源摘要: 226c3a06327636cf
  * 模块数: 25
  *
  * 这是给安卓壳用的后端展平版：把 src/ 的 ESM 后端打成单个 IIFE，
@@ -884,16 +884,24 @@ function getStreamCand(key) {
   const hit = streamCandCache.get(key)
   if (!hit) return null
   if (Date.now() - hit.ts > STREAM_CAND_TTL) { streamCandCache.delete(key); return null }
-  return hit.urls
+  /**
+   * 返回**整条记录**（含 `verified`），不再只返回 urls。
+   *
+   * 调用方必须知道这批候选「探通过没有」：`/url?fast=1` 在预算耗尽时交出去的
+   * 那批是**解析出来了但没来得及探**的地址，失败概率很高。拿它去关掉完整候选列表
+   * 等于把一整首歌钉死在一批没验证过的地址上 —— 这正是「歌单前几首退到服务端就播不出来」
+   * 的那个坑（V2.111 / 服务端 V2.15 修的）。
+   */
+  return hit
 }
 
-function setStreamCand(key, urls) {
+function setStreamCand(key, urls, verified) {
   if (!key || !urls || !urls.length) return
   if (streamCandCache.size > 100) {
     const oldest = Array.from(streamCandCache.entries()).sort((a, b) => a[1].ts - b[1].ts)[0]
     if (oldest) streamCandCache.delete(oldest[0])
   }
-  streamCandCache.set(key, { ts: Date.now(), urls })
+  streamCandCache.set(key, { ts: Date.now(), urls, verified: !!verified })
 }
 
 /* ---------------- 播放直链缓存（播放插件的结果） ---------------- */
@@ -1459,7 +1467,9 @@ async function handleApi(request, env, url) {
        * 写缓存之后，/stream 直接复用这一份，几乎瞬时就能建流。
        * 缓存键与 /stream 里的完全一致（见 streamCandKey），两边天然对得上。
        */
-      if (r.url) setStreamCand(candKey, r.urls && r.urls.length ? r.urls : [{ url: r.url, from: r.from }])
+      // 第三个参数是「这批候选探通过没有」：fast 模式下 `unverified` 为真，
+      // 记下来给 /stream 判断能不能拿它当唯一候选（见 /stream 的 preferVerified）。
+      if (r.url) setStreamCand(candKey, r.urls && r.urls.length ? r.urls : [{ url: r.url, from: r.from }], !r.unverified)
       if (!r.url) return json({ ok: false, error: r.error || '无可用播放地址', errors: r.tried }, 404)
       return json({ ok: true, url: r.url, urls: r.urls || null, from: r.from, verified: !r.unverified, tried: r.tried })
     }
@@ -1505,7 +1515,22 @@ async function handleApi(request, env, url) {
        * 候选恰好是条死链/防盗链地址，换一批通常就好了。
        */
       const isRetry = url.searchParams.get('retry') === '1'
-      let preferUrls = isRetry ? null : getStreamCand(candKey)
+      const candHit = isRetry ? null : getStreamCand(candKey)
+      let preferUrls = candHit ? candHit.urls : null
+      /**
+       * 这批候选**探通过没有**。
+       *
+       * 只有 verified 才配关掉完整候选列表（`skipCandidateList`）——
+       * 未验证的候选是「解析出来了、但预算到点没来得及探」，失败概率很高；
+       * 拿它当唯一候选，等于把一整首歌钉死在一批没验证过的地址上。
+       *
+       * 这正是「歌单前几首退到服务端就播不出来」的那一半原因：客户端把
+       * `/url?fast=1` 给的未验证候选逐条试败 → 退到 `/stream` → `/stream` 又从
+       * 60 秒缓存里读到**同一批** → 并且因为「有 preferUrls」把完整候选列表关掉 →
+       * 一条活路都没有，只能 502。现在未验证的一批只当「先试一下」，试不通照样
+       * 铺开完整候选列表（重新解析 + 逐个真拉字节）。
+       */
+      let preferVerified = candHit ? candHit.verified === true : false
       /**
        * 第二优先：**跨 isolate** 的「已经吐过音频字节」直链缓存（5 分钟）。
        *
@@ -1529,17 +1554,21 @@ async function handleApi(request, env, url) {
           const pre = await resolveMusicUrlFast(song, quality, env.PLUGIN_POOL)
           if (pre.urls && pre.urls.length) {
             preferUrls = pre.urls
-            if (!isRetry) setStreamCand(candKey, preferUrls)
+            preferVerified = !pre.unverified
+            if (!isRetry) setStreamCand(candKey, preferUrls, preferVerified)
           }
         } catch { /* 预筛失败退化成原逻辑 */ }
       }
       const r = await openAudioStream(song, quality, env.PLUGIN_POOL, {
         rangeHeader,
         preferUrls,
-        // ⚠ 命中缓存时用 skipCandidateList：候选已经排好序交下去了，再铺一遍候选列表
-        // 等于把预算花在「重新解析」上 —— 而这正是 CF 上 502 的来源。
-        // 但「跨 isolate 的直链缓存」不算 —— 它可能过期，要留退路（见 fromUrlCache）。
-        skipCandidateList: !!preferUrls && !fromUrlCache,
+        // ⚠ 只有**已验证**的候选才配关掉完整候选列表。
+        // 已验证 = 服务端真的探通过字节，这批地址的命中率高，再铺一遍候选列表
+        // 只是把预算花在重复解析上 —— 那正是 CF 上 502 的来源。
+        // 未验证的一批（/url?fast=1 预算到点交出去的）不关：它失败概率高，
+        // 关掉就等于把整首歌钉死在一批没探过的地址上。
+        // 「跨 isolate 的直链缓存」也不关 —— 它可能过期，要留退路（见 fromUrlCache）。
+        skipCandidateList: !!preferUrls && !fromUrlCache && preferVerified,
       })
       if (!r.ok) {
         // 缓存那条死了 → 把烂缓存丢掉，下一次请求走正常解析，别让坏地址顶满 5 分钟
@@ -9061,7 +9090,7 @@ __modules["src/version.js"] = function (__exports, __require) {
  * 所以统一读这里，谁也别再各写各的。
  *
  * ── 两条版本线，别混 ──────────────────────────────────────────
- *   APP_VERSION      产品版本，人看的。改功能才动它。当前 V2.14
+ *   APP_VERSION      产品版本，人看的。改功能才动它。当前 V2.15
  *   APP_VERSION_CODE 整数构建号，Android 靠它判断「能不能覆盖安装」。
  *                    每次要发新版就 +1，**不能倒退、不能重复**，
  *                    否则手机上会报「应用未安装」（签名相同也装不上）。
@@ -9087,10 +9116,10 @@ __modules["src/version.js"] = function (__exports, __require) {
  */
 
 /** 产品版本（对外展示用）。每发一版升 0.1。 */
-const APP_VERSION = 'V2.14'
+const APP_VERSION = 'V2.15'
 
 /** Android versionCode：整数、单调递增、跨次发布不可重复。每发一版 +1。 */
-const APP_VERSION_CODE = 133
+const APP_VERSION_CODE = 134
 
 /** 人类可读的完整标识，日志/关于页用。 */
 const APP_ID = 'lxmusic'

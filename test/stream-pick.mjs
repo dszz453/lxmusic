@@ -342,8 +342,8 @@ console.log('\n== 8. /url 与 /stream 共享候选缓存（CF 版「歌单第一
  */
 const apiSrc = fs.readFileSync(path.join(ROOT, 'src', 'server', 'api.js'), 'utf8')
 const apiCode = deComment(apiSrc)
-check('/url 命中候选后写进代理流候选缓存',
-  /if \(r\.url\) setStreamCand\(candKey, r\.urls && r\.urls\.length \? r\.urls : \[\{ url: r\.url, from: r\.from \}\]\)/.test(apiCode))
+check('/url 命中候选后写进代理流候选缓存（并把「探通过没有」一起记下来）',
+  /if \(r\.url\) setStreamCand\(candKey, r\.urls && r\.urls\.length \? r\.urls : \[\{ url: r\.url, from: r\.from \}\], !r\.unverified\)/.test(apiCode))
 check('⚠ 缓存键只有一个来源 streamCandKey()（两处各拼一遍必然对不上）',
   /function streamCandKey\(song, quality\) \{/.test(apiCode)
   && (apiCode.match(/streamCandKey\(song, quality\)/g) || []).length === 3,
@@ -354,13 +354,27 @@ check('/stream 读到缓存时不再铺一遍候选列表（skipCandidateList）
   /skipCandidateList: !!preferUrls/.test(apiCode))
 check('⚠ retry=1 时跳过缓存并重新解析（重试同一份候选只会同样失败）',
   /const isRetry = url\.searchParams\.get\('retry'\) === '1'/.test(apiCode)
-  && /let preferUrls = isRetry \? null : getStreamCand\(candKey\)/.test(apiCode))
+  && /const candHit = isRetry \? null : getStreamCand\(candKey\)/.test(apiCode))
 check('player.js 的代理地址带 retry 标记（第二遍才带）',
   /if \(attempt\) qs\.set\('retry', '1'\)/.test(player))
 check('候选缓存有 TTL 与容量上限（不许无限涨）',
   /const STREAM_CAND_TTL = \d+ \* 1000/.test(apiCode) && /streamCandCache\.size > 100/.test(apiCode))
 check('/url 的解析结果同时喂了 /stream 的预筛路径（preferUrls 非空即命中缓存）',
-  /let preferUrls = isRetry \? null : getStreamCand\(candKey\)/.test(apiCode))
+  /let preferUrls = candHit \? candHit\.urls : null/.test(apiCode))
+/**
+ * ⚠ 这一条是 V2.111 / 服务端 V2.15 的核心修复，别被「顺手简化」改回去。
+ *
+ * `/url?fast=1` 预算到点时交出去的候选是**解析出来了但没探过**的。客户端把它们逐条
+ * 试败 → 退到 `/stream` → `/stream` 又从 60 秒缓存里读到同一批。如果这时还因为
+ * 「有 preferUrls」把完整候选列表关掉（skipCandidateList），整首歌就只剩这条死路，
+ * 只能 502 —— 用户看到的就是「歌单前几首退到服务端就播不出来，后面直连能播就没事」。
+ *
+ * 所以：**只有 verified 的候选才配关掉完整候选列表**。
+ */
+check('⚠ 未验证的候选不配关掉完整候选列表（否则整首歌被一批没探过的地址钉死）',
+  /skipCandidateList: !!preferUrls && !fromUrlCache && preferVerified/.test(apiCode)
+  && /let preferVerified = candHit \? candHit\.verified === true : false/.test(apiCode)
+  && /preferVerified = !pre\.unverified/.test(apiCode))
 
 console.log('\n===== stream-pick：' + pass + ' 通过 / ' + fail + ' 失败 =====')
 if (failures.length) console.log('失败项：\n  - ' + failures.join('\n  - '))

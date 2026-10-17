@@ -64,7 +64,7 @@ export const CLIENT_PACKAGE = 'com.yunmusic.docker'
 export const CLIENT_APP_NAME = '云音乐(Docker版)'
 
 /** 该客户端按哪一版服务端设计（对接 src/version.js 的 APP_VERSION） */
-export const SERVICE_VERSION = 'V2.14'
+export const SERVICE_VERSION = 'V2.15'
 
 /**
  * 构建标识：Dockerfile / CI 传 commit sha，本地直接构建就是 'dev'。
