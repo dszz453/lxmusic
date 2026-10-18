@@ -1,11 +1,11 @@
 # 云音乐 · 全平台音乐播放器
 
-> **当前版本：V2.15**（服务端）· 客户端 V2.22 · 老板在用的客户端 **V2.111**（`yunmusic-client/`）
+> **当前版本：V2.15**（服务端）· 客户端 V2.23 · 老板在用的客户端 **V2.113**（`yunmusic-client/`）
 >
 > 一个自托管的音乐播放系统，支持 **Cloudflare Workers 线上部署**、**Docker 自建服务器**，并提供可在同一手机共存的 **云音乐(CF版)** 与 **云音乐(Docker版)** 两个独立 APK。
 > 两个 APK 保留各自宿主：CF 版基于 `android/` WebView + 本地 bundle；Docker 版基于 `client/` 原生多页面客户端。
 >
-> 服务端、CF APK 与 Docker APK 的版本号分别维护。服务端改动可部署生效，不必重新装 App；宿主侧改动只重建对应 APK。当前 APK 均为 V2.22，服务端为 V2.14。
+> 服务端、CF APK 与 Docker APK 的版本号分别维护。服务端改动可部署生效，不必重新装 App；宿主侧改动只重建对应 APK。当前 Docker APK 为 V2.23，服务端为 V2.15。
 >
 > **客户端的前端就是网页端本身**：`client/assets/www` 是构建时从 `public/` 整包拷进去的，
 > 只多一个客户端专属的 `js/client-layer.js`（跨端层）。改 `public/` 就等于改客户端界面。

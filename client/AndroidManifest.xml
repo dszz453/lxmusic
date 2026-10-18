@@ -32,8 +32,8 @@
 -->
 <manifest xmlns:android="http://schemas.android.com/apk/res/android"
     package="com.yunmusic.docker"
-    android:versionCode="420"
-    android:versionName="2.22">
+    android:versionCode="430"
+    android:versionName="2.23">
     <!--
       versionCode / versionName 是 aapt2 link 时用 version-code / version-name 参数覆盖的
       （见 build-client.sh，值来自 client/version.mjs —— 客户端自己的版本线）。

@@ -51,11 +51,11 @@
  * 注意分工：改客户端**不动** SERVICE_VERSION（那是「本 App 按哪版服务端设计」
  * 的声明）—— 只有服务端抬了 APP_VERSION，这里才跟着抬。 */
 
-/** 客户端产品版本。当前 V2.22（内嵌后端带上边缘缓存层），以后每个版本增加 0.1 */
-export const CLIENT_VERSION = 'V2.22'
+/** 客户端产品版本。当前 V2.23（播放器修「片段当整首播完」+ 代理级双候选重试），以后每个版本增加 0.1 */
+export const CLIENT_VERSION = 'V2.23'
 
 /** 安卓 versionCode：整数、单调递增、跨次发布不可重复 */
-export const CLIENT_VERSION_CODE = 420
+export const CLIENT_VERSION_CODE = 430
 
 /** 客户端包名。Docker 专属版本独立包名，支持与 CF 版在同一台手机上共存 */
 export const CLIENT_PACKAGE = 'com.yunmusic.docker'

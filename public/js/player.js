@@ -296,6 +296,21 @@
   let snippetWarned = false
 
   /**
+   * 「因为音源只给了片段」已经重试过几次 —— **每首歌重置一次**。
+   *
+   * 为什么需要它：试听片段是**正常播完**（`ended`，不是 `error`），所以原来
+   * 走的是和整首播完完全相同的那条路 —— 直接 `next()` 跳下一首。用户听到的
+   * 就是「放 30 秒就没了」。有了这个计数，`ended` 里就能先把「换候选 / 换级」
+   * 试一轮，再不行换音质重来一次，都失败了才认命跳歌。
+   *
+   * 上限 2 是为了防止「所有音质都只有片段」时无限重试 —— 那种情况下
+   * 最多多花一次解析 + 一次换音质的时间，然后老实跳歌并提示。
+   */
+  let snippetRetry = 0
+  let snippetRetryFor = null     // 上面那个计数属于哪首歌（换歌才归零）
+  const SNIPPET_MAX_RETRY = 2
+
+  /**
    * 客户端侧的 http→https 升级 —— **与服务端 stream.js 的 upgradeToHttps 同一口径**：
    * 一律乐观升级，不设域名白名单。
    *
@@ -446,8 +461,26 @@
        * 到本级的第 2 条时 attempt 变成 1 —— 服务端收到就知道「这已经是重试了」，
        * 可以让预算多铺开一点。见 server 侧 /stream 对 attempt 的处理。
        */
-      const attempt = curPos > 0 ? 1 : 0
-      return [{ url: serverStreamUrl(song, attempt), from: '服务端代理' }]
+      /**
+       * ⚠ 这里必须给**两条**候选，而且 attempt 要写死，不能读 `curPos`。
+       *
+       * 原来只有一条，attempt 用 `curPos > 0 ? 1 : 0` 算 —— 而 `advance()` 是
+       * **先**调本函数、**后**才把 pos 写回 curPos，所以这里读到的永远是**上一级**
+       * 的位置。两个后果：
+       *   · direct 级只有一条候选时 attempt 恒为 0 → `/stream` 只被请求一次，
+       *     502 之后 `advance` 无路可走 → 直接跳歌（用户看到的就是「播放失败」）；
+       *   · direct 级试过两条以上时 attempt 恒为 1 → 服务端按「重试」处理，
+       *     把 `/url` 刚解析好的候选丢掉、从零重新解析（慢 2~3 秒，反而更容易 502）。
+       *
+       * 现在两条候选各自带**固定** attempt，语义与位置彻底解耦：
+       *   第 1 条 → 复用服务端 60 秒候选缓存（快，正常路径）；
+       *   第 2 条 → 带 retry=1，让服务端跳过缓存重新解析一批地址（换条活路）。
+       * 这也是 `/stream` 那边 `isRetry` 分支唯一能被真正用上的入口。
+       */
+      return [
+        { url: serverStreamUrl(song, 0), from: '服务端代理' },
+        { url: serverStreamUrl(song, 1), from: '服务端代理 · 重试' },
+      ]
     }
     return []
   }
@@ -598,6 +631,16 @@
     if (!c || !song) return
     // 命中缓存起播的这首本来就在缓存里，不必再走一遍
     if (audio.dataset.cached === '1') return
+    /**
+     * **片段不落缓存。**
+     *
+     * 这行守卫比它看起来重要：`ended` 对「放完 30 秒的片段」和「放完整首」
+     * 是一视同仁的，而自动缓存默认开着（audiocache.js 的 autoEnabled）。
+     * 一旦片段被存成「整首」，下次起播命中缓存时 warnIfSnippet 会因为
+     * `dataset.cached === '1'` 直接 return —— 用户从此每次都只听到 30 秒，
+     * 而且连一句解释都没有。偶发问题就这么变成了「这首歌坏了」。
+     */
+    if (endedAsSnippet()) return
     if (!lastHit || !lastHit.url) return
     if (global.LX_NATIVE === false && !c.autoEnabled()) return
     c.cacheAfterPlay(song, state.quality, lastHit).then((r) => {
@@ -650,6 +693,9 @@
   async function load(autoplay) {
     const song = current()
     if (!song) return
+    // 换歌才把「片段重试」计数归零。**同一首歌换音质重载必须保留** ——
+    // 否则「这条音源只有片段，换音质再试一次」那条路径会把自己重置掉，变成死循环。
+    if (snippetRetryFor !== song.id) { snippetRetryFor = song.id; snippetRetry = 0 }
     // 切歌前先给上一首收个尾（同一首歌重载 —— 换音质 / 降级重试 —— 不算切歌，
     // 跳过以免把「听过一次」重复计两遍）。此刻 audio 还挂着旧 src，位置读得到。
     if (!session || session.id !== song.id) flushProgress(audio.currentTime, audio.duration, true)
@@ -1236,15 +1282,27 @@
     syncLyric(audio.currentTime, true)
   }
 
-  function setQuality(key) {
+  /**
+   * 换音质。
+   *
+   * `forcePlay` 只给「片段重试」用：那时 audio 已经 `ended`（paused），
+   * 按原逻辑 `wasPlaying = !audio.paused` 会算成 false → 换完音质停在原地不播。
+   */
+  function setQuality(key, forcePlay) {
     if (!QUALITIES.some(q => q.key === key)) return
     state.quality = key
     U.store.set('lx.quality', key)
     if (dom.qualityLabel) dom.qualityLabel.textContent = qualityName()
     if (current()) {
-      const wasPlaying = !audio.paused
+      const wasPlaying = forcePlay === true || !audio.paused
       if (!wasPlaying) wantPlay = false     // 换音质时不要凭空开始播放
-      keepPosition()                        // 听到一半换音质不该从头开始
+      /**
+       * ⚠ 片段重试必须**从头放**。
+       * 此刻 currentTime 停在片段末尾（约 30 秒），照搬 keepPosition 会让
+       * 完整版直接从 30 秒处开始 —— 听两秒又结束，看着像「还是只有 30 秒」。
+       */
+      if (forcePlay === true) resumeOverride = 0
+      else keepPosition()                   // 听到一半换音质不该从头开始
       load(wasPlaying)
     }
     emit('quality', key)
@@ -1416,16 +1474,74 @@
     state.playing = true; setPlayIcon(true); emit('state', true); updateMediaSession(); startLyricLoop()
   })
   audio.addEventListener('pause', () => { state.playing = false; setPlayIcon(false); emit('state', false); updateMediaSession(); stopLyricLoop() })
-  audio.addEventListener('ended', () => {
+  audio.addEventListener('ended', async () => {
     stopLyricLoop()
     // 播完 = 最确定的一次「听过了」，先把这一条发出去再换歌
     flushProgress(audio.currentTime, audio.duration, true)
+
+    /**
+     * 片段播完 ≠ 整首播完 —— 这是「放 30 秒就没了」的直接缺口。
+     *
+     * 试听片段是**正常播完**（`ended`，不是 `error`），所以原来走的是和整首播完
+     * 完全同一条路：`next()` 跳下一首。服务端已经尽力把完整版排到前面，但
+     * 候选里要是真的只有片段（源侧只给 `freeTrialInfo end:30`），光排序救不了。
+     *
+     * 现在的顺序是：**先在本级往后挪一条 → 再换级（direct→plugin→server）→
+     * 再换音质重新解析一轮 → 都不行才跳歌**。上限见 SNIPPET_MAX_RETRY，
+     * 免得「所有音质都只有片段」时无限重试。
+     *
+     * ⚠ 重试期间绝不能 `maybeStoreToCache()` —— 把 30 秒片段当整首存进本地缓存，
+     * 之后每次都只播 30 秒，而且命中缓存时 warnIfSnippet 会直接 return、连提示都没有。
+     */
+    if (endedAsSnippet() && snippetRetry < SNIPPET_MAX_RETRY) {
+      snippetRetry++
+      snippetWarned = true                  // 这一轮由下面的 toast 负责说，别再弹第二次
+      const token = loadToken
+      const hit = await advance(curStage, curPos + 1)
+      if (token !== loadToken) return       // 期间用户切歌了
+      if (hit) {
+        U.toast('这条音源只给了片段，换一条再试…', 3000)
+        applySrc(hit)
+        try { await audio.play() } catch { /* ignore */ }
+        return
+      }
+      // 本级与后续级都没有候选了 → 换音质重新解析一轮（load 内部会保留重试计数）
+      const i = QUALITIES.findIndex(q => q.key === state.quality)
+      const nextQ = QUALITIES[(i + 1) % QUALITIES.length].key
+      if (nextQ && nextQ !== state.quality) {
+        U.toast('这条音源只给了片段，换音质再试…', 3000)
+        snippetWarned = false
+        setQuality(nextQ, true)             // 播完那一刻 audio 是暂停的，必须显式要求续播
+        return
+      }
+    }
+
     warnIfSnippet()
     maybeStoreToCache()       // 整首听完才落缓存（见 audiocache.js 顶部「为什么不边听边存」）
     session = null            // 本轮到此为止；单曲循环由 play 事件重新开一轮
     resumeToken++             // 作废可能还在路上的续播请求
     next(false)
   })
+
+  /**
+   * 这一次 `ended` 到底是「整首放完」还是「只放了个片段」。
+   *
+   * 判据与 warnIfSnippet **完全同一份**（声明 > 60 秒 且 实播不到六成），
+   * 只是用途不同：warnIfSnippet 负责「说」，这里负责「决定要不要换源重试」。
+   * 两处各写一套的话，迟早出现「提示说没事、重试却触发」这种自相矛盾。
+   *
+   * 命中本地缓存的不算：那是我自己存下来的字节，长度不对也是我存错了，
+   * 不该怪音源，更不该因此反复重试。
+   */
+  function endedAsSnippet() {
+    if (audio.dataset.cached === '1') return false
+    const song = current()
+    if (!song) return false
+    const declared = Number(song.interval) || 0
+    const played = Number(audio.duration) || 0
+    if (declared < 60 || !played) return false
+    return played < declared * SNIPPET_PLAYED_RATIO
+  }
 
   /**
    * 这首歌实播出来比它声明的短太多 —— 说清楚原因。

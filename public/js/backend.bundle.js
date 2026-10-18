@@ -1,5 +1,5 @@
 /* 由 tools/build-app.mjs 自动生成，请勿手动修改。
- * 源摘要: 226c3a06327636cf
+ * 源摘要: 619cd504fb60ed4b
  * 模块数: 25
  *
  * 这是给安卓壳用的后端展平版：把 src/ 的 ESM 后端打成单个 IIFE，
@@ -5337,9 +5337,17 @@ function allowHttpAudio() {
  *
  * 判据用 LX_NATIVE（由 native.js 置位），而不是复用 allowHttpAudio ——
  * 那是「能不能播 http」，这是「能不能慢慢等」，两件事不该共用一个开关。
+ *
+ * ⚠ **Node（Docker 服务端）也必须算「自家后端」**。`server/index.mjs` 从不设置
+ *   LX_NATIVE（那是 WebView 里的标志），所以只判 LX_NATIVE 的话，Docker 一直在跑
+ *   网页那档预算 —— 而 stream.js 里「首条是试听片段就把收敛窗口放到总预算」
+ *   依赖的正是这一档，少了 200ms 就等于把完整版关在门外的概率调高了一点。
+ *   Docker 的出口是用户自己的机器/带宽，多等一会儿没有平台上限，理应与壳内同档。
  */
 function resolveBudget() {
-  return globalThis.LX_NATIVE === true
+  const selfHosted = globalThis.LX_NATIVE === true
+    || (typeof process !== 'undefined' && !!(process.versions && process.versions.node))
+  return selfHosted
     ? { deadline: 3500, probeDeadline: 1500, totalBudget: 3800 }
     : { deadline: 3200, probeDeadline: 1500, totalBudget: 3600 }
 }

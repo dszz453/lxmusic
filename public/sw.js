@@ -63,8 +63,19 @@
  *      候选列表关掉（`skipCandidateList`），于是那批死链成了唯一活路，只能 502。
  *      现在只有**探通过**的候选才配关列表；未验证的一批只当「先试一下」。
  *      不抬 VERSION 的话，网页端与内置客户端会先吃一轮旧 bundle。
+ * v51：`js/player.js` + `js/backend.bundle.js` 都变了 —— 修「放 30 秒就没了 / 播不出来」：
+ *      ① `player.js`：`ended` 不再把「片段播完」当「整首播完」。原来片段是**正常结束**
+ *         （不是 error），所以直接跳下一首；现在先在本级往后挪一条 → 再换级 → 再换音质，
+ *         都不行才跳歌。片段也**不再写入本地缓存**（以前会被当成整首存下来，
+ *         之后每次只播 30 秒且因为命中缓存连提示都没有）。
+ *      ② `player.js`：代理级从 1 条候选变成 2 条（第 2 条带 `retry=1`），并且不再用
+ *         上一级的 `curPos` 去猜 attempt —— 那个值原来恒错，导致 `/stream` 的 502
+ *         一次之后就无路可走，直接跳歌。
+ *      ③ `backend.bundle.js`：`resolveBudget()` 把 Node（Docker 服务端）也算作「自家后端」，
+ *         不再误用网页那档紧预算（「首条是片段就把窗口放到总预算」因此少等 200ms）。
+ *      不抬 VERSION 的话，网页端与内置客户端会先吃一轮旧资源。
  */
-const VERSION = 'v50'
+const VERSION = 'v51'
 const STATIC_CACHE = 'lxmusic-static-' + VERSION
 const SHELL_CACHE = 'lxmusic-shell-' + VERSION
 
