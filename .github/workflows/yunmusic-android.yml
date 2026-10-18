@@ -33,6 +33,7 @@ on:
       - 'test/app-wiring.test.mjs'
       - 'test/boot-speed.test.mjs'
       - 'test/edge-cache.mjs'
+      - 'test/stream-snippet.mjs'
       - '.github/workflows/yunmusic-android.yml'
   workflow_dispatch:
 
@@ -46,7 +47,7 @@ jobs:
         with:
           node-version: '22'
 
-      # 这六套是客户端相关、且**不需要安卓运行时**的（零第三方依赖，不用 npm install）：
+      # 这七套是客户端相关、且**不需要安卓运行时**的（零第三方依赖，不用 npm install）：
       #   client-wiring  静态接线审计：源码里有没有写对
       #   client-layer   跨端层行为：跑起来是不是那个行为（自带极小 DOM 替身）
       #   两者互补，别只跑一个（见 docs/client-android.md）
@@ -54,6 +55,7 @@ jobs:
       #   app-wiring     版本落点、媒体会话接线与 CI 出包链路的环境契约
       #   boot-speed     首屏启动速度护栏
       #   edge-cache     边缘缓存（榜单/专辑/歌词/播放直链）的行为与接线
+      #   stream-snippet 「放 30 秒就没了 / 播不出来」的防回归（片段当整首、代理级单候选）
       #
       # ⚠ edge-cache 读的是 src/server/api.js 与 src/lib/stream.js。这两个文件本身
       #   不在下面的 paths 里（服务端改动不该顺带跑安卓出包），但它们的产物
@@ -67,6 +69,7 @@ jobs:
           node test/app-wiring.test.mjs
           node test/boot-speed.test.mjs
           node test/edge-cache.mjs
+          node test/stream-snippet.mjs
 
   build:
     runs-on: ubuntu-latest
