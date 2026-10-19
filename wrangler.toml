@@ -12,15 +12,13 @@ workers_dev = true
 #    `Unexpected fields found in triggers field: "routes"` 然后**静默忽略**，
 #    结果 Worker 部署成功、自定义域名却没绑上（workers.dev 在国内又被污染）。
 #
-# ⚠ 这里每次 deploy 都会报一条 code 100117 的 ERROR，**属预期、无害**：
-#    该域名在 dpdns.org 侧已经有一条外部管理的 CNAME
-#    （music.zyplnn.dpdns.org → dszzlnn.cf.090227.xyz → cloudflare），
-#    CF 因此拒绝把它登记成「custom domain」。但请求照样能到 Worker ——
-#    实测 `curl https://music.zyplnn.dpdns.org/api/version` 返回
-#    {"ok":true,"app":"lxmusic","version":"V2.7",...}，与 workers.dev 一致。
-#    保留这段配置是为了留下「这个域名归这个 Worker」的意图声明。
+# 2026-10-19 迁到新账号（8204dd0e1e1815aff938afdee5207ead）：
+#   该账号下唯一接入的 zone 是 dszzzz.dpdns.org → 自定义域名取 `lxmusic.` 前缀。
+#   旧域名 music.zyplnn.dpdns.org 属于另一个账号，本账号绑不了，已移除。
+#   `custom_domain = true` 会让 CF 自动建一条 `lxmusic` 的 AAAA(100::) 记录并
+#   签证书 —— 和同账号里 iptv / joy 两个 Worker 的做法一致。
 routes = [
-  { pattern = "music.zyplnn.dpdns.org", custom_domain = true }
+  { pattern = "lxmusic.dszzzz.dpdns.org", custom_domain = true }
 ]
 
 # 每日推荐定时生成：UTC 22:00 = 北京时间 06:00（CF cron 只认 UTC）。
@@ -31,7 +29,16 @@ crons = ["0 22 * * *"]
 [[d1_databases]]
 binding = "DB"
 database_name = "lxmusic-db"
-database_id = "cf13afc2-2c37-4a5c-a2fb-647ae70ebfe3"
+# 2026-10-19 在新账号（8204dd0e1e1815aff938afdee5207ead）下新建的独立库。
+# 建表不需要手动迁移：src/server/api.js 的 handleApi 第一行就是
+# `await db.ensureSchema(env.DB)`，任何 /api/* 请求都会幂等建表。
+#
+# ⚠ **建库时必须带 `primary_location_hint = "apac"`**（走 API 建库时传
+#    `{"primary_location_hint":"apac"}`）。第一次建库没传，CF 默认给了 **WNAM**，
+#    实测登录接口热态 3.6s、冷启动 40s —— 每次 D1 查询都跨太平洋。
+#    删库重建到 APAC 后同一接口降到百毫秒级。
+#    D1 的 region 建完不能改，只能重建库（数据用 d1 export/import 迁）。
+database_id = "bc2e8412-c654-49b3-9d86-70fdb293265e"
 
 [assets]
 directory = "./public"
