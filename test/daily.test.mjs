@@ -155,6 +155,31 @@ const searchEmpty = async () => ({ list: [] })
     searches: [],
   })
   ok('歌手按播放次数排序（Beyond 在前）', p3.indexOf('Beyond') < p3.indexOf('陈奕迅'))
+
+  /* 「换一批」的 prompt 层改动（2026-10-22）：不传 opts 必须与旧版一致，
+     传了 rotate 才有增量 —— 否则 cron / 跨天那条路会被无意改掉。 */
+  const sig = {
+    playlistNames: ['深夜驾车'],
+    history: [{ song: { name: '海阔天空', singer: 'Beyond' }, playCount: 5 }],
+    searches: [],
+  }
+  ok('不传 opts 时 prompt 不带「换一批」语气（旧行为逐字保留）', !/换一批/.test(buildPrompt(sig)))
+
+  const rotated = buildPrompt(sig, { rotate: true, exclude: ['西厢寻他', '踏山河', '晴天'] })
+  ok('换一批：要求不要重复上一批', /不要重复/.test(rotated))
+  ok('换一批：排除清单的歌名进了 prompt',
+    rotated.includes('西厢寻他') && rotated.includes('踏山河') && rotated.includes('晴天'))
+  ok('换一批：prompt 比原来更长（多了一段取材角度）', rotated.length > buildPrompt(sig).length + 10)
+
+  // 角度必须真的随机：写死一个角度等于没换角度
+  const variants = new Set()
+  for (let i = 0; i < 40; i++) variants.add(buildPrompt(sig, { rotate: true }))
+  ok('换一批：取材角度确实随机（40 次出现多种写法）', variants.size >= 2, '只有 ' + variants.size + ' 种')
+
+  // 排除清单要截断，不能把 prompt 撑爆（一份 24 首，留到 30 首的余量）
+  const many = Array.from({ length: 60 }, (_, i) => '曲目' + i)
+  const long = buildPrompt(sig, { rotate: true, exclude: many })
+  ok('排除清单最多 30 首', long.includes('曲目29') && !long.includes('曲目30'))
 }
 
 /* ---------- 3. collectSignals 容错 ---------- */
@@ -226,6 +251,75 @@ const searchEmpty = async () => ({ list: [] })
     })
   } catch { threw = true }
   ok('兜底也搜不到时向上抛错', threw)
+
+  /* 4g. 「换一批」必须真的换歌，不能只换顺序（2026-10-22 报障）
+   *
+   * 老板原话：「CF 端推荐歌单，点击换一批，提示更换成功，但是再猜你喜欢的歌单中，
+   * 歌曲名称没有更换」「docker 版本，也是，只是更换顺序，歌单没有变化」。
+   *
+   * 真因：prompt 全部由用户历史拼成，连点两次时信号一个字都没变 → 同一句 prompt →
+   * 模型给出同一批最热门的歌，temperature 0.7 只抖出了顺序。
+   * 修法两层：① prompt 带「上一批歌名 + 换一个取材角度」；② AI 结果硬过滤。
+   */
+  {
+    // 直接往替身库里塞一份「当天已有的推荐」，模拟用户已经看过的那一批
+    const seedDb = () => {
+      const d = withHistory(fakeDb(), [], [])
+      d._daily.set(todayBJ(), {
+        date: todayBJ(), title: '上一批', generator: 'ai', generated_at: Date.now(),
+        // 注意第二条带 feat. 后缀：归一化必须能对上 AI 给的「伯虎说」
+        songs: JSON.stringify([
+          { name: '西厢寻他', singer: '等什么君' },
+          { name: '伯虎说 (feat.唐伯虎Annie)', singer: '等什么君' },
+        ]),
+      })
+      return d
+    }
+
+    let seenPrompt = ''
+    const dbX = seedDb()
+    const recX = await generateDaily(fakeEnv(), dbX, {
+      force: true,
+      aiFn: async (_e, _d, { prompt }) => {
+        seenPrompt = prompt
+        return {
+          title: '新的一批',
+          songs: [
+            { name: '西厢寻他', singer: '等什么君' },   // 与上一批同名 → 必须被剔
+            { name: '伯虎说', singer: '等什么君' },     // 归一化后同名 → 必须被剔
+            ...Array.from({ length: 14 }, (_, i) => ({ name: '新歌' + i, singer: '歌手' + i })),
+          ],
+        }
+      },
+      searchFn: searchOk,
+    })
+    ok('换一批：prompt 里带了上一批的歌名（否则模型必然给回同一批）', seenPrompt.includes('西厢寻他'))
+    ok('换一批：prompt 明确要求不要重复', /不要重复/.test(seenPrompt))
+    ok('换一批：与上一批重名的被硬过滤掉（含 feat. 版本）',
+      !recX.songs.some(s => /西厢寻他|伯虎说/.test(String(s.name || ''))))
+    ok('换一批：新歌照常保留', recX.songs.filter(s => /新歌/.test(String(s.name || ''))).length >= 10,
+      '剩 ' + recX.songs.length + ' 首')
+
+    // 模型完全不听（整份都是上一批）→ 不能砍成 0 首，宁可保留整份让它能播
+    const dbY = seedDb()
+    const allDup = Array.from({ length: 12 }, () => ({ name: '西厢寻他', singer: '等什么君' }))
+    const recY = await generateDaily(fakeEnv(), dbY, { force: true, aiFn: aiOk(allDup), searchFn: searchOk })
+    ok('模型全给重复时保留整份（砍到 0 首等于把推荐弄没）', recY.songs.length > 0, '剩 ' + recY.songs.length + ' 首')
+
+    // 结构断言：force 时也必须先读出当天那份 —— 读不到就没有排除清单，
+    // 这条链路的失效方式是「安静地什么都没发生」，只能靠源码钉住。
+    const dailySrc = deComment(readFileSync(new URL('../src/server/daily.js', import.meta.url), 'utf8'))
+    const gdBody = dailySrc.slice(
+      dailySrc.indexOf('export async function generateDaily('),
+      dailySrc.indexOf('export async function dailySourcesStale'))
+    ok('generateDaily：读当天那份在 if (!force) 之前（force 也要拿排除清单）',
+      gdBody.indexOf('const existing = await getDaily(db, date)') >= 0
+      && gdBody.indexOf('const existing = await getDaily(db, date)') < gdBody.indexOf('if (!force)'))
+    ok('generateDaily：排除清单只在 force 时启用（跨天不排除，免得越推越冷门）',
+      /force && existing/.test(gdBody))
+    ok('generateDaily：AI 结果要过硬过滤（只信 prompt 不可靠）',
+      /dropRepeated\(aiSongs, exclude\)/.test(gdBody))
+  }
 
   /* 4f-2. 兜底自己必须尽量打出去：全源一发失败 → 降级单源重试
    *

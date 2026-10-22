@@ -45,6 +45,14 @@ const DAILY_SOURCES_SETTING = 'daily.sources'
 const TARGET_COUNT = 24
 /** 搜索解析后少于这个数视为「生成质量不行」，走兜底。 */
 const MIN_USABLE = 8
+/**
+ * 「换一批」剔掉重复曲目后，至少要剩这么多首才认这个结果。
+ *
+ * 24 首按 ~83% 的解析命中率算，12 首能解析出 10 首左右，仍高于 MIN_USABLE。
+ * 低于这个数说明模型压根没理会「不要重复」的指令 —— 那种情况宁可保留它给的
+ * 整份（至少歌够、能播），也不要砍成半份再去撞兜底。见 generateDaily 里的用法。
+ */
+const MIN_AFTER_EXCLUDE = 12
 /** 并发搜索上限 —— 每首一次多源聚合搜索，串行 24 次太慢，全并发又容易触发上游限流。 */
 const SEARCH_CONCURRENCY = 6
 
@@ -108,12 +116,45 @@ export async function collectSignals(db, userId) {
 }
 
 /**
+ * 「换一批」时给模型换的取材角度。
+ *
+ * ══════════════ 为什么光有 temperature 不够（2026-10-22 报障） ══════════════
+ * 老板原话：「CF 端推荐歌单，点击换一批，提示更换成功，但是再猜你喜欢的歌单中，
+ * 歌曲名称没有更换」「docker 版本，也是，只是更换顺序，歌单没有变化」。
+ *
+ * 根因不在刷新链路（`generatedAt` / `title` 都确实变了、库也写了），而在 prompt：
+ * `buildPrompt` 的输入**全部是用户历史**（歌单名 / 常听歌手 / 最近听过 / 搜索词），
+ * 连点两次「换一批」时这些信号一个字都没变 → 同一句 prompt → 模型给出同一批
+ * 最热门的歌，temperature 0.7 只够把**顺序**抖乱。实测连续两次 refresh：
+ *   #1 西厢寻他 / 踏山河 / 晴天 / 青花瓷 / 伯虎说
+ *   #2 西厢寻他 / 踏山河 / 晴天 / 七里香 / 半生雪
+ * 前三首一模一样。
+ *
+ * 所以换一批必须让 prompt 本身也变：这里随机换一个「取材角度」，
+ * 同时由 buildPrompt 把**上一批的歌名**作为排除清单塞进去。
+ *
+ * ⚠ 角度都限定在「保持同样的口味方向，换人换曲」，**不放宽风格**。
+ *   写成「换一批别的类型」会把老板的古风/怀旧口味带跑偏 —— 那不是他要的「换一批」。
+ */
+const ROTATE_ANGLES = [
+  '这次换一批：同一风格里，尽量每个歌手只出现一次，多覆盖不同歌手',
+  '这次换一批：保持口味不变，多挑一些同风格里平时不太被推荐到的歌',
+  '这次换一批：保持口味不变，把年代跨度拉开一些，老歌与新歌混着来',
+  '这次换一批：保持口味不变，从同风格不同歌手的代表作里挑',
+]
+
+/**
  * 把信号拼成 prompt。要点：
  *  - 歌单名字是用户自己起的，最能代表口味，放在最前；
  *  - 播放记录按 play_count 排出高频歌手，避免把 40 条历史全塞进去（token 浪费且重点糊）；
  *  - 搜索词次之；都没有时退回「随便推荐」，AI 自己发挥。
+ *
+ * opts 只在「用户主动点换一批」时传（见 generateDaily）：
+ *  - opts.rotate   —— 换一个取材角度 + 声明这是换一批；
+ *  - opts.exclude  —— 上一批已经推过的歌名，要求本次一首都不重复。
+ * 不传 opts 时输出与旧版**逐字符一致**，`test/daily.test.mjs` 依赖这一点。
  */
-export function buildPrompt(signals) {
+export function buildPrompt(signals, opts = {}) {
   const parts = []
   const names = (signals.playlistNames || []).slice(0, 10).map(s => String(s).slice(0, 30))
   if (names.length) parts.push('用户建过这些歌单：' + names.join('、'))
@@ -136,7 +177,50 @@ export function buildPrompt(signals) {
   const kws = (signals.searches || []).map(s => s.keyword || s).filter(Boolean).slice(0, 6)
   if (kws.length) parts.push('最近搜索过：' + kws.join('、'))
 
-  return parts.join('；') || '根据大众口味推荐一些好听、传唱度高的歌曲'
+  const base = parts.join('；') || '根据大众口味推荐一些好听、传唱度高的歌曲'
+  if (!opts.rotate) return base
+
+  const tail = [ROTATE_ANGLES[Math.floor(Math.random() * ROTATE_ANGLES.length)]]
+  // 排除清单截断到 30 首 × 24 字：够覆盖一整份（24 首），又不至于把 prompt 撑爆。
+  const exclude = (opts.exclude || [])
+    .map(s => String(s || '').trim().slice(0, 24))
+    .filter(Boolean)
+    .slice(0, 30)
+  if (exclude.length) {
+    tail.push('上一批已经推过下面这些歌，本次一首都不要重复：' + exclude.join('、'))
+  }
+  return base + '。' + tail.join('；')
+}
+
+/**
+ * 歌名归一化：只用来判断「是不是同一首歌」。
+ *
+ * 去掉括号注释（feat. / Live / 伴奏 / 电视剧名）、所有空白、统一大小写 ——
+ * AI 给的「伯虎说」与服务端库里存的「伯虎说 (feat.唐伯虎Annie)」必须能对上，
+ * 否则排除清单形同虚设（这正是老板看到「歌名没变」的直接原因之一）。
+ */
+function normSongName(s) {
+  return String(s || '')
+    .replace(/[（(\[【][^）)\]】]*[）)\]】]/g, '')
+    .replace(/[\s\u3000]+/g, '')
+    .toLowerCase()
+}
+
+/**
+ * 从 AI 结果里剔掉「上一批已经推过的歌」。
+ *
+ * 为什么不只靠 prompt：模型的指令遵从度不可靠，尤其当上一批里有几首是它心里的
+ * 「必推金曲」时，prompt 说了不要重复它照样会给。只信 prompt 的结果就是老板
+ * 看到的现象 —— 点了换一批，前几首一模一样。这里是**硬保险**。
+ */
+function dropRepeated(songs, excludeNames) {
+  const ban = new Set()
+  for (const n of excludeNames || []) {
+    const k = normSongName(n)
+    if (k) ban.add(k)
+  }
+  if (!ban.size) return songs
+  return songs.filter(s => !ban.has(normSongName(s && s.name)))
 }
 
 /**
@@ -259,8 +343,12 @@ export async function generateDaily(env, db, { userId = null, force = false, toW
   const date = todayBJ()
   // 这一轮该用哪些音源 —— 与「搜索」读同一份设置（见 sources.js）
   const sig = (await searchSources(env, dbmod)).join(',')
+  /**
+   * 当天已有的那份。除了决定「要不要重生成」，它还兼任「换一批」的排除清单 ——
+   * 所以 force 时也必须读出来（原来只在 `if (!force)` 里读，换一批时就拿不到上一批的曲目）。
+   */
+  const existing = await getDaily(db, date)
   if (!force) {
-    const existing = await getDaily(db, date)
     const prev = await lastSourcesSig(db)
     // prev === null 表示「读不到签名」（替身/异常），那种情况按老行为直接用当天那份；
     // prev 是空串则说明是**老库**、从没记过签名 —— 当作变了，重算一次，
@@ -272,10 +360,26 @@ export async function generateDaily(env, db, { userId = null, force = false, toW
   const record = { date, title: '', songs: [], generator: 'fallback', generatedAt: Date.now() }
   try {
     const signals = await collectSignals(db, userId)
-    const prompt = buildPrompt(signals)
+    /**
+     * 「换一批」的排除清单 = 当前这一份的歌名。
+     *
+     * 只有 force（用户主动点换一批）才排除：跨天的那一份不排除 —— 每天排除 24 首会
+     * 逼着模型越推越冷门，那不是老板要的（他要的是「点一下真的换掉」）。
+     */
+    const exclude = force && existing && Array.isArray(existing.songs)
+      ? existing.songs.map(s => (s && s.name) || '').filter(Boolean)
+      : []
+    const prompt = buildPrompt(signals, { rotate: force, exclude })
     const ai = await aiFn(env, db, { prompt, count: TARGET_COUNT })
-    if (ai.songs.length) {
-      const resolved = await resolveAiSongs(env, db, ai.songs, searchFn)
+    let aiSongs = ai.songs
+    if (exclude.length) {
+      // 硬保险：prompt 说了不要重复，模型不一定听（见 dropRepeated 的注释）。
+      // 砍完还够用才砍 —— 砍太狠说明模型压根没理会，那种情况保留整份，别把歌数砍到触底。
+      const kept = dropRepeated(aiSongs, exclude)
+      if (kept.length >= MIN_AFTER_EXCLUDE) aiSongs = kept
+    }
+    if (aiSongs.length) {
+      const resolved = await resolveAiSongs(env, db, aiSongs, searchFn)
       if (resolved.length >= MIN_USABLE) {
         record.title = ai.title || '每日推荐'
         record.songs = resolved.map(web)
