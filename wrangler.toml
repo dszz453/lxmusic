@@ -4,21 +4,32 @@ compatibility_date = "2025-09-01"
 compatibility_flags = ["nodejs_compat"]
 workers_dev = true
 
-# 自定义域名（workers.dev 在国内 DNS 被污染，必须绑自有域名）
+# 入口路由（workers.dev 在国内 DNS 被污染，必须走自有域名）
 #
 # ⚠ 必须放在任何 [table] 头**之前**：TOML 里一旦出现 `[triggers]` 这样的 table 头，
 #    它下面直到下一个 table 头为止的所有键都归属那个 table。routes 写在 [triggers]
 #    后面会被解析成 `triggers.routes`，wrangler 只报一句
 #    `Unexpected fields found in triggers field: "routes"` 然后**静默忽略**，
-#    结果 Worker 部署成功、自定义域名却没绑上（workers.dev 在国内又被污染）。
+#    结果 Worker 部署成功、域名却没绑上（workers.dev 在国内又被污染）。
+#
+# ══════════════ 这里是 **Workers Route**，不是 custom domain（2026-10-22 纠正） ══════════════
+# 线上两个账号（新 8204dd0e… / 老 4684678c…）都是老板在面板里配的 **路由**：
+#   新：`lxmusic.dszzzz.dpdns.org/*` → lxmusic
+#   老：`music.zyplnn.dpdns.org/*`   → lxmusic
+# `/accounts/{id}/workers/domains`（custom domain）两边都是空的。
+#
+# 早先这里写的是 `custom_domain = true`，与线上实际不符，于是每次 deploy 都在最后
+# 甩一段红字：
+#   X [ERROR] Trigger configuration ... Hostname 'lxmusic.dszzzz.dpdns.org' already has
+#     externally managed DNS records (A, CNAME, etc) [code: 100117]
+# 看着像部署失败，其实代码早就换上去了（判据看行为，不看这段字）。
+# 写成 route 之后，deploy 只更新脚本，不再去碰 DNS / 域名绑定。
 #
 # 2026-10-19 迁到新账号（8204dd0e1e1815aff938afdee5207ead）：
-#   该账号下唯一接入的 zone 是 dszzzz.dpdns.org → 自定义域名取 `lxmusic.` 前缀。
-#   旧域名 music.zyplnn.dpdns.org 属于另一个账号，本账号绑不了，已移除。
-#   `custom_domain = true` 会让 CF 自动建一条 `lxmusic` 的 AAAA(100::) 记录并
-#   签证书 —— 和同账号里 iptv / joy 两个 Worker 的做法一致。
+#   该账号下接入的 zone 是 dszzzz.dpdns.org → 路由取 `lxmusic.` 前缀。
+#   旧域名 music.zyplnn.dpdns.org 在另一个账号（4684678c…），本账号管不了。
 routes = [
-  { pattern = "lxmusic.dszzzz.dpdns.org", custom_domain = true }
+  { pattern = "lxmusic.dszzzz.dpdns.org/*", zone_name = "dszzzz.dpdns.org" }
 ]
 
 # 每日推荐定时生成：UTC 22:00 = 北京时间 06:00（CF cron 只认 UTC）。
