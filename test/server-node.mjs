@@ -209,6 +209,45 @@ const main = async () => {
   ok('/rest/ping 返回 subsonic-response', ping.status === 200 && JSON.stringify(ping.data || '').includes('subsonic-response'),
     JSON.stringify(ping.data).slice(0, 120))
 
+  /* 9. 预热 / 保活心跳 */
+  console.log('\n--- 9. 预热 / 保活心跳')
+  /**
+   * 这一组验的是「静默之后第一发变慢」那个病根的解药。
+   *
+   * 病灶本身**没法在这里复现** —— 它要的是宿主真的凉下去（休眠盘 / CPU 降频 /
+   * 页面换出），CI 和开发机上永远是热的。所以这里只验「机制装上了、在动、
+   * 参数解析对」，能不能治病靠线上实测（见 server/index.mjs 里那段实测数据）。
+   *
+   * ⚠ 想验心跳真的在跳，请用 LX_WARM_INTERVAL=5s 起服务再跑本文件；
+   *    默认 25 秒的话这里会显式跳过，而不是假装通过。
+   */
+  const hz = await call('/healthz')
+  const w = (hz.data && hz.data.warm) || null
+  ok('/healthz 回报 warm 状态（没有它就无法确认心跳在不在跑）', !!w && typeof w.enabled === 'boolean',
+    JSON.stringify(w))
+  ok('warm.intervalMs 是非负数', !!w && Number.isFinite(w.intervalMs) && w.intervalMs >= 0, String(w && w.intervalMs))
+  if (w && w.enabled) {
+    ok('心跳开启时间隔不小于 5 秒（再密就没有意义）', w.intervalMs >= 5000, w.intervalMs + 'ms')
+    if (w.intervalMs <= 8000) {
+      const t0 = w.ticks
+      const deadline = Date.now() + w.intervalMs + 6000
+      let now = w
+      while (Date.now() < deadline && now.ticks === t0) {
+        await new Promise((r) => setTimeout(r, 500))
+        const again = await call('/healthz')
+        now = (again.data && again.data.warm) || now
+      }
+      ok('心跳确实在跳（ticks 增长）', now.ticks > t0, `${t0} → ${now.ticks}`)
+      ok('最近一次心跳成功', !!(now.last && now.last.ok), JSON.stringify(now.last))
+    } else {
+      ok('（跳过：间隔 >8s，无法在测试里等到一轮）', true,
+        '用 LX_WARM_INTERVAL=5s 起服务可验证心跳；当前 ' + w.intervalMs + 'ms')
+    }
+  } else {
+    ok('心跳被显式关闭时，状态自洽（intervalMs=0 且 ticks 不增长）',
+      !!w && w.intervalMs === 0 && w.ticks === 0, JSON.stringify(w))
+  }
+
   console.log(`\n================ Docker 宿主自检：${pass} 通过 / ${fail} 失败 ================\n`)
   process.exit(fail ? 1 : 0)
 }

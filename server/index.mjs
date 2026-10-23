@@ -24,6 +24,7 @@
  *   LX_SESSION_SECRET  会话签名密钥（不填则首次启动随机生成并存进库）
  *   DEFAULT_SOURCES    默认搜索源（kg,wy,kw,tx,xm）
  *   AI_PROVIDER / AI_API_KEY / AI_ACCOUNT_ID   AI 歌单的兜底配置
+ *   LX_WARM_INTERVAL   保活心跳间隔（默认 25 秒；off 关闭）—— 见下面「预热 / 保活」
  */
 import './boot-flags.mjs'   // ⚠️ 必须第一个：它负责让插件别在模块顶层求值
 import http from 'node:http'
@@ -357,6 +358,177 @@ function rescoreStatusStore(db) {
   }
 }
 
+/* ---------------- 预热 / 保活 ---------------- */
+
+/**
+ * 为什么 Docker 版需要「预热」—— 这不是拍脑袋加的，是被实测数据逼出来的。
+ *
+ * ── 实测（2026-10-23，老板那台 NAS 上的容器）─────────────────────
+ *
+ *   · 静默 60 秒后再请求，第一发 `/api/version` 出现过 **11384ms**、**2133ms**；
+ *   · 每 6 秒连打 150 秒（25 发），同一个接口**全部落在 36~129ms**，一次没超。
+ *   · `/api/version` 是**不碰数据库**的（见 src/server/api.js 里那个分支），
+ *     所以这不是「库冷」。
+ *   · 同一个容器，直连 8787（不过 Lucky）和经 Lucky 的 8616 **都会出现**，
+ *     所以也不是反向代理的锅。
+ *
+ * 剩下的解释只有一类：**进程/宿主在空闲之后变凉** —— 休眠盘要转起来、
+ * cgroup 被降频、页面被换出到 swap，三者从外部看长得一模一样。
+ * 无论是哪一个，「保持一个有节奏的轻量触碰」都能把它按住 —— 上面那 25 发连打
+ * 就是这件事的证据。
+ *
+ * ── 两层，目的不同，别合并 ──────────────────────────────────────
+ *
+ *   ① 启动预热（warmAtBoot）：只跑一次。把「第一发请求才付的钱」提前付掉 ——
+ *      SQLite 页缓存、public/index.html 的 page cache、一条完整的 HTTP 请求管线。
+ *   ② 保活心跳（startKeepWarm）：每隔 LX_WARM_INTERVAL 秒轻碰一次。
+ *      目标**不是让单个请求变快**，而是不让容器凉下去。
+ *
+ * ── 成本 ───────────────────────────────────────────────────────
+ * 启动预热是一次性的；心跳每轮只有一次本地回环请求，实测 < 2ms，**且不碰磁盘**
+ * （打的是纯计算的 /api/version）。默认 25 秒一次，一天 3456 次，
+ * 对 NAS 来说完全可以忽略；觉得多余就 LX_WARM_INTERVAL=off。
+ *
+ * ⚠ 只写在 server/ 下 —— 这是 Docker / 自托管宿主专属，Cloudflare 那边
+ *   走的是 src/index.js，根本不加载这个文件（CF 的冷启动由平台管，轮不到我们）。
+ */
+
+/** 解析 LX_WARM_INTERVAL：`off` / `0` 关闭；纯数字按秒；支持 25s / 2m 后缀。默认 25 秒。 */
+function parseWarmInterval(raw) {
+  const DEF = 25000
+  const s = String(raw == null ? '' : raw).trim().toLowerCase()
+  if (!s) return DEF
+  if (s === 'off' || s === '0' || s === 'never' || s === 'false' || s === 'no') return 0
+  const m = /^(\d+(?:\.\d+)?)\s*(ms|s|m|h)?$/.exec(s)
+  if (!m) return DEF
+  const n = Number(m[1])
+  if (!Number.isFinite(n) || n <= 0) return 0
+  const unit = m[2] || 's'
+  const ms = unit === 'ms' ? n : unit === 's' ? n * 1000 : unit === 'm' ? n * 60000 : n * 3600000
+  // 下限 5 秒：再密就没意义了（一次才 2ms，但也没必要）
+  return Math.max(5000, Math.min(Math.round(ms), 3600000))
+}
+
+/**
+ * 启动预热：进程刚起来、server 已 listen 之后跑一次。
+ *
+ * 刻意**不阻塞 listen** —— 让容器尽快变成 healthy（healthcheck 只认 /healthz 200），
+ * 预热慢一点没关系，反正那时候还没人用。
+ * 每一步都单独计时并打进日志：以后要判断「哪一步慢」不用再猜。
+ */
+async function warmAtBoot({ db, port, indexHtml }) {
+  const t0 = Date.now()
+  const steps = []
+
+  // ① 首屏 HTML 读进 page cache —— 冷盘上这一下可能要几百毫秒到几秒
+  let t = Date.now()
+  try {
+    fs.readFileSync(indexHtml)
+    steps.push(`首屏 ${Date.now() - t}ms`)
+  } catch (e) {
+    steps.push(`首屏 跳过(${(e && e.code) || 'ERR'})`)
+  }
+
+  // ② SQLite 热一下：走一次真实的主键查表，让 WAL / 页缓存落到手里
+  t = Date.now()
+  try {
+    await getSetting(db, 'session_secret', '')
+    steps.push(`库 ${Date.now() - t}ms`)
+  } catch {
+    steps.push('库 跳过')
+  }
+
+  /**
+   * ③ 走一遍自己的 HTTP 管线。
+   *
+   * 为什么用 fetch 打 127.0.0.1 而不是直接调 handleApi：
+   * 我们真正想预热的是**从 socket 进来到 socket 出去**这一整条路（含 Node 的
+   * http 解析、keep-alive 池、Response → ServerResponse 的转换）。
+   * 直接调 handleApi 只覆盖了中间一段，恰恰漏掉了最容易冷的那两头。
+   */
+  t = Date.now()
+  let httpNote = '失败'
+  try {
+    const r = await fetch(`http://127.0.0.1:${port}/healthz`, { signal: AbortSignal.timeout(10000) })
+    await r.arrayBuffer()   // body 必须读干净，否则这条 socket 不会回到 keep-alive 池
+    httpNote = r.ok ? 'OK' : `HTTP ${r.status}`
+  } catch { /* 记在 httpNote 里 */ }
+  steps.push(`HTTP ${httpNote} ${Date.now() - t}ms`)
+
+  process.stdout.write(`[server] 预热完成 ${Date.now() - t0}ms（${steps.join(' · ')}）\n`)
+  return { totalMs: Date.now() - t0, steps }
+}
+
+/**
+ * 保活心跳：每 intervalMs 轻碰一次，别让容器凉下去。
+ *
+ * 四个刻意的取舍：
+ *   · **只打 /api/version，不碰数据库**。这个接口是纯计算（见 src/server/api.js），
+ *     不会产生任何磁盘读。换成 /healthz 就会每轮查一次 settings —— 在 NAS 上
+ *     那等于让硬盘永远不睡，风扇一直转。**心跳的目的是让进程保持热，不是让库保持热。**
+ *   · **正常不打日志**。25 秒一条，一天 3456 行，等于把有用的日志全冲掉。
+ *     只在失败时打，且带熔断。
+ *   · **熔断**（连坏 3 次就停）。心跳自己坏了不该变成一个刷屏源，更不该
+ *     假装服务挂了 —— 它失败通常意味着进程正在退出，那时候本来也用不着它。
+ *   · **timer.unref()**。心跳不是业务，不该拖着进程不让退出。
+ */
+function startKeepWarm({ port, intervalMs }) {
+  if (!intervalMs) {
+    process.stdout.write('[server] 保活心跳未启用（LX_WARM_INTERVAL=off）\n')
+    return {
+      stop() {},
+      snapshot: () => ({ enabled: false, intervalMs: 0, ticks: 0, last: null }),
+    }
+  }
+
+  let fails = 0
+  let ticks = 0
+  let stopped = false
+  let last = null
+
+  const tick = async () => {
+    if (stopped) return
+    const t = Date.now()
+    let ok = true
+    try {
+      // 走完整管线但**不碰库**：/api/version 是纯计算接口
+      const r = await fetch(`http://127.0.0.1:${port}/api/version`, { signal: AbortSignal.timeout(5000) })
+      await r.arrayBuffer()   // body 必须读干净，否则 socket 不会回到 keep-alive 池
+      if (!r.ok) ok = false
+    } catch { ok = false }
+
+    ticks++
+    last = { at: new Date().toISOString(), ms: Date.now() - t, ok }
+
+    if (ok) { fails = 0; return }
+
+    fails++
+    if (fails >= 3) {
+      stopped = true
+      clearInterval(timer)
+      process.stdout.write('[server] 保活心跳连续 3 次失败，已停止（不影响正常请求）\n')
+    } else {
+      process.stderr.write(`[server] 保活心跳失败（第 ${fails} 次，${last.ms}ms）\n`)
+    }
+  }
+
+  const timer = setInterval(() => { tick().catch(() => {}) }, intervalMs)
+  timer.unref()
+
+  process.stdout.write(`[server] 保活心跳已启用：每 ${Math.round(intervalMs / 1000)} 秒轻碰一次`
+    + '（LX_WARM_INTERVAL 可调，off 关闭）\n')
+
+  return {
+    stop() { stopped = true; clearInterval(timer) },
+    snapshot: () => ({
+      enabled: !stopped,
+      intervalMs,
+      ticks,
+      last,
+    }),
+  }
+}
+
 /* ---------------- 启动 ---------------- */
 
 async function main() {
@@ -475,6 +647,12 @@ async function main() {
 
   const assets = createStaticServer(PUBLIC_DIR)
 
+  /**
+   * 保活心跳的句柄。先声明成 null，等 listen 之后才装上 ——
+   * /healthz 要用它回报「心跳到底在不在跑」，而那个分支比 listen 早定义。
+   */
+  let warm = null
+
   const server = http.createServer(async (req, res) => {
     const url = new URL(req.url, `http://${req.headers.host || 'localhost'}`)
     const p = url.pathname
@@ -508,6 +686,15 @@ async function main() {
            * 那样一轮刚跑完、还没重启时，live 有值而 last 是空的，两边对不上。
            */
           rescore: { ...snap, last: await readSavedStatus(), supported: true },
+          /**
+           * 保活心跳的自证：在不在跑、跑了几轮、上一轮几毫秒。
+           *
+           * 为什么值得放进健康检查：这个功能是**为了消除「静默后第一发很慢」**
+           * 而加的，而那个症状本来就只在「没人用的时候」出现 ——
+           * 没有这个字段，谁也没法确认它到底在不在工作，只能靠猜。
+           * 心跳没开时是 `{ enabled: false }`，一眼能看出来。
+           */
+          warm: warm ? warm.snapshot() : { enabled: false, intervalMs: 0, ticks: 0, last: null },
           ts: new Date().toISOString(),
         }))
         return
@@ -557,12 +744,25 @@ async function main() {
     console.log(snap.intervalMs
       ? `[server] 插件评分 ${snap.intervalText}自动跑一轮（也可在管理端「立即重评」）`
       : `[server] 插件评分未开自动（可在管理端「立即重评」）`)
+
+    /**
+     * 预热放在 listen 之后、且**不 await** —— 两件事都要紧：
+     *   · listen 之后：本地回环那一发才打得通（那一步是故意的，见 warmAtBoot ③）；
+     *   · 不 await：healthcheck 只认 /healthz 200，别让预热把「容器就绪」往后拖。
+     *     预热自己慢，是它自己的事。
+     */
+    warmAtBoot({ db, port: PORT, indexHtml: path.join(PUBLIC_DIR, 'index.html') })
+      .catch((e) => process.stderr.write('[server] 预热异常（不影响服务）: '
+        + String((e && e.message) || e) + '\n'))
+
+    warm = startKeepWarm({ port: PORT, intervalMs: parseWarmInterval(process.env.LX_WARM_INTERVAL) })
   })
 
   const shutdown = (sig) => {
     console.log(`[server] 收到 ${sig}，正在退出…`)
     // 先停调度器：不然定时器还挂着，评分子进程可能被留下变成孤儿
     try { scheduler.stop() } catch { /* 没起来过 */ }
+    try { if (warm) warm.stop() } catch { /* 没起来过 */ }
     server.close(() => process.exit(0))
     setTimeout(() => process.exit(0), 5000).unref()
   }

@@ -87,6 +87,12 @@ EXPOSE 8787
 #   · 早先这里写 90 秒（注释还说「启动要 ~25 秒」），那是**管道打时间戳测出来的假象** ——
 #     `node server/index.mjs | while read` 会被下游缓冲卡住，看起来像启动慢。别再用管道测启动。
 #   · start-period 只影响「启动阶段失败不算失败」，给大了的代价是容器真挂时晚 1 分钟才被发现。
+#
+# ⚠ 这个 HEALTHCHECK **只证明进程活着，不能保证它不「凉」** ——
+#   它探的是容器内的 127.0.0.1，而实测里变慢的恰恰是「静默之后的第一发」，
+#   那种情况下 healthcheck 自己也会跟着变慢甚至超时（超时 → 判 unhealthy）。
+#   真正的保活是进程内的心跳：见 server/index.mjs 的「预热 / 保活」一节，
+#   由 LX_WARM_INTERVAL 控制（默认 25 秒）。两者互补，别互相替代。
 HEALTHCHECK --interval=30s --timeout=5s --start-period=20s --retries=3 \
   CMD node -e "fetch('http://127.0.0.1:'+(process.env.LX_PORT||8787)+'/healthz').then(r=>process.exit(r.ok?0:1)).catch(()=>process.exit(1))"
 
