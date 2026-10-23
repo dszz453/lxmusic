@@ -1408,6 +1408,18 @@ export async function handleApi(request, env, url) {
       // fast=1：只解析直链、不做字节探测，浏览器直连播放用（必须秒回）。
       // 默认：逐候选真拉字节验证，服务端代理播放前先筛掉死链。
       const fast = url.searchParams.get('fast') === '1'
+      /**
+       * `nocache=1`：这次请求**跳过直链缓存**，强制重新解析。
+       *
+       * 为什么必须有这个口子（而不是「反正缓存烂了也能兜住」）：
+       * 缓存里那条地址一旦提前失效，客户端按常规流程重问 `/url` —— 如果还是先查缓存，
+       * 就**又命中同一条死链**，客户端把它当「服务端给的唯一地址」试一遍再失败，
+       * 整首歌就卡在这条死链上绕不出来。
+       * `/stream` 早就有对应机制（`retry=1` 时跳过候选缓存），`/url` 这边现在才补齐。
+       *
+       * 客户端的用法：**首次**请求走缓存（命中就秒回），**重问**时带 `nocache=1`。
+       */
+      const noCache = url.searchParams.get('nocache') === '1'
       const candKey = streamCandKey(song, quality)
       /**
        * 先看「刚刚真的取到过音频字节」的那条直链缓存（跨 isolate，5 分钟）。
@@ -1419,14 +1431,27 @@ export async function handleApi(request, env, url) {
        * 只回这一条（urls 为 null）：它是**验证过**的地址，客户端一级一条足够；
        * 万一已经过期，客户端的 plugin / server 两级兜底照旧接得住。
        */
-      const cachedUrl = await getStreamUrl(env, candKey)
+      const cachedUrl = noCache ? null : await getStreamUrl(env, candKey)
       /**
        * ⚠ 只把**本宿主播得了的形态**交出去：网页里 http 直链会被浏览器当混合内容
        * 拦掉（见 http.js 的 allowHttpAudio），交出去等于让客户端白试一条、
        * 再降一级 —— 比不给还慢。判据复用同一个开关，不在这里另立一套。
        * （`/stream` 那条读取路径不受此限：字节由服务端代拉，http 无所谓。）
+       *
+       * ★ 2026-10-23 补 `http=1`（客户端主动声明能力）。
+       *
+       * `allowHttpAudio()` 看的是 `globalThis.LX_ALLOW_HTTP_AUDIO` —— 那个标志
+       * **只有 WebView 壳里才置位**，CF 上恒为 false。于是缓存里那条
+       * 「不带 fast、逐条 Range 探测通过」的 http 直链，读的时候一律被挡掉，
+       * 安卓壳每次都要重新解析一遍 —— 缓存写了等于没写（实测就是这样：
+       * `/url` 探测返回 http，紧接着 `/url?fast=1` 却没命中）。
+       *
+       * 而安卓壳完全能播 http：manifest 里 `usesCleartextTraffic="true"`，
+       * 音频还走原生 AudioProxy（OkHttp 直接拉上游）。所以由客户端声明能力、
+       * 服务端照办，比服务端猜 UA 可靠得多。
        */
-      if (cachedUrl && (/^https:\/\//i.test(cachedUrl) || allowHttpAudio())) {
+      const allowHttp = allowHttpAudio() || url.searchParams.get('http') === '1'
+      if (cachedUrl && (/^https:\/\//i.test(cachedUrl) || allowHttp)) {
         return json({ ok: true, url: cachedUrl, urls: null, from: '缓存直链', verified: true, tried: [] })
       }
       let r
@@ -1452,6 +1477,20 @@ export async function handleApi(request, env, url) {
       // 记下来给 /stream 判断能不能拿它当唯一候选（见 /stream 的 preferVerified）。
       if (r.url) setStreamCand(candKey, r.urls && r.urls.length ? r.urls : [{ url: r.url, from: r.from }], !r.unverified)
       if (!r.url) return json({ ok: false, error: r.error || '无可用播放地址', errors: r.tried }, 404)
+      /**
+       * ★ 把这条直链写进 5 分钟缓存 —— 也就是「让 `/url` 也享受 `/stream` 的待遇」。
+       *
+       * 以前只有 `/stream` **真拉到音频字节**后才写（见下方 setStreamUrl 的调用），
+       * 而 `/url` 这条最常走的路径从不写。可 V2.114 起客户端走本地 `AudioProxy`
+       * 直连 CDN，基本不碰 `/stream` —— 结果这条缓存**几乎永远不会被写入**，
+       * 每首歌每次都把「插件池解析」重跑一遍（实测 2~4 秒）。
+       *
+       * ⚠ 条件必须带 `!r.unverified`：`fast=1` 模式下服务端**一个字节都没探过**，
+       * 写进去等于让下一次直接拿到一条死链 —— 那比不缓存更糟（客户端会把它当
+       * 唯一地址试，然后才降级，白白多花一轮）。只有不带 fast 那一趟
+       * （`resolvePlayableUrl` 逐条 Range 探测通过）才配写。
+       */
+      if (!r.unverified) setStreamUrl(env, candKey, r.url)
       return json({ ok: true, url: r.url, urls: r.urls || null, from: r.from, verified: !r.unverified, tried: r.tried })
     }
 

@@ -292,11 +292,15 @@ ok('edgeCache 支持主动作废（坏了要能立刻丢，不然顶满整个 TT
 ok('/stream 在**真的取到字节之后**才写直链缓存', /if \(r\.url\) setStreamUrl\(env, candKey, r\.url\)/.test(API))
 ok('/stream 缓存那条失败时立刻作废', /if \(fromUrlCache\) dropStreamUrl\(env, candKey\)/.test(API))
 ok('/url 先读直链缓存（命中即秒回，不再解析一遍）',
-  /const cachedUrl = await getStreamUrl\(env, candKey\)/.test(API))
+  /const cachedUrl = noCache \? null : await getStreamUrl\(env, candKey\)/.test(API))
+ok('⚠ /url 支持 nocache=1 强制跳过缓存（缓存那条死了要能绕出来）',
+  /const noCache = url\.searchParams\.get\('nocache'\) === '1'/.test(API))
 ok('⚠ /url 命中缓存时仍按宿主能力筛协议（网页里 http 会被混合内容拦掉，交了等于白试）',
   // 这条断言看**带注释的原文**：deComment 不认正则字面量，
   // `\/\/` 会被它当成行注释开头，把整行后半截吃掉（见下方 DECOMMENT 说明）。
-  API_SRC.includes("if (cachedUrl && (/^https:\\/\\//i.test(cachedUrl) || allowHttpAudio()))"))
+  API_SRC.includes("if (cachedUrl && (/^https:\\/\\//i.test(cachedUrl) || allowHttp))"))
+ok('★ 宿主能力可由客户端声明（http=1）—— 否则 CF 上缓存里的 http 直链永远读不出来',
+  /const allowHttp = allowHttpAudio\(\) \|\| url\.searchParams\.get\('http'\) === '1'/.test(API))
 ok('/stream 也读它，且 retry=1 时不吃（降级重试要换一批）',
   /if \(!isRetry && !preferUrls\) \{[\s\S]{0,200}getStreamUrl\(env, candKey\)/.test(API))
 ok('⚠ 命中直链缓存时**不**跳过常规候选列表（它可能已过期，要留退路）',
@@ -305,8 +309,19 @@ ok('tryCandidates 回传实际用的地址（否则无从写入缓存）', /url:
 ok('player.js 的降级重试标记仍在（retry=1 是这条链的第二道保险）', /if \(attempt\) qs\.set\('retry', '1'\)/.test(PLAYER_SRC))
 
 // ---- 负向：未验证的候选不许进直链缓存
-ok('⚠ 未验证的候选（/url?fast=1 那一批）不进直链缓存 —— 只 setStreamCand',
-  !/setStreamUrl\(env, candKey, r\.urls/.test(API) && /if \(r\.url\) setStreamCand\(candKey/.test(API))
+ok('⚠ 未验证的候选（/url?fast=1 那一批）不进直链缓存',
+  !/setStreamUrl\(env, candKey, r\.urls/.test(API)
+  && /if \(!r\.unverified\) setStreamUrl\(env, candKey, r\.url\)/.test(API))
+
+/**
+ * ★ /url 也必须写直链缓存（2026-10-23）。
+ *
+ * 以前只有 `/stream` 真拉到字节后才写，可 V2.114 起客户端走本地 AudioProxy
+ * 直连 CDN，基本不碰 `/stream` —— 那条缓存**几乎永远不会被写入**，
+ * 每首歌每次都重跑插件（实测 2~4 秒）。这条断言就是钉住「/url 也写」。
+ */
+ok('★ /url 解析成功后也写直链缓存（否则 AudioProxy 直连链路永远不写它）',
+  /if \(!r\.unverified\) setStreamUrl\(env, candKey, r\.url\)/.test(API))
 
 console.log('\n===== edge-cache：' + pass + ' 通过 / ' + fails.length + ' 失败 =====')
 if (fails.length) console.log('失败项：\n  - ' + fails.join('\n  - '))
