@@ -33,6 +33,16 @@ export default {
     // waitUntil 挂到 env 上：/api/home 发现当天每日推荐还没生成时，
     // 用它把「后台生成」挂到请求生命周期上（响应先回，生成继续跑）。
     env.waitUntil = (p) => ctx.waitUntil(p)
+    /**
+     * 本次请求的 origin，给边缘缓存的 key 用。
+     *
+     * ⚠ 不能省：CF 的 `caches.default.put()` 要求 request 的 URL 属于**当前 zone**，
+     * 否则直接抛异常。api.js 里原本用 `https://lx.cache.internal/…` 当 key，
+     * 那个 host 不属于任何 zone → put 全部静默失败（异常被 catch 吞掉）→
+     * **整个 edgeCache 从来没生效过**（2026-10-23 实测：播放直链写入后连打 4 次
+     * 全不命中）。有了 origin，api.js 的 `cacheKey()` 就能把 host 换成本 zone 的。
+     */
+    env.__origin = new URL(request.url).origin
 
     try {
       if (path === '/rest' || path.startsWith('/rest/')) {

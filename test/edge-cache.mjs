@@ -104,15 +104,28 @@ function buildEnv() {
   const singleFlight = new Map()
   const once = new Function('singleFlight', `return function once(key, run) {${ONCE_BODY}}`)(singleFlight)
   const store = new Map()
+  /**
+   * 替身必须跟真实实现一样**兼容两种签名**（`match(key)` 与 `match(env, key)`）。
+   *
+   * 2026-10-23 起真实实现要 env 来把 cache key 的 host 换成本 zone 的 origin
+   * （CF 的 caches.default.put 拒绝跨 zone 的 key，见 api.js 里 cacheKey 的说明）。
+   * 替身不认新签名的话，抽出来的 cachedEdgeJson 传 (env, key) 就会让
+   * store.get(undefined) 永远 miss —— 所有「命中」类断言会莫名其妙全红。
+   */
   const edgeCache = {
     store,
-    async match(key) {
+    async match(a, b) {
+      const key = b === undefined ? a : b
       const body = store.get(key.url)
       if (body === undefined) return undefined
       return new Response(body, { headers: { 'Content-Type': 'application/json' } })
     },
-    async put(key, res) { store.set(key.url, await res.text()) },
-    async delete(key) { store.delete(key.url) },
+    async put(a, b, c) {
+      const key = c === undefined ? a : b
+      const res = c === undefined ? b : c
+      store.set(key.url, await res.text())
+    },
+    async delete(a, b) { store.delete((b === undefined ? a : b).url) },
   }
   const cachedEdgeJson = new Function(
     'edgeCache', 'once', 'JSON_CACHE_BASE', 'Request', 'Response',
@@ -282,13 +295,29 @@ ok('直链缓存有独立 TTL 常量', /const STREAM_URL_TTL = \d+ \* 60 \* 1000
   ok('TTL 控制在 30 分钟以内（直链会过期，缓存久了等于缓存坏地址）', ttl > 0 && ttl <= 30, `${ttl} 分钟`)
 }
 ok('直链缓存走 edgeCache（跨 isolate），不是只活在进程内',
-  /STREAM_URL_BASE/.test(API) && /edgeCache\.match\(new Request\(STREAM_URL_BASE/.test(API)
-  && /edgeCache\.put\(new Request\(STREAM_URL_BASE/.test(API))
+  /STREAM_URL_BASE/.test(API) && /edgeCache\.match\(env, new Request\(STREAM_URL_BASE/.test(API)
+  && /edgeCache\.put\(env, new Request\(STREAM_URL_BASE/.test(API))
 ok('写缓存挂在 waitUntil 上（不拖慢本次响应、也不会不等它）',
   /setStreamUrl[\s\S]{0,700}env\.waitUntil\(put\)/.test(API))
 ok('内存 Map 有容量上限（不许无限涨）', /STREAM_URL_MAX = \d+/.test(API) && /streamUrlMem\.size > STREAM_URL_MAX/.test(API))
 
-ok('edgeCache 支持主动作废（坏了要能立刻丢，不然顶满整个 TTL）', /async delete\(key\)/.test(API))
+ok('edgeCache 支持主动作废（坏了要能立刻丢，不然顶满整个 TTL）', /async delete\(a, b\)/.test(API))
+
+/**
+ * ★ cache key 的 host 必须换成本 zone 的 origin（2026-10-23）。
+ *
+ * CF 的 `caches.default.put()` 拒绝不属于当前 zone 的 URL 作为 key ——
+ * 原来全用 `https://lx.cache.internal/…`，put 全部静默失败，
+ * **整个 edgeCache 从来没生效过**（实测：播放直链写入后连打 4 次全不命中）。
+ * 这条断言钉住「key 会被重写」，否则那天又会悄悄退回去。
+ */
+ok('★ 缓存 key 的 host 换成本次请求的 origin（CF 拒绝跨 zone 的 key）',
+  /function cacheKey\(env, key\)/.test(API)
+  && /origin \+ '\/__edgecache' \+ rest/.test(API))
+ok('★ 宿主把 origin 注入 env（不注入就等于没修）',
+  /env\.__origin = new URL\(request\.url\)\.origin/.test(read('src/index.js')))
+ok('★ 所有 edgeCache 调用点都传了 env（漏一处那处就不生效）',
+  !/edgeCache\.(match|put|delete)\((?!env,)/.test(API))
 ok('/stream 在**真的取到字节之后**才写直链缓存', /if \(r\.url\) setStreamUrl\(env, candKey, r\.url\)/.test(API))
 ok('/stream 缓存那条失败时立刻作废', /if \(fromUrlCache\) dropStreamUrl\(env, candKey\)/.test(API))
 ok('/url 先读直链缓存（命中即秒回，不再解析一遍）',

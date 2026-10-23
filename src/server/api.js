@@ -367,20 +367,75 @@ function bad(message, status = 400) {
 const memEdgeCache = new Map()
 const EDGE_CACHE_MAX = 200
 
+/**
+ * 内部缓存 key 的 host 必须换成**本次请求的 origin**。
+ *
+ * ⚠ 这是 2026-10-23 才查出来的真问题，影响面比它看起来大得多：
+ *
+ * CF 的 `caches.default.put()` 要求 request 的 URL 属于**当前 zone**，
+ * 不属于就直接抛异常。原来这里（以及 `cachedEdgeJson` / `cachedToplists` /
+ * `cachedHomeFallback` / `streamUrlCache`）全用 `https://lx.cache.internal/…`
+ * 当 key —— 那个 host 不属于任何 zone，于是 put **全部静默失败**
+ * （异常被 `catch { return }` 吞掉，一点痕迹都不留）。
+ *
+ * 后果：**整个 edgeCache 从来没生效过**。判据（实测）：
+ *   · 播放直链：`/url` 写入后等 5 秒，连打 4 次 `/url?fast=1` 全部未命中
+ *     （`from` 还是插件名，每次 2.8~4.8 秒重新解析）；
+ *   · chart / album / lyric / home 每次都回源，只有进程内 `once()` 单飞
+ *     在同一个 isolate 内顶一下 —— 换一个 isolate 就等于没缓存。
+ *
+ * 用当前请求的 origin 拼 key 就合法了。`env.__origin` 由宿主注入
+ * （CF 见 src/index.js）。Docker / 本地没有 `caches`，走 `memEdgeCache`，
+ * 那里 key 只是个 Map 键，host 换成什么都无所谓。
+ *
+ * 路径加 `/__edgecache` 前缀只是为了让日志里一眼看出这是内部 key ——
+ * `cache.put` 是显式写入，不受 zone 的 Cache Rules 影响，所以这个路径
+ * 不需要真实存在。
+ */
+const CACHE_KEY_HOST = 'lx.cache.internal'
+
+function cacheKey(env, key) {
+  const origin = (env && env.__origin) || ''
+  if (!origin || !key || key.url.indexOf(CACHE_KEY_HOST) < 0) return key
+  const rest = key.url.slice(key.url.indexOf(CACHE_KEY_HOST) + CACHE_KEY_HOST.length)
+  try {
+    return new Request(origin + '/__edgecache' + rest, { method: 'GET' })
+  } catch {
+    return key   // origin 拼不出合法 URL（替身/测试）→ 用原 key
+  }
+}
+
+/**
+ * 兼容两种签名：`edgeCache.match(key)` 与 `edgeCache.match(env, key)`。
+ *
+ * 老调用点没传 env 时按原样用 key —— 行为与改造前完全一致，
+ * 所以漏改一处也不会崩，只是那一处仍旧不生效（CF 上）。
+ */
+function edgeArgs(a, b) {
+  return b === undefined ? [null, a] : [a, b]
+}
+
 const edgeCache = {
-  async match(key) {
+  async match(a, b) {
+    const [env, key] = edgeArgs(a, b)
+    const k = cacheKey(env, key)
     const c = globalThis.caches && globalThis.caches.default
-    if (c) { try { return await c.match(key) } catch { return undefined } }
-    const hit = memEdgeCache.get(key.url)
+    if (c) { try { return await c.match(k) } catch { return undefined } }
+    const hit = memEdgeCache.get(k.url)
     return hit ? hit.clone() : undefined
   },
-  async put(key, res) {
+  async put(a, b, c2) {
+    // 三参数 = (env, key, res)；两参数 = (key, res)
+    const env = c2 === undefined ? null : a
+    const key = c2 === undefined ? a : b
+    const res = c2 === undefined ? b : c2
+    const k = cacheKey(env, key)
     const c = globalThis.caches && globalThis.caches.default
-    if (c) { try { return await c.put(key, res) } catch { return } }
+    if (c) { try { return await c.put(k, res) } catch { return } }
     if (memEdgeCache.size > EDGE_CACHE_MAX) {
-      for (const k of Array.from(memEdgeCache.keys()).slice(0, EDGE_CACHE_MAX / 2)) memEdgeCache.delete(k)
+      for (const kk of Array.from(memEdgeCache.keys()).slice(0, EDGE_CACHE_MAX / 2)) memEdgeCache.delete(kk)
     }
-    memEdgeCache.set(key.url, res.clone())
+    memEdgeCache.set(k.url, res.clone())
   },
   /**
    * 主动作废一条。
@@ -390,10 +445,12 @@ const edgeCache = {
    * 每个请求都会先试它一遍、白花一次往返。只用于「已知这条坏了」的场景，
    * 不做批量清空（那会把跨 isolate 的收益一起清掉）。
    */
-  async delete(key) {
+  async delete(a, b) {
+    const [env, key] = edgeArgs(a, b)
+    const k = cacheKey(env, key)
     const c = globalThis.caches && globalThis.caches.default
-    if (c) { try { return await c.delete(key) } catch { return } }
-    memEdgeCache.delete(key.url)
+    if (c) { try { return await c.delete(k) } catch { return } }
+    memEdgeCache.delete(k.url)
   },
 }
 
@@ -544,7 +601,7 @@ async function cachedEdgeJson(env, keyUrl, ttlMs, compute, opts = {}) {
   let stale = null
   let hasStale = false
   try {
-    const hit = await edgeCache.match(key)
+    const hit = await edgeCache.match(env, key)
     if (hit) {
       const rec = await hit.json()
       if (rec && typeof rec.ts === 'number' && rec.data !== undefined) {
@@ -561,7 +618,7 @@ async function cachedEdgeJson(env, keyUrl, ttlMs, compute, opts = {}) {
     if (cacheable(data)) {
       const rec = { ts: Date.now(), ttl: ttlFor ? ttlFor(data) : ttlMs, data }
       try {
-        await edgeCache.put(key, new Response(JSON.stringify(rec), {
+        await edgeCache.put(env, key, new Response(JSON.stringify(rec), {
           headers: { 'Content-Type': 'application/json' },
         }))
       } catch { /* 缓存写失败不影响本次返回 */ }
@@ -578,14 +635,16 @@ async function cachedEdgeJson(env, keyUrl, ttlMs, compute, opts = {}) {
   return run()
 }
 
-async function cachedToplists() {
-  return once('toplists/wy', cachedToplistsUncached)
+async function cachedToplists(env) {
+  // ⚠ 必须包一层箭头函数：`once` 缓存的是 Promise，而 env 要透传给
+  //    `cachedToplistsUncached`（它要用 env.__origin 拼 cache key）。
+  return once('toplists/wy', () => cachedToplistsUncached(env))
 }
 
-async function cachedToplistsUncached() {
+async function cachedToplistsUncached(env) {
   const key = new Request('https://lx.cache.internal/toplists/wy', { method: 'GET' })
   try {
-    const hit = await edgeCache.match(key)
+    const hit = await edgeCache.match(env, key)
     if (hit) {
       const rec = await hit.json()
       if (rec && Array.isArray(rec.list) && rec.list.length
@@ -598,7 +657,7 @@ async function cachedToplistsUncached() {
   const list = await withDeadline(fetchToplists(), TOPLISTS_DEADLINE_MS, [])
   if (Array.isArray(list) && list.length) {
     try {
-      await edgeCache.put(key, new Response(JSON.stringify({ ts: Date.now(), list }), {
+      await edgeCache.put(env, key, new Response(JSON.stringify({ ts: Date.now(), list }), {
         headers: { 'Content-Type': 'application/json' },
       }))
     } catch { /* 缓存写失败不影响本次返回 */ }
@@ -664,7 +723,7 @@ async function cachedHomeFallback(env, db) {
 async function cachedHomeFallbackByKey(env, keyword, sources, key) {
   let stale = null
   try {
-    const hit = await edgeCache.match(key)
+    const hit = await edgeCache.match(env, key)
     if (hit) {
       const rec = await hit.json()
       const ttl = (rec && rec.ttl) || HOME_FALLBACK_TTL_MS
@@ -681,7 +740,7 @@ async function cachedHomeFallbackByKey(env, keyword, sources, key) {
   const compute = async () => {
     const errors = []
     const [charts, parsed] = await Promise.all([
-      cachedToplists(),
+      cachedToplists(env),
       Promise.resolve(parseQuery(keyword, sources, pluginSearchSourceKeys(env))),
     ])
 
@@ -699,7 +758,7 @@ async function cachedHomeFallbackByKey(env, keyword, sources, key) {
     if (hot.length) {
       const ttl = charts.length ? HOME_FALLBACK_TTL_MS : HOME_FALLBACK_SHORT_TTL_MS
       try {
-        await edgeCache.put(key, new Response(JSON.stringify({ ts: Date.now(), ttl, keyword, charts, hot }), {
+        await edgeCache.put(env, key, new Response(JSON.stringify({ ts: Date.now(), ttl, keyword, charts, hot }), {
           headers: { 'Content-Type': 'application/json' },
         }))
       } catch { /* 缓存写失败不影响本次返回 */ }
@@ -944,7 +1003,7 @@ async function getStreamUrl(env, key) {
     streamUrlMem.delete(key)
   }
   try {
-    const hit = await edgeCache.match(new Request(STREAM_URL_BASE + key, { method: 'GET' }))
+    const hit = await edgeCache.match(env, new Request(STREAM_URL_BASE + key, { method: 'GET' }))
     if (hit) {
       const rec = await hit.json()
       if (rec && rec.url && typeof rec.ts === 'number' && Date.now() - rec.ts < STREAM_URL_TTL) {
@@ -960,7 +1019,7 @@ function setStreamUrl(env, key, url) {
   if (!key || !url) return
   const ts = Date.now()
   streamUrlMemSet(key, ts, url)
-  const put = edgeCache.put(new Request(STREAM_URL_BASE + key, { method: 'GET' }),
+  const put = edgeCache.put(env, new Request(STREAM_URL_BASE + key, { method: 'GET' }),
     new Response(JSON.stringify({ ts, url }), { headers: { 'Content-Type': 'application/json' } }))
     .catch(() => { /* 缓存写失败不影响播放 */ })
   try { if (env && env.waitUntil) env.waitUntil(put) } catch { /* 自由跑完即可 */ }
@@ -970,7 +1029,7 @@ function setStreamUrl(env, key, url) {
 function dropStreamUrl(env, key) {
   if (!key) return
   streamUrlMem.delete(key)
-  const del = edgeCache.delete(new Request(STREAM_URL_BASE + key, { method: 'GET' }))
+  const del = edgeCache.delete(env, new Request(STREAM_URL_BASE + key, { method: 'GET' }))
     .catch(() => { /* 删不掉也只是多试一次 */ })
   try { if (env && env.waitUntil) env.waitUntil(del) } catch { /* 自由跑完即可 */ }
 }
@@ -1103,7 +1162,7 @@ export async function handleApi(request, env, url) {
         // 用户主动点进「今日推荐」页时仍走同步等（`/daily` 的 14s 预算）——
         // 那一页是专门进来看推荐的，等得起。
         const [charts, dstale] = await Promise.all([
-          cachedToplists(),
+          cachedToplists(env),
           regenDailyIfStale(env, daily, songForWeb, { sync: false, budgetMs: HOME_REQUERY_BUDGET_MS }),
         ])
         if (dstale) {
@@ -1197,7 +1256,7 @@ export async function handleApi(request, env, url) {
 
     /* ---- 全部榜单列表 ---- */
     if (path === '/charts') {
-      const charts = await cachedToplists()
+      const charts = await cachedToplists(env)
       return json({ ok: true, list: charts.filter(c => c.cover) })
     }
 
