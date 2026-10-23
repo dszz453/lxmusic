@@ -101,10 +101,16 @@ jobs:
             --user 1000:1000 \
             -e LX_SESSION_SECRET=ci-secret \
             -e LX_SCORE_INTERVAL=off \
+            -e LX_WARM_INTERVAL=5s \
             lxmusic:ci
         # LX_SCORE_INTERVAL=off：CI 里没必要真跑一轮评分（要几分钟，
         # 而且会去打第三方音源站）。评分的真机验收在 test/rescore-docker.mjs，
         # 按需手动跑。
+        #
+        # LX_WARM_INTERVAL=5s：**故意压到 5 秒**，好让 test/server-node.mjs 第 9 节
+        # 真能等到一轮心跳、断言 ticks 增长。用默认 25 秒的话那一节会显式跳过 ——
+        # 跳过不是通过，保活心跳是这次专门为「静默后第一发要十几秒」加的，
+        # CI 里至少要证明它真的在跳。
 
       - name: 等健康检查通过
         run: |
