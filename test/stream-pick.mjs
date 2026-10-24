@@ -376,6 +376,58 @@ check('⚠ 未验证的候选不配关掉完整候选列表（否则整首歌被
   && /let preferVerified = candHit \? candHit\.verified === true : false/.test(apiCode)
   && /preferVerified = !pre\.unverified/.test(apiCode))
 
+/**
+ * ============ 9. `/url?fast=1` 也必须有跨平台兜底（2026-10-24） ============
+ *
+ * 客户端的播放顺序是「先 `/url?fast=1` 直连，失败才降级 `/api/stream`」。
+ * 而跨源逻辑原来只写在 `openAudioStream` 里 —— 意味着用户要先把那条注定
+ * 失败的路走完（实测 QQ 有声书 25~33 秒）才有机会摸到跨源。
+ *
+ * 这张专辑（李哪吒惊奇毕业旅，234 集）在酷狗那边是 13/13 全播的，
+ * 本来 1 秒就该出声。所以兜底必须前移到 `/url`。
+ */
+const fastFn = SRC.slice(SRC.indexOf('export async function resolveMusicUrlFast'))
+const fastBody = fastFn.slice(0, fastFn.indexOf('\n}\n') + 3)
+
+check('★ /url 那条解析链（resolveMusicUrlFast）里有跨源兜底调用',
+  /crossSourceResolveFast\(song, quality, pluginPool, tried\)/.test(fastBody))
+
+check('★ 「一条候选都没得交」时立刻跨源（不等客户端去啃 /stream）',
+  /if \(!soft\.length\)[\s\S]{0,220}crossSourceResolveFast/.test(fastBody))
+
+check('⚠ 有候选但没探通时，只有「服务端真拉过并否掉」才跨源（探测没跑完不跨，否则正常歌白等 2.5 秒）',
+  /const hardFail = cands\.some\(\(x\) => x\.notAudio \|\| \(x\.ok === false && x\.status\)\)/.test(fastBody))
+
+check('⚠ 跨源递归必须带 allowCrossSource: false（否则源站互相找不到时来回打转）',
+  /allowCrossSource: false/.test(SRC))
+
+check('⚠ 跨源搜索超时不能写死 4 秒（会把 /url?fast=1 拖长），必须由调用方按预算压紧',
+  /async function crossSourceSongs\(song, limit = 2, searchTimeout = 4000\)/.test(SRC)
+  && /Math\.max\(1200, budgetMs - 1500\)/.test(SRC))
+
+check('⚠ 跨源搜索不能只给 1.6 秒（CF 出口上酷狗/酷我要 3 秒，实测会把唯一能命中的平台掐掉）',
+  /budgetMs = 5000/.test(SRC) && !/budgetMs = 2500/.test(SRC))
+
+check('⚠ 备选曲目的预算必须明显小于剩余预算（否则会一直等探测通过，实测白等 3.2 秒）',
+  /const altBudget = Math\.min\(left, 2200\)/.test(SRC)
+  && /totalBudget: altBudget/.test(SRC)
+  && /deadline: Math\.min\(left, 1800\)/.test(SRC))
+
+check('⚠ 跨源结果不再重复探测（递归那一趟已经探过；CF 连不上酷我 CDN，再探只多花 1.2 秒）',
+  !/probeAudioDetail\(r\.url, \d+\)/.test(SRC))
+
+check('⚠ 跨源搜索必须逐源并发、首个命中即收工（合在一起搜要等最慢的平台 9~10 秒）',
+  /const jobs = sources\.map\(async \(src\) =>/.test(SRC)
+  && /await Promise\.race\(\[Promise\.all\(jobs\), firstHit\]\)/.test(SRC))
+
+check('⚠ 两个备选平台要并发解析（串行时第一个吃光预算，第二个永远 left<600 被 break）',
+  /const attempts = await Promise\.all\(alts\.map/.test(SRC)
+  && /const hit = attempts\.find\(Boolean\)/.test(SRC))
+
+check('⚠ 预筛已跨过源时，openAudioStream 不许再跨一次（重复一次全平台搜索 = 白等 2 秒）',
+  /allowCrossSource: !preResolved/.test(apiCode)
+  && /let preResolved = false/.test(apiCode))
+
 console.log('\n===== stream-pick：' + pass + ' 通过 / ' + fail + ' 失败 =====')
 if (failures.length) console.log('失败项：\n  - ' + failures.join('\n  - '))
 process.exit(fail ? 1 : 0)

@@ -97,12 +97,48 @@ async function readHeadBytes(res, n = 12) {
   return out
 }
 
-/** 标题归一化：去掉括号补充说明与标点，用于跨平台同名匹配 */
+/**
+ * 标题归一化：去掉括号补充说明与标点，用于跨平台同名匹配。
+ *
+ * ⚠ 分隔符表里必须有**全角竖线 `｜` 和「丨」**（U+FF5C / U+4E28）。
+ * 有声书标题普遍用它们当集号分隔（`李哪吒惊奇毕业旅丨33 都是因为爱`），
+ * 而 QQ 侧写 `丨`、酷狗侧写 `｜` 是常事 —— 不归一化就永远匹配不上，
+ * 「QQ 返回的放不出来」里有一半是这么来的。
+ */
 function normTitle(name) {
   return decodeName(String(name || ''))
     .toLowerCase()
     .replace(/[（(\[【{].*?[)）\]】}]/g, '')
-    .replace(/[\s\-_·、,，.。!！?？'"“”‘’&+]/g, '')
+    .replace(/[\s\-_·、,，.。!！?？'"“”‘’&+｜丨|:：\/]/g, '')
+}
+
+/**
+ * 两个标题是不是「同一首」。
+ *
+ * 精确同名之外，还要认**歌手名被塞进标题**这种（酷狗常干）：
+ *   QQ  : `李哪吒惊奇毕业旅丨33 都是因为爱`
+ *   酷狗: `东海小学广播站、喜马拉雅 - 李哪吒惊奇毕业旅丨33 都是因为爱`
+ * 归一化后后者 = 前者的「前缀 + 歌手名」，所以判据是
+ * 「一方是另一方的前/后缀延长，且多出来的那截正好是歌手名」。
+ *
+ * ⚠ 不能放宽成任意「包含」：同专辑的 `…丨1 出发` 与 `…丨10 出发` 会互相包含，
+ * 那就会播错集。多出来的那截必须能被歌手名解释，这条约束就是防它的。
+ */
+export function sameTitle(a, b, singer) {
+  const x = normTitle(a)
+  const y = normTitle(b)
+  if (!x || !y) return false
+  if (x === y) return true
+  const [s, l] = x.length <= y.length ? [x, y] : [y, x]
+  if (s.length < 6) return false          // 太短的一律不做包含判断
+  let extra = ''
+  if (l.startsWith(s)) extra = l.slice(s.length)
+  else if (l.endsWith(s)) extra = l.slice(0, l.length - s.length)
+  else return false
+  if (!extra) return true
+  const who = normTitle(singer)
+  if (!who) return false
+  return who.includes(extra) || extra.includes(who)
 }
 
 function singerTokens(singer) {
@@ -112,8 +148,22 @@ function singerTokens(singer) {
     .filter(Boolean)
 }
 
-/** 跨平台找同名歌曲（最多 limit 首），按歌手是否重合排序 */
-async function crossSourceSongs(song, limit = 2) {
+/**
+ * 跨平台找同名歌曲（最多 limit 首），按歌手是否重合排序。
+ *
+ * @param {number} searchTimeout 单个平台的搜索超时（毫秒）。
+ *   `/stream` 那条兜底可以给 4000（用户已经在等了）；`/url?fast=1` 那条
+ *   走的是「点开就要出声」的路径，必须给得更紧。
+ *
+ * ── 为什么逐源分开搜、而不是一次 `searchOnline` 搜全部 ──────────────
+ * `searchOnline` 内部是 `Promise.all`：它要等**最慢的那个平台**。
+ * 实测同一首歌，酷狗 0.6~3 秒就给出精确同名结果，而酷我/虾米经常 9~10 秒
+ * （在 CF 出口上更糟）。合在一起搜 = 为了一个 1 秒就到的答案等 3.5 秒。
+ *
+ * 现在逐源并发，**第一个给出匹配的平台立刻收工**，剩下的不再等。
+ * 命中质量不变（仍然是同一套 `sameTitle` 过滤 + 同一套排序）。
+ */
+async function crossSourceSongs(song, limit = 2, searchTimeout = 4000) {
   const wanted = normTitle(song.name)
   if (!wanted) return []
   const tokens = singerTokens(song.singer)
@@ -121,21 +171,38 @@ async function crossSourceSongs(song, limit = 2) {
   if (!keyword) return []
 
   const sources = ALL_SOURCES.filter(s => s !== song.source)
-  let list = []
-  try {
-    // 跨源是「兜底」，用户已经在等了，所以给搜索一个更紧的超时（默认 7s 太长）
-    const res = await searchOnline(keyword, { sources, limit: 24, timeout: 4000 })
-    list = res.list || []
-  } catch {
-    return []
-  }
+  const found = []
+  let release = null
+  const firstHit = new Promise((res) => { release = res })
 
-  return list
-    .filter(s => s && s.id && normTitle(s.name) === wanted)
+  const jobs = sources.map(async (src) => {
+    let list = []
+    try {
+      const res = await searchOnline(keyword, { sources: [src], limit: 24, timeout: searchTimeout })
+      list = res.list || []
+    } catch {
+      return
+    }
+    const hit = list.filter(s => s && s.id && sameTitle(s.name, song.name, song.singer))
+    if (!hit.length) return
+    // 已有命中 → 其余平台不必再等（但已在飞行的请求不取消，它们自己会结束）
+    if (found.length === 0) { found.push(...hit); release() }
+  })
+
+  try {
+    // 谁先命中谁结束；全都没命中就等最慢的那个自己超时
+    await Promise.race([Promise.all(jobs), firstHit])
+  } catch { /* 单源失败不影响其它源 */ }
+
+  return found
     .sort((a, b) => {
       const sa = tokens.some(t => (singerTokens(a.singer)).includes(t)) ? 1 : 0
       const sb = tokens.some(t => (singerTokens(b.singer)).includes(t)) ? 1 : 0
-      return sb - sa
+      if (sb !== sa) return sb - sa
+      // 同名时**优先完全一致的那条**：`…丨33 都是因为爱` 比 `…丨33 都是因为爱（重制）` 更该先试
+      const ea = normTitle(a.name) === normTitle(song.name) ? 1 : 0
+      const eb = normTitle(b.name) === normTitle(song.name) ? 1 : 0
+      return eb - ea
     })
     .slice(0, limit)
 }
@@ -146,6 +213,15 @@ async function crossSourceSongs(song, limit = 2) {
  * 实测把一次代理取流从 1 秒拖到 19 秒（kg 的第三方中转源）。超时即换下一个。
  */
 const CANDIDATE_TIMEOUT = 6000
+
+/**
+ * 整条取流解析链的总预算（毫秒）。
+ *
+ * 有可用源的歌实测 0.6~3 秒就出结果；10 秒还没结果基本就是「这首歌没源」。
+ * 以前没有这个上限，14 个候选串行 × 6 秒 = 40 秒，客户端只能干等。
+ * 见 openAudioStream 里的说明。
+ */
+const STREAM_BUDGET_MS = 10000
 
 async function tryCandidates(thunks, song, errors, seen, opts) {
   for (const thunk of thunks) {
@@ -242,6 +318,33 @@ async function tryCandidates(thunks, song, errors, seen, opts) {
  * @returns {Promise<{ok:boolean, response?:Response, from?:string, error?:string, errors?:string[]}>}
  */
 export async function openAudioStream(song, quality, pluginPool, opts = {}) {
+  /**
+   * ★ 整条解析链的**总预算**（2026-10-24 加）。
+   *
+   * 病根是实测出来的：一张喜马拉雅有声书专辑（QQ 平台）的曲目，
+   * 插件池里 14 个候选只有 3 个能返回地址、且全是中转站假音源。
+   * 串行试完这些候选要 **31~42 秒**（每个候选 `CANDIDATE_TIMEOUT` 6 秒，
+   * 中间还夹着跨平台兜底的一次全平台搜索）。
+   * 客户端那边看到的就是「一直在解析资源，播放不出来」——它默认超时 40 秒，
+   * 正好卡在边界上，所以有时超时、有时勉强返回 502。
+   *
+   * 现在给整条链一个硬预算：到点就明确回「解析超时」。
+   * 客户端拿到 502 会立刻提示 + 跳下一首，而不是干等 40 秒。
+   *
+   * 为什么是 10 秒：正常歌曲（有可用源）实测 0.6~3 秒就返回，
+   * 10 秒已经覆盖了「插件慢但能用」的全部情况；再等下去只可能是没源。
+   */
+  const budgetMs = Math.max(2000, Math.min(Number(opts.budgetMs) || STREAM_BUDGET_MS, 30000))
+  let budgetTimer = null
+  const timedOut = new Promise((resolve) => {
+    budgetTimer = setTimeout(() => resolve({
+      ok: false,
+      errors: [],
+      error: `取流解析超过 ${Math.round(budgetMs / 1000)} 秒，已放弃（这首歌的源可能都已失效）`,
+    }), budgetMs)
+  })
+
+  const work = (async () => {
   const maxCandidates = Math.max(1, Math.min(Number(opts.maxCandidates) || 6, 12))
   const errors = []
   const seen = new Set()
@@ -267,6 +370,13 @@ export async function openAudioStream(song, quality, pluginPool, opts = {}) {
   if (result) return result
 
   return await crossSourceFallback(song, quality, pluginPool, opts, errors, seen)
+  })()
+
+  try {
+    return await Promise.race([work, timedOut])
+  } finally {
+    clearTimeout(budgetTimer)
+  }
 }
 
 /** 本平台全挂 → 跨平台搜同名歌曲（用户的诉求是「听到这首歌」，不是「必须来自酷狗」） */
@@ -308,13 +418,19 @@ async function crossSourceFallback(song, quality, pluginPool, opts, errors, seen
  *   · 其余（status 0 / 超时 / 4xx）—— 可能只是服务端出口不通，
  *     用户手机的网络未必不通，值得让客户端自己试一次。
  */
-export async function probeAudioDetail(url) {
+export async function probeAudioDetail(url, timeoutMs = 4000) {
   try {
     const res = await outboundFetch(url, {
       method: 'GET',
       // 12 字节：要能看出音频魔数，理由见 looksLikeAudioBytes
       headers: { 'User-Agent': BROWSER_UA, Range: 'bytes=0-11' },
       redirect: 'follow',
+      /*
+       * ⚠ 必须带超时。`outboundFetch` 底下就是裸 `fetch`，**默认永不超时** ——
+       * 一个「连上了但不吐数据」的中转源能把整条解析链挂死在这里。
+       * 实测 QQ 专辑那批候选里就有这种，导致 /api/stream 一次要 40 秒。
+       */
+      signal: AbortSignal.timeout(timeoutMs),
     })
     const ct = res.headers.get('content-type') || ''
     const head = await readHeadBytes(res, 12)
@@ -334,14 +450,23 @@ export async function probeAudioUrl(url) {
  * 解析出一个「已探测可用」的直链，供 /api/url 使用。
  * 只探测前几个候选，避免拖慢响应。
  */
-export async function resolvePlayableUrl(song, quality, pluginPool, { maxProbe = 4 } = {}) {
+export async function resolvePlayableUrl(song, quality, pluginPool, { maxProbe = 4, budgetMs = 8000 } = {}) {
   const thunks = musicUrlCandidateList(song, quality, pluginPool).slice(0, maxProbe)
   const tried = []
   if (!thunks.length) {
     return { url: null, from: null, tried, error: '当前歌曲来源没有启用取流插件' }
   }
+  const t0 = Date.now()
   const soft = []   // 解析出来了、但探测没能证明它是音频（网络原因）—— 可以兜底交出去
   for (const thunk of thunks) {
+    /*
+     * 总预算：这是 `/api/url` 的同步路径，用户正等着这一发拿地址。
+     * 没有预算时 4 个候选 × 每个最多 4 秒 = 16 秒，实测把一次 /url 拖到十几秒。
+     */
+    if (Date.now() - t0 > budgetMs) {
+      tried.push(`解析超预算（${budgetMs}ms），剩余候选已跳过`)
+      break
+    }
     let cand = null
     try { cand = await thunk() } catch { continue }
     if (!cand || !cand.url) continue
@@ -424,12 +549,14 @@ function hostMatches(url, list) {
  * 只探前 2 字节，判断这个地址是不是真音频、总长多少。
  * 用 Range 而不是完整 GET：单次约 120~240ms（实测），且不消耗源站流量。
  */
-async function probeAudioBytes(url) {
+async function probeAudioBytes(url, timeoutMs = 4000) {
   try {
     const res = await outboundFetch(url, {
       // ⚠ 12 字节而不是 2 字节：要看得出文件头魔数（见 looksLikeAudioBytes）
       headers: { 'User-Agent': BROWSER_UA, Accept: '*/*', Range: 'bytes=0-11' },
       redirect: 'follow',
+      // 同 probeAudioDetail：底层 fetch 默认永不超时，必须自己兜住
+      signal: AbortSignal.timeout(timeoutMs),
     })
     const contentType = res.headers.get('content-type') || ''
     const contentRange = res.headers.get('content-range') || ''
@@ -469,6 +596,117 @@ async function probeAudioBytes(url) {
  *   全部探测失败时不返回空，而是兜底给出第一个插件返回的 https 候选（unverified），
  *   让客户端自己试 —— 不会转而调用 provider 的官方直连接口。
  */
+/**
+ * `/url?fast=1` 这条路的跨平台兜底。
+ *
+ * ── 为什么这条兜底以前只长在 `/api/stream` 上，是个真漏洞 ──────────
+ * 客户端的播放顺序是「先 `/url?fast=1` 直连，失败才降级 `/api/stream`」。
+ * 而跨源逻辑（`crossSourceFallback`）只写在 `openAudioStream` 里 ——
+ * 也就是说**用户要先把那条注定失败的路走完**（实测 QQ 有声书 25~33 秒）
+ * 才有机会摸到跨源。可这张专辑在酷狗那边是 13/13 全播的，
+ * 本来 1 秒就能出声。
+ *
+ * 所以兜底必须前移到 `/url`：本平台候选一个都探不通时，立刻去别的平台
+ * 找同名曲目，用它的取流候选（那条链在酷狗侧是好的）。
+ *
+ * ⚠ 只在**彻底没戏**时才调用（全 notAudio，或一条都没探通），
+ * 有可用源时绝不走这里 —— 否则每首歌都白白多一次全平台搜索。
+ *
+ * @returns {Promise<object|null>} 命中则返回与 resolveMusicUrlFast 同形状的结果
+ */
+async function crossSourceResolveFast(song, quality, pluginPool, tried, budgetMs = 5000) {
+  const t0 = Date.now()
+  const perf = { search: 0, resolve: 0, probe: 0 }
+  let alts = []
+  try {
+    /**
+     * 搜索给到 3.5 秒。
+     *
+     * 早先给的是 1.6 秒，实测**在 CF 出口上不够**：酷狗 0.6~3 秒、酷我 3~10 秒，
+     * 1.6 秒经常把唯一能命中的那个平台直接掐掉 —— 表现就是「同一首歌，
+     * 有时能跨源成功、有时一条都找不到」，查了半天不是匹配逻辑的问题。
+     *
+     * 这条路只有「本平台彻底没戏」时才会走到，用户此时本来就在等，
+     * 多等 1~2 秒换「能播」是划算的；正常歌曲根本进不来。
+     */
+    alts = await crossSourceSongs(song, 3, Math.max(1200, budgetMs - 1500))
+  } catch {
+    return null
+  }
+  perf.search = Date.now() - t0
+  if (!alts.length) return null
+
+  /**
+   * 两个备选平台**并发**解析，不串行。
+   *
+   * 串行时第一个平台（常是酷狗，搜索就要 3 秒）会把预算吃光，
+   * 第二个平台永远只能拿到 `left < 600` 然后被 break 掉 —— 等于白找。
+   * 并发之后两边各自拿完整剩余预算，谁先出来用谁（仍按 alts 的优先级取）。
+   */
+  const left = budgetMs - (Date.now() - t0)
+  if (left < 600) return null
+  /**
+   * ⚠ 给备选曲目的预算要**明显小于 `left`**。
+   *
+   * 实测（`/url?perf=1`）：备选曲目的候选地址 1 毫秒就解析出来了，
+   * 可 `resolveMusicUrlFast` 会一直等到 `totalBudget` 才返回 —— 因为它在等
+   * 「探测通过」。而 CF 出口连酷我 CDN 根本连不通，探测注定超时，
+   * 于是白等满整个预算（实测 3.1~3.3 秒）。
+   *
+   * 跨源要的是「尽快拿到那条地址」，不是「在服务端证明它能出声」——
+   * 后者在 CF 上永远做不到，客户端手机侧自然会验。
+   * 所以这里只给 1.6 秒：够插件解析，也够探一次（能验就验，验不了就算了）。
+   */
+  const altBudget = Math.min(left, 2200)
+  const tResolve = Date.now()
+  const attempts = await Promise.all(alts.map(async (alt) => {
+    let r = null
+    try {
+      // 递归回到本函数解析备选曲目，但**禁止再跨源**（否则源站互相找不到时会来回打转）
+      r = await resolveMusicUrlFast(alt, quality, pluginPool, {
+        maxTries: 12,
+        deadline: Math.min(left, 1800),
+        probeDeadline: Math.min(1200, altBudget),
+        totalBudget: altBudget,
+        allowCrossSource: false,
+      })
+    } catch {
+      return null
+    }
+    if (!r || !r.url) return null
+    /**
+     * 这里**不再重复探测**。
+     *
+     * 递归那一趟已经按 `probeDeadline` 探过了：验得通就是 `verified`，
+     * 验不通就说明 CF 出口到那个 CDN 不通（酷我 CDN 就是这样）。
+     * 再探一次只会同样超时 —— 实测白白多花 1.2 秒，而判据一点没变。
+     *
+     * 能不能出声交给客户端手机侧判断：那条地址是 CDN 直链，
+     * 服务端探不通 ≠ 用户播不了（这一点和 `probeAudioDetail` 的注释是同一套口径）。
+     */
+    const verified = r.unverified !== true
+    return { alt, r, verified }
+  }))
+  perf.resolve = Date.now() - tResolve - perf.probe
+
+  const hit = attempts.find(Boolean)
+  if (!hit) return null
+  const { alt, r, verified } = hit
+  const srcName = (SOURCE_META[alt.source] && SOURCE_META[alt.source].name) || alt.source
+  tried.push(`本平台无可用源，已跨源命中「${srcName}」：${alt.name}`)
+  const wrap = (x) => ({ ...x, from: `跨源(${srcName}) ${x.from}` })
+  return {
+    urls: (r.urls && r.urls.length ? r.urls : [{ url: r.url, from: r.from }]).map(wrap),
+    url: r.url,
+    from: `跨源(${srcName}) ${r.from}`,
+    size: r.size || 0,
+    tried,
+    unverified: !verified,
+    crossSource: { source: alt.source, name: alt.name, singer: alt.singer },
+    crossPerf: perf,
+  }
+}
+
 export async function resolveMusicUrlFast(song, quality, pluginPool, options = {}) {
   // 宿主默认预算（网页紧、壳内宽），调用方传入的 options 优先 —— 见 http.js 的 resolveBudget
   const {
@@ -799,6 +1037,12 @@ export async function resolveMusicUrlFast(song, quality, pluginPool, options = {
    */
   const soft = cands.filter((x) => !x.notAudio)
   if (!soft.length) {
+    // 一条都没得交（全被证明是假音源）→ 立刻跨源，别让客户端去啃 /stream
+    if (options.allowCrossSource !== false) {
+      const tCross = Date.now()
+      const x = await crossSourceResolveFast(song, quality, pluginPool, tried)
+      if (x) return { ...x, perfMs: { primary: tCross - t0, cross: Date.now() - tCross } }
+    }
     return {
       urls: [],
       url: null,
@@ -807,6 +1051,20 @@ export async function resolveMusicUrlFast(song, quality, pluginPool, options = {
       error: '取流插件返回的地址都不是音频（中转站/错误页）',
       unverified: true,
     }
+  }
+  /**
+   * 有候选、但一条都没探通 —— 这时要不要跨源，判据必须收紧。
+   *
+   * 「没探通」有两种：① 服务端**真的拉过并被否掉**（假音源 / 4xx / 5xx）；
+   * ② 预算到点，探测压根没跑完（`status` 为 0）。②里绝大多数地址其实是好的，
+   * 只是慢 —— 对它做跨源等于给每首正常歌白加 2.5 秒。
+   * 所以只在出现 ① 时才跨源。
+   */
+  const hardFail = cands.some((x) => x.notAudio || (x.ok === false && x.status))
+  if (hardFail && options.allowCrossSource !== false) {
+    const tCross = Date.now()
+    const x = await crossSourceResolveFast(song, quality, pluginPool, tried)
+    if (x && x.url) return { ...x, perfMs: { primary: tCross - t0, cross: Date.now() - tCross } }
   }
   const ordered = soft.slice().sort(compareCandidates)
   return {

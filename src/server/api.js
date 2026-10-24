@@ -1477,6 +1477,8 @@ export async function handleApi(request, env, url) {
 
     /* ---- 播放地址（探测可用的直链，供客户端直接播放/下载） ---- */
     if (path === '/url') {
+      // 诊断用起点（`?perf=1` 时把总耗时一起吐出来，见下面的 perf 分支）
+      const perfT0 = Date.now()
       const song = decodeSongId(url.searchParams.get('id'))
       if (!song) return bad('无效歌曲 ID')
       const quality = url.searchParams.get('q') || '320k'
@@ -1552,6 +1554,26 @@ export async function handleApi(request, env, url) {
       // 记下来给 /stream 判断能不能拿它当唯一候选（见 /stream 的 preferVerified）。
       if (r.url) setStreamCand(candKey, r.urls && r.urls.length ? r.urls : [{ url: r.url, from: r.from }], !r.unverified)
       if (!r.url) return json({ ok: false, error: r.error || '无可用播放地址', errors: r.tried }, 404)
+      /**
+       * `?perf=1`：把这次解析的**分阶段耗时**一起吐出来。
+       *
+       * 为什么要有：`/url?fast=1` 是客户端起播的第一跳，「点开要等几秒」时
+       * 光看一个总数没法判断是插件慢、跨源搜索慢、还是探测超时在空等。
+       * 与 `/stream?debug=1` 是同一套思路 —— 不靠猜。
+       *
+       * 只加一个字段，不影响任何既有调用方（不带 `perf` 时行为完全不变）。
+       */
+      if (url.searchParams.get('perf') === '1') {
+        return json({
+          ok: true, url: r.url, urls: r.urls || null, from: r.from,
+          verified: !r.unverified, tried: r.tried,
+          perf: {
+            totalMs: Date.now() - perfT0,
+            ...(r.perfMs || {}),
+            ...(r.crossPerf ? { crossSearchMs: r.crossPerf.search, crossResolveMs: r.crossPerf.resolve, crossProbeMs: r.crossPerf.probe } : {}),
+          },
+        })
+      }
       /**
        * ★ 把这条直链写进 5 分钟缓存 —— 也就是「让 `/url` 也享受 `/stream` 的待遇」。
        *
@@ -1644,9 +1666,19 @@ export async function handleApi(request, env, url) {
           fromUrlCache = true
         }
       }
+      /**
+       * 这次预筛**有没有做过跨源尝试**。
+       *
+       * `resolveMusicUrlFast` 现在自带跨源兜底（V2.19 起，见 lib/stream.js 的
+       * `crossSourceResolveFast`）。预筛已经跑过一次跨源，`openAudioStream` 里
+       * 再跑一次就是纯重复 —— 多一次全平台搜索（1.5~2 秒）换同样的结果。
+       * 所以只在「预筛没跑过跨源」时才允许下游再跨。
+       */
+      let preResolved = false
       if (!preferUrls) {
         try {
           const pre = await resolveMusicUrlFast(song, quality, env.PLUGIN_POOL)
+          preResolved = true
           if (pre.urls && pre.urls.length) {
             preferUrls = pre.urls
             preferVerified = !pre.unverified
@@ -1657,6 +1689,8 @@ export async function handleApi(request, env, url) {
       const r = await openAudioStream(song, quality, env.PLUGIN_POOL, {
         rangeHeader,
         preferUrls,
+        // 预筛已跨过源 → 下游不必再跨（见 preResolved 的说明）
+        allowCrossSource: !preResolved,
         // ⚠ 只有**已验证**的候选才配关掉完整候选列表。
         // 已验证 = 服务端真的探通过字节，这批地址的命中率高，再铺一遍候选列表
         // 只是把预算花在重复解析上 —— 那正是 CF 上 502 的来源。
