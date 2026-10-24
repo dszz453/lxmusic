@@ -11,6 +11,7 @@ import {
 } from '../providers/index.js'
 import { songToSubsonic } from './subsonic.js'
 import { safeInt } from '../lib/util.js'
+import * as pluginStats from '../lib/plugin-stats.js'
 import { openAudioStream, resolvePlayableUrl, resolveMusicUrlFast } from '../lib/stream.js'
 import { outboundFetch, allowHttpAudio } from '../lib/http.js'
 import { generatePlaylist, loadAiConfig, chatOnce, AI_PROVIDERS } from '../lib/ai.js'
@@ -1056,6 +1057,17 @@ export async function handleApi(request, env, url) {
     // 公开接口也能触发 —— 全新库的第一个请求就把表建好。
     await db.ensureSchema(env.DB)
 
+    /**
+     * 拉一次插件在线命中率的快照（跨 isolate，edgeCache 里那份）。
+     *
+     * 放在这里而不是取流函数里：`resolveMusicUrlFast` 的签名里没有 env，
+     * 而统计需要 env 才能拼出合法的 edgeCache key（见 plugin-stats.js）。
+     * `hydrate()` 自己带 60 秒节流，所以不是每个请求都真的去读缓存。
+     *
+     * 失败不影响任何东西：统计只用于**排序**，读不到就退回静态 rank。
+     */
+    try { await pluginStats.hydrate(env) } catch { }
+
     /* ---- 公开接口 ---- */
     if (path === '/setup-status') {
       return json({ ok: true, needsSetup: (await db.countUsers(env.DB)) === 0 })
@@ -1080,6 +1092,65 @@ export async function handleApi(request, env, url) {
      */
     if (path === '/version') {
       return json({ ok: true, ...versionInfo(), host: env.LX_HOST_KIND || null })
+    }
+
+    /**
+     * 插件在线命中率快照（只读诊断口）。
+     *
+     * 存在的理由：这套统计是**运行期自己攒**的，攒不到就等于没接上 ——
+     * 而它失效的样子非常安静（排序退回静态表，功能一切正常，只是没变快）。
+     * 没有这个口子，线上根本没法判断「到底有没有在记」。
+     *
+     * 与 `/healthz` 同一档：不含任何用户数据，只有 `平台|插件id → 成功/失败次数`。
+     * 插件名本来就在 `/url` 的 `from` 里回给客户端，不算新泄露。
+     */
+    if (path === '/plugin-stats') {
+      // 强制读一次 edgeCache（跳过 60 秒节流）：诊断口可能落到一个刚起的
+      // isolate 上，只查内存会看到空表，白白误判「统计没在记」。
+      try { await pluginStats.hydrate(env, true) } catch { }
+      const all = pluginStats.snapshot()
+      const keys = Object.keys(all)
+      const rows = keys
+        .map((k) => {
+          const [source, id] = k.split('|')
+          const v = all[k] || {}
+          const ok = v.ok || 0
+          const fail = v.fail || 0
+          const n = ok + fail
+          return { source, id, ok, fail, samples: n, rate: n ? Number((ok / n).toFixed(3)) : null, ts: v.ts || 0 }
+        })
+        .sort((a, b) => a.source.localeCompare(b.source) || (b.samples - a.samples))
+      const payload = { ok: true, total: keys.length, items: rows }
+      // ?debug=1：把落盘状态一起吐出来。这套统计失效时毫无声响，
+      // 没有这些数字（dirty / lastFlushOk / lastFlushErr）只能靠猜。
+      /**
+       * ?selftest=1：在这个请求里**真的记一条、真的落一次盘**，把结果原样吐出来。
+       *
+       * 为什么需要它：这套统计失效时一点声响都没有。线上排查时「排序好像没变」
+       * 可能是 ① 没记上 ② 记上了没落盘 ③ 落盘了但读不回来 —— 三者从外面看
+       * 一模一样。有了这个开关，一次请求就能把链路走通并把断点暴露出来。
+       * 记的是 `__selftest|probe` 这种不可能与真实插件重名的键，不影响排序。
+       */
+      if (url.searchParams.get('selftest') === '1') {
+        pluginStats.record('__selftest', 'probe', 'ok')
+        const flushed = await pluginStats.flush(env, true)
+        const back = await pluginStats.hydrate(env, true)
+        payload.selftest = {
+          flushed,
+          hydrateDone: back !== undefined,
+          debug: pluginStats.debugInfo(),
+          sawSelfTestEntry: !!(pluginStats.snapshot()['__selftest|probe']),
+        }
+      }
+      if (url.searchParams.get('debug') === '1') {
+        payload.debug = {
+          ...pluginStats.debugInfo(),
+          hasOrigin: !!(env && env.__origin),
+          hasCacheApi: !!(globalThis.caches && globalThis.caches.default),
+          hasWaitUntil: typeof env.waitUntil === 'function',
+        }
+      }
+      return json(payload)
     }
 
     if (path === '/setup' && method === 'POST') {
@@ -2456,6 +2527,25 @@ export async function handleApi(request, env, url) {
   } catch (e) {
     console.error('[api] 处理失败:', path, e && e.stack || e)
     return bad(String((e && e.message) || e), 500)
+  } finally {
+    /**
+     * 把这一轮攒下的插件在线命中率刷进 edgeCache（跨 isolate 共享）。
+     *
+     * 放在 `finally` 里而不是某个 return 之前：`/url` 和 `/stream` 各有七八个
+     * 出口（缓存命中、perf、错误……），逐个加必然漏。
+     *
+     * `flush()` 自己判断「攒够 20 次没有」，没攒够就是空操作，所以每个请求
+     * 都调一遍没有成本。真正要落盘时走 `env.waitUntil` —— **不能 await**，
+     * 那会让响应多等一次 Cache API 往返（Docker 上无所谓，CF 上有 20~40ms）。
+     * 没有 waitUntil 的宿主（壳内 / 单测）就让它自己飘着，失败也不影响响应。
+     */
+    try {
+      const p = pluginStats.flush(env)
+      if (p && typeof p.then === 'function') {
+        if (typeof env.waitUntil === 'function') env.waitUntil(p)
+        else p.catch(() => {})
+      }
+    } catch { }
   }
 }
 

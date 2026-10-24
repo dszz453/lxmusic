@@ -9,9 +9,10 @@
  *   2) 全部失败时，可跨平台搜索同名歌曲，但备用歌曲仍只调用其 musicUrl 插件；
  *   3) 仍失败就明确报错，不回退官方 provider 直连。
  */
-import { musicUrlCandidateList, searchOnline, ALL_SOURCES, SOURCE_META } from '../providers/index.js'
+import { musicUrlCandidateList, musicUrlCandidatesWithIds, searchOnline, ALL_SOURCES, SOURCE_META } from '../providers/index.js'
 import { audioMime, guessAudioFormat, decodeName } from './util.js'
 import { outboundFetch, allowHttpAudio, resolveBudget } from './http.js'
+import * as pluginStats from './plugin-stats.js'
 
 const BROWSER_UA = 'Mozilla/5.0 (Linux; Android 12) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Mobile Safari/537.36'
 
@@ -715,7 +716,16 @@ export async function resolveMusicUrlFast(song, quality, pluginPool, options = {
   // 候选只来自 musicUrl 插件；按插件池的评分序并行解析，不调用 provider 官方取流接口。
   // 放到 12 是为了不让前面的空槽位挤掉评分靠后的插件；并行解析 + totalBudget
   // 只增加并发数，不增加等待时间（到点就带着已解析出的插件候选返回）。
-  const thunks = musicUrlCandidateList(song, quality, pluginPool).slice(0, maxTries)
+  //
+  // 候选带上插件 id（`musicUrlCandidatesWithIds`），并在下面用 `pluginStats.order()`
+  // 按**线上真实命中率**再排一次 —— 静态的 plugin-rank.js 是构建机上测的，
+  // 跟这台机器的出口不是一回事（见 lib/plugin-stats.js 开头）。统计没数据时
+  // order() 原样返回，所以这条链路在「还没攒够样本」时与改动前完全一致。
+  const list = pluginStats.order(
+    song.source,
+    musicUrlCandidatesWithIds(song, quality, pluginPool).slice(0, maxTries),
+  )
+  const thunks = list.map((x) => x.thunk)
   const tried = []
   if (!thunks.length) {
     return {
@@ -855,10 +865,19 @@ export async function resolveMusicUrlFast(song, quality, pluginPool, options = {
     })[0]
   }
 
-  const flow = Promise.all(thunks.map(async (t, rank) => {
+  const flow = Promise.all(list.map(async (item, rank) => {
+    const t = item.thunk
     let r = null
-    try { r = await withDeadline(t(), deadline) } catch { return }
-    if (!r || !r.url) return
+    try { r = await withDeadline(t(), deadline) } catch {
+      // 抛异常 = 插件自己坏了，算它的账
+      pluginStats.record(song.source, item.id, 'fail')
+      return
+    }
+    if (!r || !r.url) {
+      // 正常返回但没给地址：插件答了「我没有」，同样算它的账
+      pluginStats.record(song.source, item.id, 'fail')
+      return
+    }
 
     /**
      * 这条候选**可以尝试的 URL 形态**，按优先级排列。
@@ -880,6 +899,9 @@ export async function resolveMusicUrlFast(song, quality, pluginPool, options = {
     const fresh = urls.filter(u => !seen.has(u))
     if (!fresh.length) {
       if (!urls.length) tried.push(`${r.from}(仅 http，无法直连)`)
+      // URL 重复（别的插件已经给过同一地址）或纯 http 用不了 —— 这两种都
+      // 不是「插件交出了坏音源」，记 skip，别冤枉它。
+      pluginStats.record(song.source, item.id, 'skip')
       return
     }
     for (const u of fresh) seen.add(u)
@@ -933,6 +955,27 @@ export async function resolveMusicUrlFast(song, quality, pluginPool, options = {
      * ⚠ 判据只此一份，不要再在这里另写一套体积比较。
      */
     rec.trial = looksLikeTrial(rec)
+    /**
+     * 记一笔在线命中率。
+     *
+     * 判据与下面的 `hardFail` **逐字一致**，这不是巧合：两处都在回答
+     * 「这个插件这次到底行不行」，答案不一致会让排序与跨源判断互相打架。
+     *
+     *   · `notAudio`            → 假音源（中转站回了 JSON/HTML 却报 audio/mpeg）→ fail
+     *   · `ok === false && status` → 真的被上游拒了（4xx/5xx）                  → fail
+     *   · `ok === true`         → 真拉到了音频字节                              → ok
+     *   · 其余（`status` 为 0）  → 预算到点、探测压根没跑完                     → skip
+     *
+     * 最后那条最容易写错：把它算成 fail，会让「慢但正常」的插件被降权，
+     * 而它恰恰是 CF 出口上最常见的情形（酷狗 CDN 探测常常顶到 3200 的 deadline）。
+     */
+    if (rec.notAudio || (rec.ok === false && rec.status)) {
+      pluginStats.record(song.source, item.id, 'fail')
+    } else if (rec.ok) {
+      pluginStats.record(song.source, item.id, 'ok')
+    } else {
+      pluginStats.record(song.source, item.id, 'skip')
+    }
     if (rec.ok) {
       probed.push(rec)
       // 探通了：不再立刻收工，而是开一个短窗口多收几条再挑（见上面 SETTLE_MS 说明）。

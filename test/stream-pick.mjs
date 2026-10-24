@@ -240,8 +240,11 @@ check('⚠ 交给客户端的每条候选都带上 trial（客户端会按体积
 check('⚠ 交给客户端的每条候选都带上 rank（插件实测评分序，缺了它评分就到不了客户端）',
   (src.match(/rank: x\.rank/g) || []).length === 2,
   '出现 ' + ((src.match(/rank: x\.rank/g) || []).length) + ' 处')
-check('rank 取自 thunk 下标 —— 而 thunk 顺序正是 musicUrlCandidateList 的评分序',
-  /thunks\.map\(async \(t, rank\) => \{/.test(src))
+check('rank 取自候选下标 —— 而候选顺序正是 musicUrlPlugins 的评分序（V2.27 起还要过一遍 pluginStats.order）',
+  /list\.map\(async \(item, rank\) => \{/.test(src))
+check('⚠ 在线命中率的重排必须发生在「拿到插件 id」之后（否则 order() 没有键可用）',
+  /pluginStats\.order\(\s*\n?\s*song\.source,\s*\n?\s*musicUrlCandidatesWithIds\(/.test(src)
+  || /pluginStats\.order\(\s*song\.source,\s*musicUrlCandidatesWithIds\(/.test(src))
 check('rank 挂进了候选记录 rec（少了它，返回时就没得带）',
   /\n\s+rank,\n\s+\}/.test(src))
 
@@ -315,7 +318,12 @@ check('wy.js 用 freeTrialInfo 标记试听片段',
 check('wy.js 的 outer/url 最终兜底也标 trial（实测 302→/404，VIP 歌只给片段）',
   /return \{ url: `https:\/\/music\.163\.com\/song\/media\/outer\/url\?id=\$\{id\}\.mp3`, trial: true, from: 'native' \}/.test(wySrc))
 const idxCode = deComment(idxSrc)
-const candidateBuilder = (idxCode.match(/export function musicUrlCandidateList\([\s\S]*?\n\}/) || [''])[0]
+/**
+ * ⚠ V2.27 起，真正的候选构造搬到了 `musicUrlCandidatesWithIds`（带插件 id），
+ * `musicUrlCandidateList` 只是它的一个 `.map(x => x.thunk)` 外壳。
+ * 所以下面这几条必须去查**新函数**的函数体 —— 只查外壳等于什么也没钉住。
+ */
+const candidateBuilder = (idxCode.match(/export function musicUrlCandidatesWithIds\([\s\S]*?\n\}/) || [''])[0]
 check('providers/index.js 播放候选构造只枚举 musicUrl 插件',
   /musicUrlPlugins\(song\.source, 'musicUrl'\)/.test(candidateBuilder)
   && /invokePlugin\(plugin, song\.source, 'musicUrl'/.test(candidateBuilder))
@@ -325,6 +333,10 @@ check('播放候选构造不调用 provider 原生取流方法',
 check('候选构造中无插件时为空，不从 provider 生成原生取流候选',
   /return out\s*\n\}/.test(candidateBuilder)
   && !/getMusicUrlCandidates?\s*\(/.test(candidateBuilder))
+check('每个候选都带上插件 id（在线命中率靠它对账，名字会改、id 不会）',
+  /id,\s*\n\s*name,/.test(candidateBuilder) || /\bid\b[\s\S]{0,40}name,/.test(candidateBuilder))
+check('musicUrlCandidateList 只是新函数的外壳（别再另写一份候选构造）',
+  /export function musicUrlCandidateList\([\s\S]{0,200}musicUrlCandidatesWithIds\([\s\S]{0,120}map\(\(x\) => x\.thunk\)/.test(idxCode))
 
 console.log('\n== 8. /url 与 /stream 共享候选缓存（CF 版「歌单第一首歌播不出来」的修复） ==')
 /**
@@ -438,6 +450,27 @@ check('⚠ 跨源判据只看「硬失败」，不许加「体积小也算」（
 
 check('跨源试过没成时要留 crossTried 标记（让 /api/stream 知道不用再试）',
   /crossTried: true/.test(SRC))
+
+console.log('\n== 10. 插件在线命中率的记录点（V2.27） ==')
+/**
+ * 这套统计的风险不是「算错」，是**记错账**：
+ *   · 把「探测没跑完」（`status` 为 0，预算到点）记成 fail →
+ *     慢而正常的插件被降权，而它恰恰是 CF 出口上最常见的情形
+ *     （酷狗 CDN 探测常常顶到 3200 的 deadline）；
+ *   · 判据与 `hardFail` 不一致 → 排序认为某插件「全灭」、跨源却认为它「还行」，
+ *     两条链路互相打架，症状会表现为「排序莫名跳来跳去」。
+ * 所以这里把三档判据逐字钉住。
+ */
+check('⚠ 探测没跑完（status 为 0）必须记 skip，不许算成失败',
+  /pluginStats\.record\(song\.source, item\.id, 'skip'\)/.test(SRC)
+  && /else \{\s*\n\s*pluginStats\.record\(song\.source, item\.id, 'skip'\)/.test(SRC))
+check('记录的失败判据与 hardFail 逐字一致（notAudio 或带 status 的失败）',
+  /if \(rec\.notAudio \|\| \(rec\.ok === false && rec\.status\)\) \{\s*\n\s*pluginStats\.record\(song\.source, item\.id, 'fail'\)/.test(SRC))
+check('插件抛异常 / 返回空地址都记 fail（那是它自己的问题）',
+  (SRC.match(/pluginStats\.record\(song\.source, item\.id, 'fail'\)/g) || []).length >= 3)
+check('只记「本平台」的账（跨源命中的是别的平台，不能算到原平台插件头上）',
+  /pluginStats\.record\(song\.source, item\.id,/.test(SRC)
+  && !/pluginStats\.record\(alt\.source/.test(SRC))
 
 console.log('\n===== stream-pick：' + pass + ' 通过 / ' + fail + ' 失败 =====')
 if (failures.length) console.log('失败项：\n  - ' + failures.join('\n  - '))

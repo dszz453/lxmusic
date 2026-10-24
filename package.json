@@ -14,7 +14,8 @@
     "test:server": "node test/server-node.mjs",
     "build:app": "node tools/build-app.mjs",
     "test:magic": "node test/stream-magic.mjs",
-    "test:cross": "node test/stream-cross.mjs"
+    "test:cross": "node test/stream-cross.mjs",
+    "test:stats": "node test/plugin-stats.mjs"
   },
   "devDependencies": {
     "@cloudflare/workerd-windows-64": "^1.20260926.1",

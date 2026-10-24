@@ -239,20 +239,48 @@ function interleave(groups) {
  * @returns {Array<() => Promise<{url:string, from:string}|null>>}
  */
 export function musicUrlCandidateList(song, quality = '320k', pluginPool = null) {
+  return musicUrlCandidatesWithIds(song, quality, pluginPool).map((x) => x.thunk)
+}
+
+/**
+ * 与 `musicUrlCandidateList` 完全一样，只是**每个候选额外带上插件 id**。
+ *
+ * 为什么需要（而不是让调用方从 `from` 里反解插件名）：`invokePlugin` 回来的
+ * `from` 是插件的**显示名**（`plugin.meta.name`，如「杰翔聚合音源」），
+ * 而统计、停用清单、用户排序全都以 **id** 为准。名字会改、会重名，
+ * 拿它当键迟早对不上号。
+ *
+ * `resolveMusicUrlFast` 用这个版本，好在取流结束后按 id 记一笔在线命中率
+ * （见 lib/plugin-stats.js）。顺序仍然由 `musicUrlPlugins()` 决定 ——
+ * 也就是静态实测排序表；在线统计的重排在 stream.js 里做，不在这里。
+ *
+ * @returns {Array<{id:string, name:string, thunk:() => Promise<{url:string,from:string}|null>}>}
+ */
+export function musicUrlCandidatesWithIds(song, quality = '320k', pluginPool = null) {
   if (!song || !song.source) return []
 
   const out = []
   if (pluginPool && typeof pluginPool.musicUrlPlugins === 'function') {
     for (const plugin of pluginPool.musicUrlPlugins(song.source, 'musicUrl')) {
-      out.push(async () => {
-        const r = await pluginPool.invokePlugin(plugin, song.source, 'musicUrl', { type: quality, musicInfo: song })
-        return r.ok ? { url: r.value, from: `plugin:${r.plugin}` } : null
+      const id = plugin && plugin.id ? String(plugin.id) : ''
+      const name = (plugin && plugin.meta && plugin.meta.name) || id
+      out.push({
+        id,
+        name,
+        thunk: async () => {
+          const r = await pluginPool.invokePlugin(plugin, song.source, 'musicUrl', { type: quality, musicInfo: song })
+          return r.ok ? { url: r.value, from: `plugin:${r.plugin}` } : null
+        },
       })
     }
   } else if (pluginPool && typeof pluginPool.supports === 'function' && pluginPool.supports(song.source, 'musicUrl')) {
-    out.push(async () => {
-      const res = await pluginPool.invoke(song.source, 'musicUrl', { type: quality, musicInfo: song })
-      return res.value ? { url: res.value, from: `plugin:${res.plugin}` } : null
+    out.push({
+      id: '',
+      name: 'default',
+      thunk: async () => {
+        const res = await pluginPool.invoke(song.source, 'musicUrl', { type: quality, musicInfo: song })
+        return res.value ? { url: res.value, from: `plugin:${res.plugin}` } : null
+      },
     })
   }
   return out
