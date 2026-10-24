@@ -1057,14 +1057,31 @@ export async function resolveMusicUrlFast(song, quality, pluginPool, options = {
    *
    * 「没探通」有两种：① 服务端**真的拉过并被否掉**（假音源 / 4xx / 5xx）；
    * ② 预算到点，探测压根没跑完（`status` 为 0）。②里绝大多数地址其实是好的，
-   * 只是慢 —— 对它做跨源等于给每首正常歌白加 2.5 秒。
+   * 只是慢 —— 对它做跨源等于给每首正常歌白加 2 秒。
    * 所以只在出现 ① 时才跨源。
+   *
+   * ⚠ 曾经试过再放宽一条「一条都没有超过 100KB 的体积也算」（想救 Docker 上
+   * 那些直接 `fetch failed` 的中转站），**撤掉了**：酷狗专辑的曲目在 CF 上
+   * 探测本来就常常跑不完（`totalMs` 会顶到 3200 的 deadline），放宽之后
+   * 这些正常歌也会去跨源，等于把用户能播的酷狗源换成酷我源 —— 得不偿失。
+   * 老板的原话：「能播放酷狗源就行，QQ 源播放不了没有关系」。
    */
   const hardFail = cands.some((x) => x.notAudio || (x.ok === false && x.status))
   if (hardFail && options.allowCrossSource !== false) {
     const tCross = Date.now()
     const x = await crossSourceResolveFast(song, quality, pluginPool, tried)
     if (x && x.url) return { ...x, perfMs: { primary: tCross - t0, cross: Date.now() - tCross } }
+    // 跨源没成：留个标记，好让 /api/stream 知道「已经跨过了」而不是再试一遍
+    tried.push('跨源兜底未找到可用的同名曲目')
+    const ordered2 = soft.slice().sort(compareCandidates)
+    return {
+      urls: ordered2.map((x2) => ({ url: x2.url, from: x2.from, size: x2.size || 0, trial: x2.trial === true, rank: x2.rank })),
+      url: ordered2[0].url,
+      from: ordered2[0].from,
+      tried,
+      unverified: true,
+      crossTried: true,
+    }
   }
   const ordered = soft.slice().sort(compareCandidates)
   return {

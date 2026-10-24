@@ -424,9 +424,20 @@ check('⚠ 两个备选平台要并发解析（串行时第一个吃光预算，
   /const attempts = await Promise\.all\(alts\.map/.test(SRC)
   && /const hit = attempts\.find\(Boolean\)/.test(SRC))
 
-check('⚠ 预筛已跨过源时，openAudioStream 不许再跨一次（重复一次全平台搜索 = 白等 2 秒）',
-  /allowCrossSource: !preResolved/.test(apiCode)
-  && /let preResolved = false/.test(apiCode))
+check('⚠ 预筛**真的**跨过源时，openAudioStream 不许再跨一次（重复一次全平台搜索 = 白等 2 秒）',
+  /allowCrossSource: !preCrossTried/.test(apiCode)
+  && /let preCrossTried = false/.test(apiCode))
+
+check('⚠ 判据必须是「真的跨过」而不是「预筛跑过了」（否则预筛没触发跨源时，下游也被禁掉，这首歌彻底没救）',
+  /preCrossTried = pre\.crossTried === true/.test(apiCode)
+  && !/allowCrossSource: !preResolved/.test(apiCode))
+
+check('⚠ 跨源判据只看「硬失败」，不许加「体积小也算」（否则酷狗正常歌也会被换源）',
+  !/looksLikeRealAudio/.test(SRC)
+  && /const hardFail = cands\.some\(\(x\) => x\.notAudio \|\| \(x\.ok === false && x\.status\)\)/.test(SRC))
+
+check('跨源试过没成时要留 crossTried 标记（让 /api/stream 知道不用再试）',
+  /crossTried: true/.test(SRC))
 
 console.log('\n===== stream-pick：' + pass + ' 通过 / ' + fail + ' 失败 =====')
 if (failures.length) console.log('失败项：\n  - ' + failures.join('\n  - '))

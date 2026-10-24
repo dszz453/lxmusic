@@ -1667,18 +1667,24 @@ export async function handleApi(request, env, url) {
         }
       }
       /**
-       * 这次预筛**有没有做过跨源尝试**。
+       * 这次预筛**有没有真的跑过跨源**。
        *
-       * `resolveMusicUrlFast` 现在自带跨源兜底（V2.19 起，见 lib/stream.js 的
-       * `crossSourceResolveFast`）。预筛已经跑过一次跨源，`openAudioStream` 里
-       * 再跑一次就是纯重复 —— 多一次全平台搜索（1.5~2 秒）换同样的结果。
-       * 所以只在「预筛没跑过跨源」时才允许下游再跨。
+       * `resolveMusicUrlFast` 自带跨源兜底（V2.19 起，见 lib/stream.js 的
+       * `crossSourceResolveFast`）。预筛已经跑过跨源，`openAudioStream` 里
+       * 再跑一次就是纯重复 —— 多一次全平台搜索换同样的结果。
+       *
+       * ⚠ 判据必须是 `pre.crossTried`，**不能是「预筛跑过了」**。
+       * 预筛也可能压根没触发跨源（本平台候选看着还行、只是没探通），
+       * 这时下游要是也不许跨，这首歌就彻底没有跨源机会了 ——
+       * 2026-10-24 在 Docker 上实测到的正是这个：`/url` 把假中转站交出去，
+       * 客户端播不出退到 `/stream`，而 `/stream` 因为「预筛跑过了」不再跨源，
+       * 于是一路 502。用户看到的就是「同一首歌时好时坏」。
        */
-      let preResolved = false
+      let preCrossTried = false
       if (!preferUrls) {
         try {
           const pre = await resolveMusicUrlFast(song, quality, env.PLUGIN_POOL)
-          preResolved = true
+          preCrossTried = pre.crossTried === true
           if (pre.urls && pre.urls.length) {
             preferUrls = pre.urls
             preferVerified = !pre.unverified
@@ -1689,8 +1695,8 @@ export async function handleApi(request, env, url) {
       const r = await openAudioStream(song, quality, env.PLUGIN_POOL, {
         rangeHeader,
         preferUrls,
-        // 预筛已跨过源 → 下游不必再跨（见 preResolved 的说明）
-        allowCrossSource: !preResolved,
+        // 预筛已真的跨过源 → 下游不必再跨（见 preCrossTried 的说明）
+        allowCrossSource: !preCrossTried,
         // ⚠ 只有**已验证**的候选才配关掉完整候选列表。
         // 已验证 = 服务端真的探通过字节，这批地址的命中率高，再铺一遍候选列表
         // 只是把预算花在重复解析上 —— 那正是 CF 上 502 的来源。
