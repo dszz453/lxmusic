@@ -1359,7 +1359,15 @@ export async function handleApi(request, env, url) {
     if (path === '/album') {
       const source = url.searchParams.get('source') || ''
       const id = url.searchParams.get('id') || ''
-      const limit = Math.min(safeInt(url.searchParams.get('limit'), 200) || 200, 500)
+      /*
+       * 默认 500，上限 1000。
+       *
+       * 原来的默认值是 200，于是「234 首的专辑」点进去只剩 200 首 ——
+       * 搜索卡片上明明写着 234 首（trackCount 来自平台搜索结果），
+       * 详情页却只有 200 首，看着像凭空丢了 34 首。
+       * 有声书 / 播客类专辑动辄几百上千集，200 这个数太容易撞上。
+       */
+      const limit = Math.min(safeInt(url.searchParams.get('limit'), 500) || 500, 1000)
       if (!source || !id) return bad('缺少 source 或 id')
       let data
       try {
@@ -1380,7 +1388,15 @@ export async function handleApi(request, env, url) {
           sourceId: data.sourceId,
           name: data.name,
           cover: data.cover || '',
-          total: data.songs.length,
+          /*
+           * total = **专辑真实曲目数**（平台给的），fetched = 本次取回条数。
+           *
+           * 以前这里写的是 `total: data.songs.length` —— 那等于「我取到几首就说专辑有几首」，
+           * limit 一截断就自我圆谎，前端永远发现不了自己少了歌。
+           * 现在两者分开：total > songs.length 时前端能明确说「已载入 200 / 共 234」。
+           */
+          total: Number(data.total) || data.songs.length,
+          fetched: data.songs.length,
           songs: data.songs.map(songForWeb),
         },
       })

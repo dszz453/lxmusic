@@ -227,6 +227,8 @@ export default {
     let cover = ''
     let page = 1
     let maxPage = 1
+    // 专辑真实曲目数（album/song 的 data.total），与「本次取回多少首」分开记
+    let total = 0
 
     /*
      * 专辑名 / 封面必须单独走 album/info。
@@ -253,7 +255,10 @@ export default {
       const { json } = await request(url, { headers: { 'User-Agent': UA_PC }, retry: 1, timeout: 15000 })
       const info = json && json.data && json.data.info
       if (!Array.isArray(info) || !info.length) break
-      if (page === 1) maxPage = Math.ceil(safeInt(json.data.total) / pageSize) || 1
+      if (page === 1) {
+        total = safeInt(json.data.total) || 0
+        maxPage = Math.ceil(total / pageSize) || 1
+      }
       for (const raw of info) {
         const s = this._playlistSongToSong(raw)
         if (s) songs.push(s)
@@ -263,7 +268,12 @@ export default {
     }
 
     if (!songs.length) throw new Error('该酷狗专辑没有可用曲目')
-    return { source: SOURCE, sourceId: id, name: name || `酷狗专辑 ${id}`, cover, songs }
+    /*
+     * total 用上游给的**专辑真实曲目数**，别用 songs.length。
+     * 上游 limit 会截断（比如 234 首的专辑只取 200 首），拿 songs.length 当总数
+     * 就会把「共 234 首」显示成「共 200 首」，看着像凭空丢了 34 首。
+     */
+    return { source: SOURCE, sourceId: id, name: name || `酷狗专辑 ${id}`, cover, total: total || songs.length, songs }
   },
 
   /** 歌单详情 */

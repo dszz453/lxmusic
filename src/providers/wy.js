@@ -256,6 +256,9 @@ export default {
       sourceId: id,
       name: decodeName(album.name || ''),
       cover: album.picUrl || '',
+      // album.size 是网易云给的**专辑真实曲目数**；limit 截断后 songs.length 会变小，
+      // 上层拿它当总数就会把「234 首」显示成「200 首」。
+      total: Number(album.size) || songs.length,
       songs: list,
     }
   },

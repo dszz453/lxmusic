@@ -248,6 +248,8 @@ export default {
     let cover = ''
     let page = 1
     let maxPage = 1
+    // 专辑真实曲目数（tracks.totalCount），与本次取回条数分开
+    let total = 0
 
     while (page <= Math.min(maxPage, 40) && songs.length < limit) {
       const url = `${MOBILE_API}/mobile/others/ca/album/track/${id}/true/${page}/${pageSize}`
@@ -259,7 +261,8 @@ export default {
         albumTitle = decodeName(album.title || '')
         const c = album.coverOrigin || album.coverMiddle || album.coverSmall || ''
         cover = c ? String(c).replace(/^http:/, 'https:') : ''
-        maxPage = Math.ceil(safeInt((json.tracks && json.tracks.totalCount) || 0) / pageSize) || 1
+        total = safeInt((json.tracks && json.tracks.totalCount) || 0) || 0
+        maxPage = Math.ceil(total / pageSize) || 1
       }
 
       const list = (json.tracks && json.tracks.list) || []
@@ -280,6 +283,8 @@ export default {
       sourceId: id,
       name: albumTitle || `喜马拉雅专辑 ${id}`,
       cover,
+      // total 是**专辑真实曲目数**（tracks.totalCount），不是本次取回条数
+      total: total || songs.length,
       songs,
     }
   },

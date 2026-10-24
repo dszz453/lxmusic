@@ -23,6 +23,80 @@ function looksLikeError(contentType) {
     || ct.includes('text/plain') || ct.includes('text/xml')
 }
 
+/**
+ * 用**文件头魔数**判断这是不是音频 —— 只看 Content-Type 是不够的。
+ *
+ * ── 为什么必须看字节（2026-10-24 实测，用户反馈「点开专辑大部分歌放不出来」）──
+ *
+ * 插件池里有一批「中转站」源，典型是
+ *   `https://music-dl.sayqz.com/api/?source=qq&id=...`
+ *   `https://175.27.166.236/kgqq/qq.php?type=mp3&id=...`
+ * 它们回 `200` + **看起来完全正常的 Content-Type**，body 却是
+ * `{"code":201,"msg":"error"}` 或者一张 HTML 错误页。
+ *
+ * 而原来的探测是 `Range: bytes=0-1`（只拿 2 字节）+ 只信 Content-Type ——
+ * 2 个字节什么也证明不了，于是这类假音源**全部探测通过**、还因为「体积未知/rank 靠前」
+ * 被排到候选第一位。客户端把地址喂给 `<audio>` 立刻
+ * `MEDIA_ELEMENT_ERROR: Format error`，接着要走一整轮降级
+ * （重问 /url → 退 /api/stream → 跳歌），用户看到的就是
+ * 「点开一张专辑，13 首里只有 2 首能播」。
+ *
+ * 实测代价：`bytes=0-11` 与 `bytes=0-1` 耗时无差别（都 120~240ms），
+ * 但能一刀切掉整类假音源。多花的 10 个字节换掉一整轮降级，非常值。
+ *
+ * 认的容器：ID3 标签 / 裸 MPEG 帧（MP3、AAC-ADTS）/ Ogg / FLAC / WAV / MP4-M4A / APE。
+ * 认不出就一律当作「不是音频」—— 宁可少给一条，也不要给一条必然报 Format error 的。
+ */
+export function looksLikeAudioBytes(bytes) {
+  if (!bytes || bytes.length < 4) return false
+  const at = (o, n) => {
+    if (bytes.length < o + n) return ''
+    let s = ''
+    for (let i = 0; i < n; i++) s += String.fromCharCode(bytes[o + i])
+    return s
+  }
+  // ID3v2 标签（绝大多数 MP3 都有）
+  if (bytes[0] === 0x49 && bytes[1] === 0x44 && bytes[2] === 0x33) return true   // "ID3"
+  // 裸 MPEG / ADTS 帧同步字：0xFF 后跟 111xxxxx
+  if (bytes[0] === 0xFF && (bytes[1] & 0xE0) === 0xE0) return true
+  if (at(0, 4) === 'OggS') return true        // Ogg（Vorbis / Opus）
+  if (at(0, 4) === 'fLaC') return true        // FLAC
+  if (at(0, 4) === 'RIFF' && at(8, 4) === 'WAVE') return true   // WAV
+  if (at(4, 4) === 'ftyp') return true        // MP4 / M4A（前 4 字节是 box 长度）
+  if (at(0, 4) === 'MAC ') return true        // APE
+  return false
+}
+
+/**
+ * 读响应体的**前 n 个字节**，读完立刻取消，不把整首歌下下来。
+ *
+ * 必须用 reader 逐块读：`res.arrayBuffer()` 会把整个文件拉完 ——
+ * 那是几百毫秒到几十秒的差别，探测就失去意义了。
+ */
+async function readHeadBytes(res, n = 12) {
+  if (!res || !res.body) return new Uint8Array(0)
+  const reader = res.body.getReader()
+  const chunks = []
+  let got = 0
+  try {
+    while (got < n) {
+      const { done, value } = await reader.read()
+      if (done) break
+      if (value && value.length) { chunks.push(value); got += value.length }
+    }
+  } catch { /* 读到一半断了，就用已经拿到的字节判断 */ }
+  try { await reader.cancel() } catch { /* 已经结束 */ }
+  const out = new Uint8Array(Math.min(got, n))
+  let off = 0
+  for (const c of chunks) {
+    const take = Math.min(c.length, out.length - off)
+    if (take <= 0) break
+    out.set(c.subarray(0, take), off)
+    off += take
+  }
+  return out
+}
+
 /** 标题归一化：去掉括号补充说明与标点，用于跨平台同名匹配 */
 function normTitle(name) {
   return decodeName(String(name || ''))
@@ -227,19 +301,33 @@ async function crossSourceFallback(song, quality, pluginPool, opts, errors, seen
 }
 
 /** 探测候选地址是否真的能出音频（供 /api/url 用） */
-export async function probeAudioUrl(url) {
+/**
+ * 探测一条地址，并**区分两种失败**（兜底逻辑必须知道这个区别）：
+ *   · `notAudio` —— 源站回了 200，但内容不是音频（JSON / HTML / 脚本）。
+ *     这条永远放不出来，兜底时不能交给客户端。
+ *   · 其余（status 0 / 超时 / 4xx）—— 可能只是服务端出口不通，
+ *     用户手机的网络未必不通，值得让客户端自己试一次。
+ */
+export async function probeAudioDetail(url) {
   try {
     const res = await outboundFetch(url, {
       method: 'GET',
-      headers: { 'User-Agent': BROWSER_UA, Range: 'bytes=0-1' },
+      // 12 字节：要能看出音频魔数，理由见 looksLikeAudioBytes
+      headers: { 'User-Agent': BROWSER_UA, Range: 'bytes=0-11' },
       redirect: 'follow',
     })
     const ct = res.headers.get('content-type') || ''
-    try { await res.body?.cancel() } catch { /* ignore */ }
-    return (res.ok || res.status === 206) && !looksLikeError(ct)
-  } catch {
-    return false
+    const head = await readHeadBytes(res, 12)
+    const reachable = res.ok || res.status === 206
+    const audio = looksLikeAudioBytes(head)
+    return { ok: reachable && !looksLikeError(ct) && audio, notAudio: reachable && !audio, status: res.status, contentType: ct }
+  } catch (e) {
+    return { ok: false, notAudio: false, status: 0, err: (e && e.message) || String(e) }
   }
+}
+
+export async function probeAudioUrl(url) {
+  return (await probeAudioDetail(url)).ok
 }
 
 /**
@@ -252,21 +340,35 @@ export async function resolvePlayableUrl(song, quality, pluginPool, { maxProbe =
   if (!thunks.length) {
     return { url: null, from: null, tried, error: '当前歌曲来源没有启用取流插件' }
   }
+  const soft = []   // 解析出来了、但探测没能证明它是音频（网络原因）—— 可以兜底交出去
   for (const thunk of thunks) {
     let cand = null
     try { cand = await thunk() } catch { continue }
     if (!cand || !cand.url) continue
     tried.push(cand.from)
-    if (await probeAudioUrl(cand.url)) return { url: cand.url, from: cand.from, tried }
+    const p = await probeAudioDetail(cand.url)
+    if (p.ok) return { url: cand.url, from: cand.from, tried }
+    if (p.notAudio) tried.push(`${cand.from}: 返回的不是音频（${p.contentType || '无 Content-Type'}）`)
+    else soft.push(cand)
   }
-  // 全都探测失败时，仍把第一个插件返回的地址给出去（客户端也许能放）
-  for (const thunk of thunks) {
-    try {
-      const cand = await thunk()
-      if (cand && cand.url) return { url: cand.url, from: cand.from, tried, unverified: true }
-    } catch { /* ignore */ }
+  /**
+   * 兜底：把「没证明是音频、但也没证据说它不是」的候选交给客户端自己试。
+   *
+   * ⚠ 明确返回非音频内容（`notAudio`）的那批**绝不能**放进兜底。
+   * 以前这里是无条件「把第一个插件返回的地址给出去」—— 于是中转站
+   * （`music-dl.sayqz.com`、`175.27.166.236/kgqq/qq.php` 这类回 JSON 的）
+   * 会被当成播放地址交出去，客户端 `<audio>` 必然 Format error，
+   * 再走一整轮降级。宁可明确回「没有可用音源」，让客户端立刻提示 + 跳下一首。
+   */
+  if (soft.length) {
+    return { url: soft[0].url, from: soft[0].from, tried, unverified: true }
   }
-  return { url: null, from: null, tried, error: '所有取流插件均未返回可用地址' }
+  return {
+    url: null,
+    from: null,
+    tried,
+    error: tried.length ? '所有取流插件返回的都不是音频' : '所有取流插件均未返回可用地址',
+  }
 }
 
 /* ------------------------------------------------------------------ *
@@ -325,17 +427,28 @@ function hostMatches(url, list) {
 async function probeAudioBytes(url) {
   try {
     const res = await outboundFetch(url, {
-      headers: { 'User-Agent': BROWSER_UA, Accept: '*/*', Range: 'bytes=0-1' },
+      // ⚠ 12 字节而不是 2 字节：要看得出文件头魔数（见 looksLikeAudioBytes）
+      headers: { 'User-Agent': BROWSER_UA, Accept: '*/*', Range: 'bytes=0-11' },
       redirect: 'follow',
     })
     const contentType = res.headers.get('content-type') || ''
     const contentRange = res.headers.get('content-range') || ''
     const size = Number((contentRange.match(/\/(\d+)\s*$/) || [])[1] || res.headers.get('content-length') || 0)
-    try { await res.body?.cancel() } catch { /* ignore */ }
-    const ok = (res.ok || res.status === 206) && !looksLikeError(contentType)
-    return { ok, size, status: res.status, contentType }
+    const head = await readHeadBytes(res, 12)
+    const audio = looksLikeAudioBytes(head)
+    const reachable = res.ok || res.status === 206
+    const ok = reachable && !looksLikeError(contentType) && audio
+    /**
+     * `notAudio` 与「网络没通」必须分开记：
+     *   · notAudio=true  → 源站好好地回了一个**不是音频**的东西（JSON/HTML/脚本）。
+     *     这条候选**永远**放不出来，兜底时不能交出去 —— 交出去只会让客户端
+     *     白等一轮 Format error 再降级。
+     *   · status=0（网络错误 / 超时）→ 可能只是服务端出口这会儿不通，
+     *     用户的手机网络未必不通，值得让客户端自己试一次。
+     */
+    return { ok, size, status: res.status, contentType, notAudio: reachable && !audio }
   } catch (e) {
-    return { ok: false, size: 0, status: 0, err: (e && e.message) || String(e) }
+    return { ok: false, size: 0, status: 0, err: (e && e.message) || String(e), notAudio: false }
   }
 }
 
@@ -667,9 +780,35 @@ export async function resolveMusicUrlFast(song, quality, pluginPool, options = {
   // 预算到点（或全部跑完）仍无一条探通：把候选按可信度排好交出去，
   // 由客户端自己试。服务端探测走的是 Cloudflare 出口，和用户手机的网络不是一回事。
   for (const x of cands) {
-    if (!x.ok) tried.push(`${x.from}: 探测未通过(${x.status || x.err || '未完成'})`)
+    if (x.ok) continue
+    tried.push(x.notAudio
+      ? `${x.from}: 返回的不是音频（${x.contentType || '无 Content-Type'}）`
+      : `${x.from}: 探测未通过(${x.status || x.err || '未完成'})`)
   }
-  const ordered = cands.slice().sort(compareCandidates)
+  /**
+   * ⚠ 明确「不是音频」的候选**一条都不能交出去**。
+   *
+   * 这批就是插件池里的中转站（回 `{"code":201,"msg":"error"}` 或 HTML 错误页）。
+   * 以前这里无条件把 `cands` 全交出去，于是客户端拿到的第一条就是它们，
+   * `<audio>` 立刻 `MEDIA_ELEMENT_ERROR: Format error` —— 用户看到的就是
+   * 「点开专辑，大部分歌放不出来」。它们的共同特征是**已经证明放不出来**，
+   * 交给客户端只是让它白等一轮，不如直接说「没有可用音源」。
+   *
+   * 保留的只有「网络没通」那批（status 0 / 超时）：服务端出口不通，
+   * 不代表用户手机不通。
+   */
+  const soft = cands.filter((x) => !x.notAudio)
+  if (!soft.length) {
+    return {
+      urls: [],
+      url: null,
+      from: null,
+      tried,
+      error: '取流插件返回的地址都不是音频（中转站/错误页）',
+      unverified: true,
+    }
+  }
+  const ordered = soft.slice().sort(compareCandidates)
   return {
     urls: ordered.map((x) => ({ url: x.url, from: x.from, size: x.size || 0, trial: x.trial === true, rank: x.rank })),
     url: ordered[0].url,

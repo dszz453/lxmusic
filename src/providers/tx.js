@@ -377,6 +377,14 @@ export default {
       name: decodeName(data.data.name || data.data.albumName || ''),
       cover: String(data.data.albumPic || `https://y.gtimg.cn/music/photo_new/T002R300x300M000${mid}.jpg`)
         .replace(/^http:\/\//, 'https://'),
+      /*
+       * total 是**专辑真实曲目数**，不是本次取回条数。
+       *
+       * 这个接口一次就把整张专辑全给（实测 234 首的专辑 list 长度就是 234），
+       * 但上游 limit 会截断 —— 上层如果拿 songs.length 当总数，
+       * 就会把「一张 234 首的专辑」显示成「共 200 首」，看着像丢了 34 首。
+       */
+      total: Number(data.data.total_song_num || data.data.total || raw.length) || raw.length,
       songs,
     }
   },
