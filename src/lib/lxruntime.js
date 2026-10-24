@@ -331,9 +331,20 @@ export class PluginPool {
 
     const MAX = Number.MAX_SAFE_INTEGER
     const rankIdx = (this._rankIndex && this._rankIndex.get(source)) || null
-    const manual = (this._prefIndex && this.userPrefs && this.userPrefs.mode === 'manual')
-      ? this._prefIndex.order.get(source) || null
-      : null
+    /**
+     * 手工序：**只要排过就用，不再要求 `mode === 'manual'`**（V2.31）。
+     *
+     * 原来这里写着 `mode === 'manual' ? ... : null`，于是默认的 `auto` 模式下
+     * 老板在「音源与插件」页拖出来的顺序**完全不参与排序** —— 界面上顺序
+     * 显示是对的（界面读的是 prefs.order 本身），实际取流一次都没按它走。
+     * 老板报的「我之前设计的音源排名你好像也没有用上」就是这个。
+     *
+     * 现在的语义：
+     *   · `order` 里有这个平台 → 按它排（人工意图最高优先）；
+     *   · 没排过的插件（`m === MAX`）→ 继续按实测评分 `r` 垫后，
+     *     保持「没动过的那些不会因为切模式而整体重排」这个既有保证。
+     */
+    const manual = (this._prefIndex && this._prefIndex.order.get(source)) || null
     if (!rankIdx && !manual) return list // 没有任何排序依据，保持注册顺序
 
     return list

@@ -712,6 +712,19 @@ export async function resolveMusicUrlFast(song, quality, pluginPool, options = {
   // 宿主默认预算（网页紧、壳内宽），调用方传入的 options 优先 —— 见 http.js 的 resolveBudget
   const {
     maxTries = 12, deadline = 1600, probeDeadline = 1200, totalBudget = 1800,
+    /**
+     * 这个平台有没有**管理员手工排的序**。
+     *
+     * 有的话就**不许**再用在线命中率重排 —— 那是老板在「音源与插件」页
+     * 亲手定的顺序（`plugin.prefs.order`），插件的 `musicUrlPlugins()`
+     * 已经按它排好了；这里再按统计洗一次，等于把老板的排序冲掉。
+     *
+     * 踩过的坑：`plugin.prefs.mode` 默认是 `auto`，而插件池只有 `manual`
+     * 模式才应用手工序。于是老板排了半天、界面上顺序也显示对了，
+     * 实际取流一次都没按那个序走过 —— 他报的「我设计的音源排名你好像
+     * 也没有用上」就是这个。现在改成「只要有手工序就认」，不再看 mode。
+     */
+    pinnedOrder = false,
   } = { ...resolveBudget(), ...options }
   // 候选只来自 musicUrl 插件；按插件池的评分序并行解析，不调用 provider 官方取流接口。
   // 放到 12 是为了不让前面的空槽位挤掉评分靠后的插件；并行解析 + totalBudget
@@ -721,10 +734,11 @@ export async function resolveMusicUrlFast(song, quality, pluginPool, options = {
   // 按**线上真实命中率**再排一次 —— 静态的 plugin-rank.js 是构建机上测的，
   // 跟这台机器的出口不是一回事（见 lib/plugin-stats.js 开头）。统计没数据时
   // order() 原样返回，所以这条链路在「还没攒够样本」时与改动前完全一致。
-  const list = pluginStats.order(
-    song.source,
-    musicUrlCandidatesWithIds(song, quality, pluginPool).slice(0, maxTries),
-  )
+  //
+  // ⚠ `pinnedOrder` 为真时**整段跳过** order()：手工序是最高优先级，
+  //   在线统计只配在「没人手工排过」的时候说话。
+  const raw = musicUrlCandidatesWithIds(song, quality, pluginPool).slice(0, maxTries)
+  const list = pinnedOrder ? raw : pluginStats.order(song.source, raw)
   const thunks = list.map((x) => x.thunk)
   const tried = []
   if (!thunks.length) {
@@ -1147,9 +1161,39 @@ export async function resolveMusicUrlFast(song, quality, pluginPool, options = {
  * ⚠ 必须与上面的 pickBest 同档位同顺序，改一处就要改另一处。
  */
 function compareCandidates(a, b) {
+  /**
+   * 排序判据的顺序，就是「哪个插件说了算」的优先级。
+   *
+   * ══════════ 为什么 rank 要提到第三位（V2.31）══════════
+   *
+   * 原来是 `weak → trial → official → 体积 → rank`，**rank 垫底**。
+   * 后果是「评分/排名几乎不起作用」：只要某条候选体积更大一点，或者
+   * 域名落在官方 CDN 上，评分第一的插件就会被顶掉 —— 老板在后台把
+   * 某个插件排到第一，实际取流时它可能一次都轮不到。
+   *
+   * 老板的原话：「我之前设计的音源排名你好像也没有用上…做好用的插件
+   * hello world，没有被你排在前面」。实测也印证了：CF 上 `cloud-fuguang`
+   * （运行时名就是那个花体 `𝖧౿ᥣᥣ𝗈 Ԝ𝗈𝗋ᥣᑯ`）的在线命中率 7/7，
+   * 但 9 首抽样里它**一次都没被选中** —— 因为别人体积大 / 域名 official。
+   *
+   * 新顺序的道理：
+   *   ① `weak` / `trial` 是**硬质量红线**（弱源、30 秒试听片段），必须压在最前。
+   *      把试听片段排在前面会让用户「播 30 秒就没了」，比慢更难受。
+   *   ② `rank` = 插件评分（静态实测表 + 在线命中率重排后的位次）。
+   *      它是「这个插件在这个出口上到底行不行」的唯一证据，**必须压过
+   *      域名偏好和体积** —— 否则排名就是摆设。
+   *   ③ `official` 只是「域名看着可信」，不是质量证据，降为第三。
+   *   ④ 体积放最后：同评分下才比大小，避免「128k 完整版被 320k 挤掉」
+   *      这类判断失去意义。
+   *
+   * ⚠ 不要再把 rank 挪回最后。它一旦垫底，后台的排序与实测评分就都失效了。
+   */
   if (!!a.weak !== !!b.weak) return a.weak ? 1 : -1
   if (!!a.trial !== !!b.trial) return a.trial ? 1 : -1
+  const ra = Number.isFinite(a.rank) ? a.rank : Infinity
+  const rb = Number.isFinite(b.rank) ? b.rank : Infinity
+  if (ra !== rb) return ra - rb
   if (!!a.official !== !!b.official) return a.official ? -1 : 1
   if ((b.size || 0) !== (a.size || 0)) return (b.size || 0) - (a.size || 0)
-  return (Number.isFinite(a.rank) ? a.rank : Infinity) - (Number.isFinite(b.rank) ? b.rank : Infinity)
+  return 0
 }

@@ -1187,7 +1187,24 @@ export async function handleApi(request, env, url) {
     }
 
     // 插件调度偏好：命中 60s 缓存时纯内存操作，取流路径的开销可以忽略
-    await applyPluginPrefs(env, db)
+    const pluginPrefs = await applyPluginPrefs(env, db)
+
+    /**
+     * 这个平台有没有**管理员手工排的序**（`plugin.prefs.order[src]`）。
+     *
+     * 有的话，取流时就不许再用在线命中率去重排 —— 手工序是老板亲手定的，
+     * 优先级高于任何自动统计。判定放在这里、三处取流调用共用一份，
+     * 免得哪天加第四个调用点又忘了传（忘了传 = 手工序静默失效，
+     * 而界面上顺序看着还是对的，最难查）。
+     *
+     * ⚠ 不看 `mode`：`plugin.prefs.mode` 默认是 `auto`，而插件池只有
+     * `manual` 才应用手工序 —— 这正是「排了序却不生效」的由来。
+     * 只要 order 里有这个平台的非空数组，就认为他排过。
+     */
+    const hasPinnedOrder = (src) => {
+      const o = pluginPrefs && pluginPrefs.order
+      return !!(o && Array.isArray(o[src]) && o[src].length)
+    }
 
     if (path === '/me') {
       return json({ ok: true, user: { id: user.id, username: user.username, isAdmin: !!user.is_admin } })
@@ -1604,7 +1621,7 @@ export async function handleApi(request, env, url) {
       }
       let r
       if (fast) {
-        r = await resolveMusicUrlFast(song, quality, env.PLUGIN_POOL)
+        r = await resolveMusicUrlFast(song, quality, env.PLUGIN_POOL, { pinnedOrder: hasPinnedOrder(song.source) })
       } else {
         r = await resolvePlayableUrl(song, quality, env.PLUGIN_POOL)
       }
@@ -1674,7 +1691,7 @@ export async function handleApi(request, env, url) {
         const t0 = Date.now()
         const marks = []
         const trace = []
-        const pre = await resolveMusicUrlFast(song, quality, env.PLUGIN_POOL).catch((e) => ({ error: String(e) }))
+        const pre = await resolveMusicUrlFast(song, quality, env.PLUGIN_POOL, { pinnedOrder: hasPinnedOrder(song.source) }).catch((e) => ({ error: String(e) }))
         marks.push({ step: 'resolveMusicUrlFast', ms: Date.now() - t0, unverified: pre.unverified, urls: (pre.urls || []).map(u => ({ from: u.from, size: u.size, url: u.url.slice(0, 90) })) })
         const thunks = musicUrlCandidateList(song, quality, env.PLUGIN_POOL)
         marks.push({ step: '候选总数', n: thunks.length })
@@ -1754,7 +1771,7 @@ export async function handleApi(request, env, url) {
       let preCrossTried = false
       if (!preferUrls) {
         try {
-          const pre = await resolveMusicUrlFast(song, quality, env.PLUGIN_POOL)
+          const pre = await resolveMusicUrlFast(song, quality, env.PLUGIN_POOL, { pinnedOrder: hasPinnedOrder(song.source) })
           preCrossTried = pre.crossTried === true
           if (pre.urls && pre.urls.length) {
             preferUrls = pre.urls

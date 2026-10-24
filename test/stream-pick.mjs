@@ -242,9 +242,33 @@ check('⚠ 交给客户端的每条候选都带上 rank（插件实测评分序�
   '出现 ' + ((src.match(/rank: x\.rank/g) || []).length) + ' 处')
 check('rank 取自候选下标 —— 而候选顺序正是 musicUrlPlugins 的评分序（V2.27 起还要过一遍 pluginStats.order）',
   /list\.map\(async \(item, rank\) => \{/.test(src))
+// ⚠ 必须匹配**代码行**而不是裸字符串：注释里也写着 `pluginStats.order()`，
+//    用 indexOf 会命中注释、把顺序判断整个搞反（这里踩过一次）。
 check('⚠ 在线命中率的重排必须发生在「拿到插件 id」之后（否则 order() 没有键可用）',
-  /pluginStats\.order\(\s*\n?\s*song\.source,\s*\n?\s*musicUrlCandidatesWithIds\(/.test(src)
-  || /pluginStats\.order\(\s*song\.source,\s*musicUrlCandidatesWithIds\(/.test(src))
+  /const raw = musicUrlCandidatesWithIds\(song, quality, pluginPool\)/.test(src)
+  && /const list = pinnedOrder \? raw : pluginStats\.order\(song\.source, raw\)/.test(src))
+
+/**
+ * V2.31：老板在「音源与插件」页手工排的序必须压过在线统计。
+ *
+ * 踩过的坑：`plugin.prefs.mode` 默认是 `auto`，而插件池只有 `manual`
+ * 才应用手工序 —— 于是老板排了半天、界面上顺序也对，实际取流一次都没按它走
+ * （他报的「我设计的音源排名你好像也没有用上」）。现在改判据：只要有
+ * 手工序就认，并且**跳过** pluginStats.order()，别再让统计把它冲掉。
+ */
+check('⚠ 有手工序时必须跳过在线统计重排（否则老板排的序被冲掉）',
+  /pinnedOrder \? raw : pluginStats\.order\(song\.source, raw\)/.test(src))
+// 判定逻辑在 api.js（`hasPinnedOrder`），真正「用不用手工序」在 lxruntime.js 的
+// `musicUrlPlugins`。两处都要钉：api.js 那份决定要不要跳过统计，lxruntime 那份
+// 决定插件池本身按什么排。
+// ⚠ 不能笼统地 grep `mode === 'manual'`：api.js 的 normalizePrefs 里那处是
+//    **保留 mode 字段**用的（合法），拿它当判据会假红。
+const API_SRC = fs.readFileSync(path.join(ROOT, 'src', 'server', 'api.js'), 'utf8')
+const RT_SRC = fs.readFileSync(path.join(ROOT, 'src', 'lib', 'lxruntime.js'), 'utf8')
+const manualLine = (RT_SRC.match(/const manual = [^\n]*/) || [''])[0]
+check('手工序的判定不许再看 mode（auto 模式下也得认）',
+  /Array\.isArray\(o\[src\]\)/.test(API_SRC)
+  && !!manualLine && !/mode/.test(manualLine))
 check('rank 挂进了候选记录 rec（少了它，返回时就没得带）',
   /\n\s+rank,\n\s+\}/.test(src))
 
