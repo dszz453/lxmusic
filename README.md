@@ -1,6 +1,6 @@
 # 云音乐 · 全平台音乐播放器
 
-> **当前版本：V2.15**（服务端）· 客户端 V2.23 · 老板在用的客户端 **V2.113**（`yunmusic-client/`）
+> **当前版本：V2.32**（服务端）· 客户端 V2.23 · 老板在用的客户端 **V2.127**（`yunmusic-client/`）
 >
 > 一个自托管的音乐播放系统，支持 **Cloudflare Workers 线上部署**、**Docker 自建服务器**，并提供可在同一手机共存的 **云音乐(CF版)** 与 **云音乐(Docker版)** 两个独立 APK。
 > 两个 APK 保留各自宿主：CF 版基于 `android/` WebView + 本地 bundle；Docker 版基于 `client/` 原生多页面客户端。
