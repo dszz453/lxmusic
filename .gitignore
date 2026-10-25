@@ -20,6 +20,13 @@ android/assets/www/
 *.apk
 *.aab
 
+# 例外：**客户端更新包**要跟着服务端一起进仓库。
+# 原因：Dockerfile 是 `COPY public ./public`，镜像里要有它，
+# `/app/yunmusic-latest.apk` 这条直链才存在 —— 否则 Docker 线路的应用内更新
+# 会 404，只能退网盘。CF 那边是 wrangler 直接上传本地 public/，不受影响，
+# 所以「CF 能自动更新、Docker 不能」这种诡异差异，根源就在这一行。
+!public/app/yunmusic-latest.apk
+
 # android/assets/www 是 build-apk.sh 第 1.5 步从 public/ **整包拷过去**的产物。
 # 它和 public/ 逐字节同源，提交进来只会造成「改了一处、另一处是旧的」的经典事故。
 # 想构建 APK 就先跑 build-apk.sh（它自己会拷）。
@@ -92,3 +99,6 @@ Thumbs.db
 # 且插件是第三方代码，不该由本仓库分发。
 plugins/
 .ghcache.json
+
+# 部署到老账号时临时用的 wrangler 配置（用完即删，里面写着老账号 id）
+wrangler.old.toml

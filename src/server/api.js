@@ -25,7 +25,7 @@ import { searchSources, pluginSearchSourceKeys, DEFAULT_SOURCES_SETTING } from '
 import { importPlugin, removeImportedPlugin } from './plugin-import.mjs'
 import { generateDaily, getDaily, pickPrimaryUser, todayBJ, dailySourcesStale, requeryDailySources } from './daily.js'
 import { HOME_KEYWORDS } from './keywords.js'
-import { versionInfo } from '../version.js'
+import { versionInfo, CLIENT_LATEST } from '../version.js'
 
 const SESSION_TTL = 30 * 24 * 3600 * 1000
 
@@ -1092,6 +1092,20 @@ export async function handleApi(request, env, url) {
      */
     if (path === '/version') {
       return json({ ok: true, ...versionInfo(), host: env.LX_HOST_KIND || null })
+    }
+
+    /**
+     * 安卓客户端的最新版本清单（公开接口，不需要登录）。
+     *
+     * 客户端「关于」页进来就打这一发，拿 `code` 跟自己的 versionCode 比。
+     * 放在服务端而不是写进客户端，是因为「要更新才能知道有更新」毫无意义。
+     *
+     * `apk` 是相对路径（`/app/yunmusic-latest.apk`，随 public 一起部署），
+     * 客户端自己拼上当前线路的 host —— 两条线路（CF / Docker）各自有各自的
+     * 直链，不会把用户导到另一条线上。留空表示没配直链，客户端走网盘。
+     */
+    if (path === '/app/latest') {
+      return json({ ok: true, ...CLIENT_LATEST })
     }
 
     /**

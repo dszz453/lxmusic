@@ -13,7 +13,7 @@
  * 所以统一读这里，谁也别再各写各的。
  *
  * ── 两条版本线，别混 ──────────────────────────────────────────
- *   APP_VERSION      产品版本，人看的。改功能才动它。当前 V2.31
+ *   APP_VERSION      产品版本，人看的。改功能才动它。当前 V2.32
  *   APP_VERSION_CODE 整数构建号，Android 靠它判断「能不能覆盖安装」。
  *                    每次要发新版就 +1，**不能倒退、不能重复**，
  *                    否则手机上会报「应用未安装」（签名相同也装不上）。
@@ -39,13 +39,39 @@
  */
 
 /** 产品版本（对外展示用）。每发一版升 0.1。 */
-export const APP_VERSION = 'V2.31'
+export const APP_VERSION = 'V2.32'
 
 /** Android versionCode：整数、单调递增、跨次发布不可重复。每发一版 +1。 */
-export const APP_VERSION_CODE = 150
+export const APP_VERSION_CODE = 151
 
 /** 人类可读的完整标识，日志/关于页用。 */
 export const APP_ID = 'lxmusic'
+
+/**
+ * **安卓客户端**的最新版本（和上面的 APP_VERSION 是两条线，别混）。
+ *
+ * 客户端「关于」页拿它跟自己的 versionCode 比：服务端这个 `code` 更大就提示更新。
+ * 为什么放在服务端而不是客户端里：放客户端就等于「要更新才能知道有更新」，
+ * 每次发版都得先改一遍旧包，没有意义。
+ *
+ * 字段说明：
+ *   version / code  最新客户端的版本名与 versionCode（code 是判断依据，别只比字符串）
+ *   apk             直链（放在本仓库 public/app/ 下，随服务端一起部署）。
+ *                   **留空也合法** —— 客户端会退回「打开网盘」那条路。
+ *   pan             网盘兜底链接：自动更新装不上（用户没给安装未知应用权限、
+ *                   直链被墙/被限速）时，客户端直接打开这个页面让用户手动下。
+ *   notes           更新说明，一行即可，会显示在关于页的横幅里。
+ *
+ * ⚠ 发新版客户端时这里要跟着改：version、code、notes 三处，
+ *   并把新 APK 覆盖到 public/app/yunmusic-latest.apk。
+ */
+export const CLIENT_LATEST = {
+  version: 'V2.127',
+  code: 1470,
+  apk: '/app/yunmusic-latest.apk',
+  pan: 'https://pan.quark.cn/s/10cf5fc5e588',
+  notes: '缓存/下载位置可选 · 关于页检查更新 · 应用内自动更新',
+}
 
 /**
  * 构建标识。用来回答「这台机器上跑的是哪一次构建」。
