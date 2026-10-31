@@ -66,11 +66,11 @@ export const APP_ID = 'lxmusic'
  *   并把新 APK 覆盖到 public/app/yunmusic-latest.apk。
  */
 export const CLIENT_LATEST = {
-  version: 'V2.127',
-  code: 1470,
+  version: 'V2.128',
+  code: 1480,
   apk: '/app/yunmusic-latest.apk',
   pan: 'https://pan.quark.cn/s/10cf5fc5e588',
-  notes: '缓存/下载位置可选 · 关于页检查更新 · 应用内自动更新',
+  notes: '修「打开不自动登录」· 登录态落盘 · 401 自动重登并重放请求',
 }
 
 /**
